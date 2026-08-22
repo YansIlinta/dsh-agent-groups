@@ -110,6 +110,8 @@ export interface GroupRecord {
   readonly maxMembers?: number
   /** Last durable mutation timestamp (set by mutators via withGroup). */
   readonly updatedAt?: number
+  /** V0.4: configurable team composition (roles + per-role runtime/model/reasoning). */
+  readonly teamConfig?: TeamConfig
 }
 
 // ── Members (第 3/4 节) ────────────────────────────────────────────────────
@@ -129,6 +131,14 @@ export interface GroupMember {
   readonly lastActiveAt?: number
   /** V0.2: display-only role label, independent from the Agent Profile. */
   readonly displayRole?: string
+  /** V0.4: team role this member instance was spawned under. */
+  readonly roleId?: string
+  /** V0.4: runtime this instance runs on (tenant of the role config). */
+  readonly runtime?: string
+  /** V0.4: effective model this instance was spawned with. */
+  readonly model?: string
+  /** V0.4: effective reasoning level this instance was spawned with. */
+  readonly reasoningLevel?: string
 }
 
 // ── Tasks (第 5/6/12 节) ───────────────────────────────────────────────────
@@ -262,6 +272,12 @@ export type ActivityType =
   | 'notes_updated'
   | 'group_duplicated'
   | 'group_status'
+  | 'member_spawn_requested'
+  | 'member_runtime_starting'
+  | 'member_runtime_started'
+  | 'member_runtime_failed'
+  | 'member_runtime_stopped'
+  | 'team_config_updated'
 
 export interface ActivityEvent {
   readonly id: ActivityId
@@ -362,4 +378,39 @@ export interface GroupListItem {
   readonly updatedAt?: number
   readonly pausedAt?: number
   readonly archivedAt?: number
+}
+
+// ── V0.4: Agent Role Definitions & Team Configuration ──────────────────────
+
+/**
+ * One reusable "how to create this kind of member" configuration. A Role is
+ * NOT a running agent — instances spawn from it and inherit its settings.
+ */
+export interface AgentRoleDefinition {
+  readonly id: string
+  readonly name: string
+  readonly description?: string
+  /** Runtime provider id (deepseek-harness, codex, …). */
+  readonly runtime: string
+  /** Agent preset / profile used when the runtime supports profiles. */
+  readonly profile?: string
+  /** Model id interpreted by the runtime's provider. */
+  readonly model?: string
+  /** Abstract reasoning strength: low | medium | high (runtime translates). */
+  readonly reasoningLevel?: string
+  /** Role-specific system prompt, layered BELOW the member protocol. */
+  readonly systemPrompt?: string
+  /** Hard cap on concurrent instances of this role. */
+  readonly maxInstances?: number
+  /** Instances materialized eagerly at team start (lazy team composition). */
+  readonly defaultInstances?: number
+  /** Role-scoped tool hints (informational for runtimes that support tool control). */
+  readonly tools?: readonly string[]
+  readonly metadata?: Readonly<Record<string, unknown>>
+}
+
+/** The Team's declared composition: leader role + member roles. */
+export interface TeamConfig {
+  readonly leaderRole: AgentRoleDefinition
+  readonly memberRoles: readonly AgentRoleDefinition[]
 }

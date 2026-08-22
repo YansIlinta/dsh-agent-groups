@@ -14,6 +14,7 @@ import type {
   GroupStatus,
   Mission,
   TaskId,
+  TeamConfig,
   Workstream,
   WorkstreamId,
 } from './core-types.js'
@@ -41,6 +42,12 @@ export type GroupErrorCode =
   | 'CONFLICT'
   | 'PAUSED'
   | 'ARCHIVED'
+  | 'ROLE_NOT_FOUND'
+  | 'ROLE_INSTANCE_LIMIT'
+  | 'RUNTIME_UNAVAILABLE'
+  | 'MODEL_UNAVAILABLE'
+  | 'REASONING_UNAVAILABLE'
+  | 'SPAWN_FAILED'
 
 export interface MissionInput {
   readonly objective: string
@@ -90,7 +97,7 @@ export class GroupService {
     leaderName: string,
     name: string,
     missionInput: MissionInput,
-    options?: { templateId?: string; maxMembers?: number; cwd?: string },
+    options?: { templateId?: string; maxMembers?: number; cwd?: string; teamConfig?: TeamConfig },
   ): Promise<GroupRecord> {
     const existingActive = this.activeGroupForActor(leaderSessionId)
     if (existingActive !== undefined) {
@@ -120,6 +127,7 @@ export class GroupService {
       ...(options?.templateId !== undefined ? { templateId: options.templateId } : {}),
       ...(options?.maxMembers !== undefined ? { maxMembers: options.maxMembers } : {}),
       ...(options?.cwd !== undefined ? { cwd: options.cwd } : {}),
+      ...(options?.teamConfig !== undefined ? { teamConfig: options.teamConfig } : {}),
     }
     const leader: GroupMember = {
       sessionId: leaderSessionId,
@@ -276,11 +284,13 @@ export class GroupService {
         templateId: source.templateId,
         maxMembers: source.maxMembers,
         cwd: source.cwd,
+        teamConfig: source.teamConfig,
       },
     )
     const copied = await this.withGroup(target.groupId, (current) => ({
       ...current,
       workstreams: source.workstreams,
+      teamConfig: source.teamConfig,
       updatedAt: Date.now(),
     }))
     await this.activity.append({

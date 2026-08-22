@@ -111,6 +111,38 @@ describe('web API routes (V0.3 regression)', () => {
     expect(JSON.parse(templates.body).length).toBeGreaterThanOrEqual(4)
   })
 
+  it('V0.4: GET /groups/api/runtimes reports providers; team-config GET/PUT roundtrips', async () => {
+    const host = makeHost()
+    host.runtimes.register({
+      id: 'deepseek-harness',
+      name: 'DeepSeek Harness',
+      isAvailable: () => true,
+      getCapabilities: () => ({ models: true, reasoningLevels: true, interactiveSession: true, workspace: true, toolControl: false, streaming: true }),
+      listModels: () => [{ id: 'm1' }],
+      listReasoningLevels: () => [{ id: 'high', label: 'High' }],
+      spawnAgent: async () => { throw new Error('not used in route test') },
+      stopAgent: async () => undefined,
+    })
+    const group = await host.initGroup('lead-1', { name: 'T', objective: 'demo', acceptanceCriteria: ['x'] })
+    const runtimes = await call(host, host.notifier, '/groups/api/runtimes', 'GET')
+    expect(runtimes.status).toBe(200)
+    expect(JSON.parse(runtimes.body).map((r: { id: string }) => r.id)).toContain('deepseek-harness')
+
+    const before = await call(host, host.notifier, `/groups/api/groups/${group.groupId}/team-config`, 'GET')
+    expect(JSON.parse(before.body).memberRoles.length).toBeGreaterThanOrEqual(1)
+
+    const saved = await call(host, host.notifier, `/groups/api/groups/${group.groupId}/team-config`, 'PUT', {
+      leaderRole: { id: 'leader', name: 'Leader', runtime: 'deepseek-harness' },
+      memberRoles: [
+        { id: 'planner', name: 'Planner', runtime: 'deepseek-harness', model: 'deepseek-reasoner', reasoningLevel: 'high', maxInstances: 1 },
+      ],
+    })
+    expect(saved.status).toBe(200)
+    expect(JSON.parse(saved.body).teamConfig.memberRoles[0].model).toBe('deepseek-reasoner')
+    const after = await call(host, host.notifier, `/groups/api/groups/${group.groupId}/team-config`, 'GET')
+    expect(JSON.parse(after.body).memberRoles[0].reasoningLevel).toBe('high')
+  })
+
   it('GET /groups/api/groups/:id/tasks-style deep routes are not mis-routed', async () => {
     const host = makeHost()
     const grouped = await call(host, host.notifier, '/groups/api/groups/nope/workspace', 'GET')

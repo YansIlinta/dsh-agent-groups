@@ -42,12 +42,27 @@ export const LEADER_TOOLS: readonly GroupToolDef[] = [
   },
   {
     name: 'leader_spawn_member',
-    description: 'Materialize a Member from an Agent Profile as a durable teammate of this group. List profiles with group_list_profiles first.',
+    description: 'Materialize a Member from an Agent Profile as a durable teammate of this group (legacy path). List profiles with group_list_profiles first. Prefer leader_spawn_role for role-based spawns driven by the Team Configuration.',
     parameters: {
       profileId: { type: string, required: true, description: 'Agent profile id to materialize (e.g. frontend-engineer).' },
       name: { type: string, description: 'Optional display name; defaults to the profile name.' },
     },
     run: (host, actor, args) => host.spawnMember(actor, { profileId: strArg(args, 'profileId'), name: strOptArg(args, 'name') }),
+  },
+  {
+    name: 'leader_spawn_role',
+    description: 'Spawn a Member from a TEAM ROLE — the Team Configuration decides runtime, model, reasoning and profile. Do not guess model or reasoning ids yourself: pick the role id that fits the current need (planner for planning, researcher for research, implementation for coding, reviewer for review, …). Use leader_team_status to see available roles, running instances and instance limits.',
+    parameters: {
+      role: { type: string, required: true, description: 'Team role id to materialize (see leader_team_status for available roles).' },
+      name: { type: string, description: 'Optional display name; defaults to the role name.' },
+    },
+    run: (host, actor, args) => host.spawnByRole(actor, { role: strArg(args, 'role'), name: strOptArg(args, 'name') }),
+  },
+  {
+    name: 'leader_team_status',
+    description: 'Read the Team Configuration: every role with its runtime, model, reasoning level, profile and max instances, plus how many instances of each role are currently running. Use this before spawning roles.',
+    parameters: {},
+    run: (host, actor) => host.teamStatus(actor),
   },
   {
     name: 'leader_add_workstream',

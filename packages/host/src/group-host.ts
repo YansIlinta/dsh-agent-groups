@@ -15,6 +15,7 @@ import type {
   ActivityEvent,
   AgentMemberStatus,
   AgentProfile,
+  AgentRoleDefinition,
   AgentTaskResult,
   ChannelMessage,
   CompatibilityReport,
@@ -29,6 +30,7 @@ import type {
   PrivateMessage,
   TaskKind,
   TaskStatus,
+  TeamConfig,
   TeamTemplate,
   Workstream,
   WorkspaceArtifact,
@@ -43,6 +45,9 @@ import { GroupNotifier } from './notifier.js'
 import { groupMessageSource } from './message-source.js'
 import { LeaderRegistry } from './leader-registry.js'
 import { listTemplates, requireTemplate, templateMemberSlots } from './template-registry.js'
+import { RuntimeRegistry, RuntimeError } from './runtime/registry.js'
+import type { AgentRuntimeProvider, RuntimeAgentHandle } from './runtime/base.js'
+import { teamConfigFor } from './runtime/team-config.js'
 
 export function textContent(text: string): ContentBlock[] {
   return [{ type: 'text', text }]
@@ -66,7 +71,9 @@ export class GroupHost {
   readonly profiles: ProfileRegistry
   readonly notifier: GroupNotifier
   readonly leaders: LeaderRegistry
+  readonly runtimes: RuntimeRegistry
   private readonly adapter: AgentRuntimeAdapter
+  private readonly externalHandles = new Map<string, RuntimeAgentHandle>()
 
   constructor(options: {
     groups: GroupService
@@ -78,6 +85,7 @@ export class GroupHost {
     notifier: GroupNotifier
     adapter: AgentRuntimeAdapter
     leaders: LeaderRegistry
+    runtimes?: RuntimeRegistry
   }) {
     this.groups = options.groups
     this.tasks = options.tasks
@@ -88,6 +96,7 @@ export class GroupHost {
     this.notifier = options.notifier
     this.adapter = options.adapter
     this.leaders = options.leaders
+    this.runtimes = options.runtimes ?? new RuntimeRegistry()
   }
 
   // ── actor resolution ──────────────────────────────────────────────────────
@@ -103,6 +112,254 @@ export class GroupHost {
     return { group, member: this.groups.assertMember(group.groupId, actor) }
   }
 
+  // ── team configuration (V0.4) ─────────────────────────────────────────────
+
+  /** Team roles with the V0.4 migration: no stored config → derived defaults. */
+  teamConfig(group: GroupRecord): TeamConfig {
+    return teamConfigFor(group.templateId, group.teamConfig)
+  }
+
+  async updateTeamConfig(groupId: GroupId, next: TeamConfig, actorName: string): Promise<GroupRecord> {
+    const group = this.groups.requireGroup(groupId)
+    this.groups.assertMutable(group)
+    const roleIds = new Set<string>()
+    const check = (definition: AgentRoleDefinition): void => {
+      if (definition.id === '' || roleIds.has(definition.id)) {
+        throw new GroupError('CONFLICT', `duplicate or empty role id "${definition.id}"`)
+      }
+      roleIds.add(definition.id)
+      if (definition.maxInstances !== undefined && definition.maxInstances < 1) {
+        throw new GroupError('CONFLICT', `role "${definition.id}": maxInstances must be >= 1`)
+      }
+      if (definition.reasoningLevel !== undefined && !['low', 'medium', 'high'].includes(definition.reasoningLevel)) {
+        throw new GroupError('CONFLICT', `role "${definition.id}": unsupported reasoning level "${definition.reasoningLevel}" (use low/medium/high)`)
+      }
+    }
+    check(next.leaderRole)
+    for (const definition of next.memberRoles) check(definition)
+    const updated = await this.groups.withGroupTouch(groupId, (current) => ({ ...current, teamConfig: next }))
+    await this.activity.append({
+      groupId,
+      type: 'team_config_updated',
+      actorName,
+      payload: { roles: next.memberRoles.map((r) => r.id).join(',') },
+    })
+    this.notifier.emit(groupId, 'group', undefined)
+    return updated
+  }
+
+  // ── role-based spawn (V0.4) ───────────────────────────────────────────────
+
+  // ── role-based spawn (V0.4) ───────────────────────────────────────────────
+
+  /**
+   * Leader spawns by team role (leader_spawn_member({role})). The TeamConfig
+   * decides runtime/model/reasoning/profile; the Leader only picks the role.
+   * A restricted override (model/reasoning only) is supported for explicit
+   * cases but never changes the runtime or the TeamConfig itself.
+   */
+  async spawnByRole(actor: string, input: { role: string; name?: string; override?: { model?: string; reasoningLevel?: string } }): Promise<GroupMember> {
+    const { group } = this.leaderActor(actor)
+    this.groups.assertDispatchable(group)
+    return this.spawnRoleInto(group.groupId, input.role, input.name, input.override, actor)
+  }
+
+  /** User console: same path, actor label 'User' (Add Member by role). */
+  async userSpawnByRole(groupId: GroupId, input: { role: string; name?: string }): Promise<GroupMember> {
+    const group = this.groups.requireGroup(groupId)
+    this.groups.assertMutable(group)
+    this.groups.assertDispatchable(group)
+    return this.spawnRoleInto(group.groupId, input.role, input.name, undefined, 'User')
+  }
+
+  private async spawnRoleInto(
+    groupId: GroupId,
+    roleId: string,
+    name: string | undefined,
+    override: { model?: string; reasoningLevel?: string } | undefined,
+    requestedBy: string,
+  ): Promise<GroupMember> {
+    const group = this.groups.requireGroup(groupId)
+    const config = this.teamConfig(group)
+    const role = config.memberRoles.find((r) => r.id === roleId)
+    if (role === undefined) {
+      throw new GroupError('ROLE_NOT_FOUND', `no team role "${roleId}" — available roles: ${config.memberRoles.map((r) => r.id).join(', ')}`)
+    }
+    const instances = this.groups
+      .listMembers(group.groupId, () => undefined)
+      .filter((m) => m.role === 'member' && m.status !== 'left' && m.roleId === roleId).length
+    if (role.maxInstances !== undefined && instances >= role.maxInstances) {
+      throw new GroupError('ROLE_INSTANCE_LIMIT', `role "${roleId}" is at its instance limit (${role.maxInstances})`)
+    }
+    let provider: AgentRuntimeProvider
+    try {
+      provider = await this.runtimes.assertUsable(role.runtime)
+    } catch (error) {
+      if (error instanceof RuntimeError) throw new GroupError('RUNTIME_UNAVAILABLE', error.message)
+      throw error
+    }
+
+    const model = override?.model ?? role.model
+    const reasoningLevel = override?.reasoningLevel ?? role.reasoningLevel
+    const capabilities = await provider.getCapabilities()
+    if (model !== undefined && capabilities.models) {
+      const models = await provider.listModels()
+      if (models.length > 0 && !models.some((m) => m.id === model)) {
+        throw new GroupError('MODEL_UNAVAILABLE', `model "${model}" is not available on the ${provider.name} runtime`)
+      }
+    }
+    if (reasoningLevel !== undefined) {
+      const levels = (await provider.listReasoningLevels?.()) ?? []
+      if (levels.length > 0 && !levels.some((level) => level.id === reasoningLevel)) {
+        throw new GroupError('REASONING_UNAVAILABLE', `reasoning level "${reasoningLevel}" is not available on the ${provider.name} runtime`)
+      }
+    }
+
+    await this.activity.append({
+      groupId,
+      type: 'member_spawn_requested',
+      actorId: requestedBy,
+      payload: { role: roleId, runtime: role.runtime, model, reasoningLevel },
+    })
+    const agentId = randomUUID()
+    let handle: RuntimeAgentHandle
+    try {
+      handle = await provider.spawnAgent({
+        groupId,
+        agentId,
+        role: roleId,
+        profile: role.profile,
+        model,
+        reasoningLevel,
+        systemPrompt: role.systemPrompt,
+        workspace: group.cwd,
+        parentMemberId: group.leaderSessionId,
+      })
+    } catch (error) {
+      await this.activity.append({
+        groupId,
+        type: 'member_runtime_failed',
+        actorId: requestedBy,
+        payload: { role: roleId, runtime: role.runtime, error: error instanceof Error ? error.message : String(error) },
+      })
+      throw new GroupError('SPAWN_FAILED', `failed to start ${role.name}: ${error instanceof Error ? error.message : String(error)}`)
+    }
+    const member = await this.groups.addMember(group.groupId, {
+      sessionId: agentId,
+      profileId: role.profile ?? 'group-member',
+      name: name ?? role.name,
+      role: 'member',
+      status: 'idle',
+      displayRole: role.name,
+      roleId: roleId,
+      runtime: role.runtime,
+      model,
+      reasoningLevel,
+    })
+    this.externalHandles.set(agentId, handle)
+    // External runtimes resolve on exit → record the member's result draft.
+    void handle.waitExit().then((result) => this.onRuntimeExit(group.groupId, agentId, result)).catch(() => undefined)
+
+    await this.activity.append({
+      groupId,
+      type: 'member_runtime_started',
+      actorName: member.name,
+      refMemberId: agentId,
+      payload: { role: roleId, runtime: role.runtime, model, reasoningLevel },
+    })
+    await this.channel.post(group.groupId, {
+      senderId: 'system',
+      senderName: 'System',
+      kind: 'system',
+      text: `${member.name} joined as ${role.name} (runtime: ${role.runtime}${model !== undefined ? `, model: ${model}` : ''}${reasoningLevel !== undefined ? `, reasoning: ${reasoningLevel}` : ''}).`,
+    })
+    return member
+  }
+
+  /** External process exit → auto result draft for the member's current task. */
+  private async onRuntimeExit(groupId: GroupId, agentId: string, result: { code: number; output: string }): Promise<void> {
+    this.externalHandles.delete(agentId)
+    let member: GroupMember
+    try {
+      member = this.groups.requireMember(groupId, agentId)
+    } catch {
+      return // member already removed
+    }
+    if (member.status === 'left') return // removed before the exit landed
+    if (result.code === 0) {
+      const taskId = member.currentTaskId
+      if (taskId !== undefined) {
+        const task = this.tasks.requireTask(groupId, taskId)
+        if (task.result === undefined && (task.status === 'in_progress' || task.status === 'pending' || task.status === 'blocked')) {
+          const summary = result.output.trim().slice(-1200) || `${member.name} finished the task.`
+          await this.tasks.complete(groupId, taskId, agentId, {
+            summary,
+            artifacts: [],
+            completionClaim: true,
+          })
+        }
+      }
+      await this.activity.append({
+        groupId,
+        type: 'member_runtime_stopped',
+        actorName: member.name,
+        refMemberId: agentId,
+        payload: { exitCode: 0, role: member.roleId, runtime: member.runtime },
+      })
+    } else {
+      const snippet = result.output.trim().slice(-300)
+      await this.activity.append({
+        groupId,
+        type: 'member_runtime_failed',
+        actorName: member.name,
+        refMemberId: agentId,
+        payload: { exitCode: result.code, role: member.roleId, runtime: member.runtime, snippet },
+      })
+      await this.groups.patchMember(groupId, agentId, { error: snippet.length > 0 ? `runtime exited ${result.code}: ${snippet}` : `runtime exited ${result.code}`, status: 'failed' })
+    }
+  }
+
+  /** Registry view for the Team Configuration UI (no secrets, §32/§33). */
+  async runtimesView(): Promise<Array<{
+    id: string
+    name: string
+    description?: string
+    available: boolean
+    capabilities: import('./runtime/base.js').RuntimeCapabilities
+    models: readonly import('./runtime/base.js').ModelDescriptor[]
+    reasoningLevels: readonly import('./runtime/base.js').ReasoningOption[]
+  }>> {
+    return Promise.all(this.runtimes.list().map(async (provider) => ({
+      id: provider.id,
+      name: provider.name,
+      description: provider.description,
+      available: await provider.isAvailable(),
+      capabilities: await provider.getCapabilities(),
+      models: await provider.listModels(),
+      reasoningLevels: await provider.listReasoningLevels?.() ?? [],
+    })))
+  }
+
+  /** Leader view of the Team Configuration + live instance counts. */
+  teamStatus(actor: string): unknown {
+    const { group } = this.leaderActor(actor)
+    const config = this.teamConfig(group)
+    const members = this.groups.listMembers(group.groupId, () => undefined)
+    return {
+      leaderRoleId: config.leaderRole.id,
+      roles: config.memberRoles.map((role) => ({
+        id: role.id,
+        name: role.name,
+        runtime: role.runtime,
+        model: role.model ?? null,
+        reasoningLevel: role.reasoningLevel ?? null,
+        profile: role.profile ?? null,
+        maxInstances: role.maxInstances ?? null,
+        running: members.filter((member) => member.roleId === role.id && member.status !== 'left').length,
+      })),
+    }
+  }
+
   // ── Leader operations ─────────────────────────────────────────────────────
 
   async initGroup(
@@ -111,7 +368,10 @@ export class GroupHost {
   ): Promise<GroupRecord> {
     void this.leaders.register(actor)
     const cwd = this.adapter.liveAgent(actor)?.agent.session.header.cwd
-    const group = await this.groups.initGroup(actor, this.actorDisplayName(actor), input.name, input, { cwd })
+    const group = await this.groups.initGroup(actor, this.actorDisplayName(actor), input.name, input, {
+      cwd,
+      teamConfig: teamConfigFor(undefined, undefined),
+    })
     await this.channel.post(group.groupId, {
       senderId: 'system',
       senderName: 'System',
@@ -238,19 +498,31 @@ export class GroupHost {
     this.groups.assertDispatchable(group)
     this.groups.requireMember(group.groupId, input.ownerId)
     const task = await this.tasks.assign(group.groupId, input.taskId, input.ownerId, actor, input.expectedRevision)
+    // record the member's current task (external runtimes cannot claim themselves)
+    await this.groups.patchMember(group.groupId, input.ownerId, { currentTaskId: task.taskId })
     if (input.deliver !== false) {
-      await this.adapter.deliver(
+      const delivered = await this.adapter.deliver(
         input.ownerId,
         textContent(this.taskBrief(group, task)),
         groupMessageSource(group.groupId, { direction: 'leader-to-member', label: 'task assignment' }),
       )
+      if (!delivered) {
+        const handle = this.externalHandles.get(input.ownerId)
+        if (handle?.sendInput !== undefined) {
+          await handle.sendInput(this.taskBrief(group, task))
+        }
+      }
     }
     return task
   }
 
   async verifyTask(actor: string, input: { taskId: string; passed: boolean; notes?: string }): Promise<GroupTask> {
     const { group } = this.leaderActor(actor)
-    return this.tasks.verify(group.groupId, input.taskId, actor, input.passed, input.notes)
+    const task = await this.tasks.verify(group.groupId, input.taskId, actor, input.passed, input.notes)
+    if (input.passed && task.ownerId !== undefined) {
+      await this.groups.patchMember(group.groupId, task.ownerId, { currentTaskId: undefined })
+    }
+    return task
   }
 
   async reopenTask(actor: string, input: { taskId: string; reason?: string }): Promise<GroupTask> {
@@ -342,7 +614,9 @@ export class GroupHost {
   async claimTask(actor: string, input: { taskId: string; expectedRevision?: number }): Promise<GroupTask> {
     const { group } = this.memberContext(actor)
     this.groups.assertDispatchable(group)
-    return this.tasks.claim(group.groupId, input.taskId, actor, input.expectedRevision)
+    const task = await this.tasks.claim(group.groupId, input.taskId, actor, input.expectedRevision)
+    await this.groups.patchMember(group.groupId, actor, { currentTaskId: task.taskId })
+    return task
   }
 
   async completeTask(actor: string, input: { taskId: string; summary: string; artifacts: string[]; changedFiles?: string[]; tests?: AgentTaskResult['tests']; risks?: string[]; unresolved?: string[]; completionClaim: boolean }): Promise<GroupTask> {
@@ -594,6 +868,7 @@ export class GroupHost {
       templateId: input.templateId,
       maxMembers: input.maxMembers,
       cwd,
+      teamConfig: teamConfigFor(input.templateId, undefined),
     })
     await this.channel.post(group.groupId, {
       senderId: 'system',
@@ -643,8 +918,15 @@ export class GroupHost {
     this.groups.assertMutable(group)
     const member = this.groups.requireMember(group.groupId, memberSessionId)
     if (member.role === 'leader') throw new GroupError('CONFLICT', 'the Leader cannot be removed')
-    await this.adapter.disposeMember(memberSessionId)
+    // Mark the member left FIRST so a concurrent runtime-exit callback (from
+    // stop) cannot resurrect it; then stop the external process / DSH handle.
     await this.groups.removeMember(group.groupId, memberSessionId)
+    const handle = this.externalHandles.get(memberSessionId)
+    if (handle !== undefined) {
+      this.externalHandles.delete(memberSessionId)
+      await handle.stop()
+    }
+    await this.adapter.disposeMember(memberSessionId)
     await this.activity.append({
       groupId,
       type: 'member_removed',

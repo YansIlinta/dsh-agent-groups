@@ -179,6 +179,25 @@ export async function handleApi(
     return
   }
 
+  // ── V0.4: team configuration + runtimes ──────────────────────────────────
+
+  if (rest.length === 1 && rest[0] === 'runtimes' && method === 'GET') {
+    sendJson(res, 200, await host.runtimesView())
+    return
+  }
+
+  if (rest.length === 3 && rest[0] === 'groups' && rest[2] === 'team-config' && method === 'GET') {
+    const group = host.groups.requireGroup(rest[1]!)
+    sendJson(res, 200, host.teamConfig(group))
+    return
+  }
+
+  if (rest.length === 3 && rest[0] === 'groups' && rest[2] === 'team-config' && method === 'PUT') {
+    const body = (await readJsonBody(req)) ?? {}
+    sendJson(res, 200, await host.updateTeamConfig(rest[1]!, normalizeTeamConfig(body), 'User'))
+    return
+  }
+
   // ── notes / workspace ─────────────────────────────────────────────────────
 
   if (rest.length === 3 && rest[0] === 'groups' && rest[2] === 'notes' && method === 'GET') {
@@ -208,6 +227,15 @@ export async function handleApi(
 
   if (rest.length === 3 && rest[0] === 'groups' && rest[2] === 'members' && method === 'POST') {
     const body = (await readJsonBody(req)) ?? {}
+    if (body.role !== undefined) {
+      // V0.4: role-based member (Team Configuration decides the runtime config)
+      const member = await host.userSpawnByRole(rest[1]!, {
+        role: stringOf(body.role, 'role'),
+        name: optionalString(body.name),
+      })
+      sendJson(res, 200, member)
+      return
+    }
     const member = await host.userSpawnMember(rest[1]!, {
       profileId: stringOf(body.profileId, 'profileId'),
       name: optionalString(body.name),
@@ -307,6 +335,35 @@ function leaderChat(host: GroupHost, groupId: string): unknown[] {
   return host.privateMessages
     .listForGroup(group.groupId, group.leaderSessionId)
     .filter((m) => m.direction === 'user-to-leader' || m.direction === 'leader-to-user')
+}
+
+
+/** Coerce an inbound TeamConfig body into the durable shape. */
+function normalizeTeamConfig(body: Record<string, unknown>): import('../core-types.js').TeamConfig {
+  const roles = (def: unknown): Array<Record<string, unknown>> => (Array.isArray(def) ? def : []) as Array<Record<string, unknown>>
+  const roleDef = (raw: unknown, fallbackId: string): import('../core-types.js').AgentRoleDefinition => {
+    const r = (typeof raw === 'object' && raw !== null ? raw : {}) as Record<string, unknown>
+    const id = optionalString(r.id) ?? fallbackId
+    return {
+      id,
+      name: optionalString(r.name) ?? id,
+      description: optionalString(r.description),
+      runtime: optionalString(r.runtime) ?? 'deepseek-harness',
+      profile: optionalString(r.profile),
+      model: optionalString(r.model),
+      reasoningLevel: optionalString(r.reasoningLevel),
+      systemPrompt: optionalString(r.systemPrompt),
+      maxInstances: optionalNumber(r.maxInstances),
+      defaultInstances: optionalNumber(r.defaultInstances),
+      tools: Array.isArray(r.tools) ? r.tools.map(String) : undefined,
+      metadata: typeof r.metadata === 'object' && r.metadata !== null ? r.metadata as Record<string, unknown> : undefined,
+    }
+  }
+  const leaderRaw = (typeof body.leaderRole === 'object' && body.leaderRole !== null ? body.leaderRole : {}) as Record<string, unknown>
+  return {
+    leaderRole: roleDef(leaderRaw, optionalString(leaderRaw.id) ?? 'leader'),
+    memberRoles: roles(body.memberRoles).map((r, index) => roleDef(r, `role-${index + 1}`)),
+  }
 }
 
 function stringOf(value: unknown, name: string): string {

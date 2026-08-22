@@ -27,6 +27,9 @@ import { installMemberPeerContactPolicy } from './policy.js'
 import { buildCompatibilityReport, detectSurfaces, printCompatibility } from './compatibility.js'
 import { createGroupWebApi } from './web/api.js'
 import { LeaderRegistry } from './leader-registry.js'
+import { RuntimeRegistry } from './runtime/registry.js'
+import { DeepSeekHarnessRuntimeProvider } from './runtime/deepseek-harness.js'
+import { CodexRuntimeProvider } from './runtime/codex.js'
 
 export { GroupHost } from './group-host.js'
 export { GroupError, type GroupErrorCode } from './group-service.js'
@@ -39,6 +42,11 @@ export { LeaderRegistry } from './leader-registry.js'
 export { TEAM_TEMPLATES, listTemplates, getTemplate, requireTemplate, templateMemberSlots } from './template-registry.js'
 export { MemoryStore } from './store.js'
 export type { TableStore } from './store.js'
+export { RuntimeRegistry, RuntimeError } from './runtime/registry.js'
+export { DeepSeekHarnessRuntimeProvider } from './runtime/deepseek-harness.js'
+export { CodexRuntimeProvider } from './runtime/codex.js'
+export { teamConfigFor, templateTeamConfig, ROLE_TEMPLATES, LEADER_ROLE, GENERALIST_ROLE } from './runtime/team-config.js'
+export type { AgentRuntimeProvider, RuntimeAgentHandle, RuntimeAgentConfig, RuntimeCapabilities, ModelDescriptor, ReasoningOption } from './runtime/base.js'
 export * from './core-types.js'
 
 export const name = 'agent-groups'
@@ -92,7 +100,15 @@ export async function apply(ctx: Context): Promise<void> {
   )
   const leaders = new LeaderRegistry(stores.leaders)
 
-  const host = new GroupHost({ groups, tasks, channel, privateMessages, activity, profiles, notifier, adapter, leaders })
+  // V0.4: runtime registry — role-based spawns resolve through providers.
+  const runtimes = new RuntimeRegistry()
+  runtimes.register(new DeepSeekHarnessRuntimeProvider(
+    adapter,
+    { currentSelection: () => (agentDefaultModel?.currentSelection() ?? {}) },
+  ))
+  runtimes.register(new CodexRuntimeProvider())
+
+  const host = new GroupHost({ groups, tasks, channel, privateMessages, activity, profiles, notifier, adapter, leaders, runtimes })
   ctx.provide('groupHost', host)
 
   // Policy: no raw peer messaging for group members (defense-in-depth).

@@ -53,6 +53,12 @@ const ACTIVITY_TYPES = [
   'notes_updated',
   'group_duplicated',
   'group_status',
+  'member_spawn_requested',
+  'member_runtime_starting',
+  'member_runtime_started',
+  'member_runtime_failed',
+  'member_runtime_stopped',
+  'team_config_updated',
 ] as const
 
 const profileSchema = z.object({
@@ -85,6 +91,26 @@ const missionSchema = z.object({
   risks: z.array(str),
 })
 
+const roleDefinitionSchema = z.object({
+  id: str,
+  name: str,
+  description: str.optional(),
+  runtime: str,
+  profile: str.optional(),
+  model: str.optional(),
+  reasoningLevel: str.optional(),
+  systemPrompt: str.optional(),
+  maxInstances: z.number().optional(),
+  defaultInstances: z.number().optional(),
+  tools: z.array(str).optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+})
+
+const teamConfigSchema = z.object({
+  leaderRole: roleDefinitionSchema,
+  memberRoles: z.array(roleDefinitionSchema),
+})
+
 const groupSchema = z.object({
   groupId: str,
   name: str,
@@ -102,6 +128,7 @@ const groupSchema = z.object({
   templateId: str.optional(),
   maxMembers: z.number().optional(),
   updatedAt: z.number().optional(),
+  teamConfig: teamConfigSchema.optional(),
 })
 
 const memberSchema = z.object({
@@ -116,6 +143,10 @@ const memberSchema = z.object({
   error: str.optional(),
   lastActiveAt: z.number().optional(),
   displayRole: str.optional(),
+  roleId: str.optional(),
+  runtime: str.optional(),
+  model: str.optional(),
+  reasoningLevel: str.optional(),
 })
 
 const taskResultSchema = z.object({

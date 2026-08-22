@@ -25,6 +25,17 @@ Duurable: group/mission/workstreams/tasks/channel/private/timeline (DSH storage 
 - **Native page** — the UI is a DSH client bundle (`dsh.client` declaration, `/plugins/@dsh-agent-groups/host/client.js`): an “Agent Groups” entry in the sidebar footer and a full-frame page on the shell overlay. Group list → group detail tabs (Overview/Tasks/Team/Channel/Activity) → create-group dialog, live through `/groups/api/*` + SSE. No iframe, no second app shell, no `/groups/` site.
 - **Compatibility diagnostic at boot** — prints the DSH Agent Groups banner and **fails loud** if a required DSH surface is missing.
 
+### V0.4 — configurable roles, models & runtime adapters
+
+| Area | What was added |
+| --- | --- |
+| Roles | **Agent Role Definitions** as first-class durable config (runtime / model / reasoningLevel / profile / systemPrompt / maxInstances / defaultInstances). Old groups load with derived defaults (migration). |
+| Team Config | `TeamConfig` (leaderRole + memberRoles) on the group record; built-in role templates (Planner/Researcher/Architect/Implementation/Reviewer/Generalist); team templates now just role sets — no runtime coupling; **Configuration tab** in the native page edits roles (runtime-aware model & reasoning selects, availability badges). |
+| Runtime layer | `runtime/` module: `AgentRuntimeProvider` interface + `RuntimeRegistry`; **DeepSeek Harness provider** (existing DSH member factory, now with role-configured **reasoning effort** via `installModelSelection`); **Codex provider** (real `codex exec` subprocess per assigned task, lazy start, credential-based availability, workspace-scoped, output captured back into the task result). |
+| Leader | `leader_spawn_role({role})` + `leader_team_status`; Leader picks a ROLE, never model/reasoning ids; legacy `leader_spawn_member` stays. Instance limits → `ROLE_INSTANCE_LIMIT`; unavailable runtime/model/reasoning fail clearly (`RUNTIME_UNAVAILABLE` / `MODEL_UNAVAILABLE` / `REASONING_UNAVAILABLE`). |
+| Members | Instances carry roleId/runtime/model/reasoningLevel; `currentTaskId` is now actually recorded on assign/claim (was a dead field); external process exits auto-submit a result draft; remove-member → left first so a runtime-exit callback cannot resurrect it. |
+| Activity | `member_spawn_requested` / `member_runtime_starting` / `member_runtime_started` / `member_runtime_failed` / `member_runtime_stopped` / `team_config_updated` (no credentials in payloads). |
+
 ### V0.2 — the team workspace
 
 | Area | What was added |
@@ -59,6 +70,7 @@ packages/
       leader.ts / member.ts   preset addon plugins  leader-prompt.ts / member-prompt.ts
       compatibility.ts     boot diagnostic          web/api.ts  data API + SSE + /groups → / redirect
       native-client/       DSH-native page source (plain CommonJS; built by scripts/build-native-client.mjs)
+      runtime/             V0.4: provider base + RuntimeRegistry + DeepSeek Harness / Codex providers + process runtime + team config
   profiles/     presets (group-leader, group-member) + web-profile patch fragment
 scripts/        install-web-profile.sh, relaunch-web.sh, patch-profile.mjs, verify-durability.mjs, demo-v02.mjs, build-native-client.mjs
 ```
@@ -130,6 +142,7 @@ dashboard URL anymore.
 2. In the DSH sidebar foot click **Agent Groups** → **New Group** → pick the **Software Team** template → name + mission (“Build a small analytics dashboard”) → the picker shows the free Leader session → **Create**. The group and its 5 members materialize immediately; the Leader sees everything via its tools.
 3. Watch **Team**: leader + members with role/profile/status/current task.
 4. On **Tasks**: the list fills as the Leader decomposes (title/status/assignee/dependencies/updated).
+5. On **Roles** (Configuration): the Team's role set is editable — runtime/model/reasoning/profile/max instances per role, availability per runtime; **Add Member** on Team spawns by role.
 5. On **Channel**: read agent chatter and post a team-wide instruction (e.g., “Please avoid changing the database schema.”) — new messages appear live via SSE.
 6. On **Activity**: the durable event feed (member joined, task created/assigned/claimed/completed, message posted, group status changed…) updates live.
 7. Re-open the page after a refresh → the last group/tab is restored.
@@ -154,6 +167,7 @@ It boots the **same cordis storage stack** over a throwaway root and drives the 
 - **Conflicts** — nested/identical/disjoint write scopes, non-terminal-only reporting.
 - **Profiles** — built-ins present, register/get/remove over the durable table.
 - **V0.2** — team templates (slots + valid profiles); task editing (fields/CAS/guards + `task_updated`); user hold → board blocked without DAG changes; channel reply + pin/unpin with history kept; mission notes durable; pause gate blocks dispatch but keeps messaging; archive hides/restores and blocks mutations; duplicate copies mission/workstreams and re-materializes members (completion/archive required); known-leader registry + Agent Groups page creation with template members; user↔leader private directions; **backward compatibility** — V0.1 group/task/channel/private records still parse with the extended schema.
+- **V0.4 roles & runtimes** — role templates & derivation; old-group migration; team-config persistence + validation; role-based spawn picks the configured runtime/model/reasoning/profile/workspace; instance limits; unavailable runtime / invalid model / invalid reasoning fail clearly; legacy spawn compatibility; external exit auto-result and failure handling; remove/exit race; registry semantics; API routes for `/groups/api/runtimes` and `/groups/api/groups/:id/team-config`.
 - **V0.3 API routes** — the `/groups/api/*` dispatcher is now covered with fake request/response harnesses: broadcast and members POSTs are no longer shadowed by the group-action branch, group actions still dispatch, unknown sub-paths 404 cleanly, collections return JSON.
 
 ## Design notes & constraints honored

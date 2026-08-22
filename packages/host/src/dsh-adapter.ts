@@ -7,8 +7,9 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, AgentRegistry } from '@deepseek-ai/dsh-agent'
+import { installModelSelection } from '@deepseek-ai/dsh-agent'
 import { SessionId } from '@deepseek-ai/dsh-session'
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, MessageSource } from '@deepseek-ai/dsh-llm'
 import type { AgentPresets } from '@deepseek-ai/dsh-agent-presets'
 
@@ -30,6 +31,8 @@ export interface MemberCreateSpec {
   readonly cwd?: string
   readonly provider?: string
   readonly model?: string
+  /** V0.4: abstract reasoning level (low/medium/high) mapped onto the DSH model-selection reasoning effort. */
+  readonly reasoningLevel?: string
 }
 
 /**
@@ -112,6 +115,8 @@ export class DshAgentRuntimeAdapter implements AgentRuntimeAdapter {
   async createMemberAgent(spec: MemberCreateSpec): Promise<void> {
     const sessionId = SessionId(spec.sessionId)
     const selection = this.selection()
+    const provider = spec.provider ?? selection.provider
+    const model = spec.model ?? selection.model
     const handle = await this.agents.create({
       sessionId,
       meta: {
@@ -120,13 +125,22 @@ export class DshAgentRuntimeAdapter implements AgentRuntimeAdapter {
         origin: 'subagent',
       },
       agentOptions: {
-        provider: spec.provider ?? selection.provider,
-        model: spec.model ?? selection.model,
+        provider,
+        model,
       },
       setup: async (agentCtx: Context) => {
         // The member world: work tools + group member tools + member section,
         // taken from the shipped `group-member` agent preset.
         await this.agentPresets.mount(agentCtx, MEMBER_PRESET_ID)
+        // V0.4: role-configured reasoning effort rides the agent-scoped model
+        // selection (the DSH entry point for reasoning strength per agent).
+        if (provider !== undefined && model !== undefined && spec.reasoningLevel !== undefined) {
+          const effort = ReasoningEffortId(spec.reasoningLevel)
+          agentCtx.effect(() => installModelSelection(agentCtx, {
+            current: { provider, model, reasoningEffort: effort },
+            assembled: undefined,
+          }))
+        }
       },
     })
     this.handles.set(spec.sessionId, handle)

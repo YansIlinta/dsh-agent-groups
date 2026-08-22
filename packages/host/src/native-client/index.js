@@ -364,7 +364,7 @@ function CreateGroupDialog({ onClose, onCreated }) {
 
 // ── group detail: tabs ─────────────────────────────────────────────────────
 
-const TABS = ['overview', 'tasks', 'team', 'channel', 'activity']
+const TABS = ['overview', 'tasks', 'team', 'channel', 'activity', 'roles']
 
 function GroupDetail({ groupId, tab, onBack, onTab }) {
   const [snap, setSnap] = React.useState(null)
@@ -420,6 +420,7 @@ function GroupDetail({ groupId, tab, onBack, onTab }) {
           tab === 'team' && React.createElement(TeamTab, { snap }),
           tab === 'channel' && React.createElement(ChannelTab, { snap, onMessage: load }),
           tab === 'activity' && React.createElement(ActivityTab, { snap }),
+          tab === 'roles' && React.createElement(RolesTab, { snap }),
         ),
   )
 }
@@ -505,27 +506,90 @@ function TasksTab({ snap }) {
 }
 
 function TeamTab({ snap }) {
-  const { members, tasks } = snap
+  const { members, tasks, group } = snap
+  const [addOpen, setAddOpen] = React.useState(false)
   const live = members.filter((m) => m.status !== 'left')
   const taskTitle = (id) => tasks.find((t) => t.taskId === id)?.subject ?? '—'
-  return React.createElement('table', { className: 'ag-table' },
-    React.createElement('thead', null,
-      React.createElement('tr', null,
-        React.createElement('th', null, 'Agent'),
-        React.createElement('th', null, 'Role'),
-        React.createElement('th', null, 'Profile'),
-        React.createElement('th', null, 'Status'),
-        React.createElement('th', null, 'Current task'),
-      )),
-    React.createElement('tbody', null,
-      live.map((member) =>
-        React.createElement('tr', { key: member.sessionId },
-          React.createElement('td', null, React.createElement('strong', null, member.name), member.role === 'leader' && React.createElement('span', { className: 'ag-badge', style: { marginLeft: 6 } }, 'leader')),
-          React.createElement('td', null, member.displayRole ?? member.role),
-          React.createElement('td', { className: 'ag-monoblock' }, member.profileId),
-          React.createElement('td', null, statusBadge(member.liveStatus ?? member.status)),
-          React.createElement('td', { className: 'ag-note' }, member.currentTaskId !== undefined ? taskTitle(member.currentTaskId) : 'idle'),
+  return React.createElement('div', { className: 'ag-col' },
+    React.createElement('div', { className: 'ag-toolbar' },
+      React.createElement(Button, { variant: 'primary', size: 'sm', icon: React.createElement(primitives.IconPlusOutline16, {}), onClick: () => setAddOpen(true) }, 'Add Member'),
+      React.createElement('span', { className: 'ag-note', style: { marginLeft: 'auto' } }, `${live.filter((m) => m.role === 'member').length} member(s)`),
+    ),
+    React.createElement('table', { className: 'ag-table' },
+      React.createElement('thead', null,
+        React.createElement('tr', null,
+          React.createElement('th', null, 'Agent'),
+          React.createElement('th', null, 'Role'),
+          React.createElement('th', null, 'Runtime'),
+          React.createElement('th', null, 'Model'),
+          React.createElement('th', null, 'Reasoning'),
+          React.createElement('th', null, 'Status'),
+          React.createElement('th', null, 'Current task'),
         )),
+      React.createElement('tbody', null,
+        live.map((member) =>
+          React.createElement('tr', { key: member.sessionId },
+            React.createElement('td', null, React.createElement('strong', null, member.name), member.role === 'leader' && React.createElement('span', { className: 'ag-badge', style: { marginLeft: 6 } }, 'leader')),
+            React.createElement('td', null, member.roleId ?? member.displayRole ?? member.role),
+            React.createElement('td', { className: 'ag-monoblock' }, member.runtime ?? '—'),
+            React.createElement('td', { className: 'ag-monoblock' }, member.model ?? '—'),
+            React.createElement('td', null, member.reasoningLevel ?? '—'),
+            React.createElement('td', null, statusBadge(member.liveStatus ?? member.status)),
+            React.createElement('td', { className: 'ag-note' }, member.currentTaskId !== undefined ? taskTitle(member.currentTaskId) : member.role === 'leader' ? 'orchestrating' : 'idle'),
+          )),
+      ),
+    ),
+    addOpen && React.createElement(AddMemberModal, { groupId: group.groupId, onClose: () => setAddOpen(false) }),
+  )
+}
+
+function AddMemberModal({ groupId, onClose }) {
+  const [roles, setRoles] = React.useState([])
+  const [role, setRole] = React.useState('')
+  const [name, setName] = React.useState('')
+  const [busy, setBusy] = React.useState(false)
+  const [error, setError] = React.useState(null)
+
+  React.useEffect(() => {
+    api(`/groups/api/groups/${encodeURIComponent(groupId)}/team-config`).then((config) => {
+      setRoles(config.memberRoles)
+      if (config.memberRoles.length > 0) setRole(config.memberRoles[0].id)
+    }).catch(() => undefined)
+  }, [groupId])
+
+  const add = async () => {
+    if (busy) return
+    setBusy(true)
+    setError(null)
+    try {
+      await api(`/groups/api/groups/${encodeURIComponent(groupId)}/members`, {
+        method: 'POST', body: JSON.stringify({ role, ...(name.trim() !== '' ? { name: name.trim() } : {}) }),
+      })
+      onClose()
+    } catch (cause) {
+      setError(errorOf(cause))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return React.createElement(Modal, {
+    open: true, onClose, title: 'Add Member (by team role)',
+    footer: React.createElement('div', { style: { display: 'flex', gap: 8, justifyContent: 'flex-end' } },
+      React.createElement(Button, { variant: 'ghost', size: 'sm', onClick: onClose }, 'Cancel'),
+      React.createElement(Button, { variant: 'primary', size: 'sm', onClick: () => void add(), disabled: busy || role === '' }, busy ? 'Joining…' : 'Join Team'),
+    ),
+  },
+    React.createElement('div', { className: 'ag-form' },
+      error !== null && React.createElement(ErrorLine, { message: error }),
+      React.createElement('label', null, 'Team role (runtime/model/reasoning come from the configuration)',
+        React.createElement('select', { value: role, onChange: (e) => setRole(e.target.value), style: { padding: 6, borderRadius: 6, border: '1px solid var(--dsw-alias-border-l1)', background: 'var(--dsw-alias-bg-layer-2)', color: 'var(--dsw-alias-label-primary)' } },
+          roles.map((r) => React.createElement('option', { key: r.id, value: r.id }, `${r.name} [${r.runtime}]`)),
+        ),
+      ),
+      React.createElement('label', null, 'Display name (optional)',
+        React.createElement(Input, { value: name, onChange: (e) => setName(e.target.value), placeholder: 'planner-1' }),
+      ),
     ),
   )
 }
@@ -619,6 +683,138 @@ function ActivityTab({ snap }) {
         ),
         React.createElement('span', { className: 'when' }, fmtTime(event.timestamp)),
       )),
+  )
+}
+
+
+// ── Team Configuration (V0.4): roles + runtimes ────────────────────────────
+
+function RolesTab({ snap }) {
+  const groupId = snap.group.groupId
+  const [config, setConfig] = React.useState(null)
+  const [runtimes, setRuntimes] = React.useState([])
+  const [error, setError] = React.useState(null)
+  const [saved, setSaved] = React.useState(null)
+  const [busy, setBusy] = React.useState(false)
+
+  const load = React.useCallback(() => {
+    setError(null)
+    api(`/groups/api/groups/${encodeURIComponent(groupId)}/team-config`).then(setConfig).catch((err) => setError(errorOf(err)))
+    api('/groups/api/runtimes').then(setRuntimes).catch(() => undefined)
+  }, [groupId])
+
+  React.useEffect(() => { load() }, [load])
+
+  const save = async () => {
+    if (busy || config === null) return
+    setBusy(true)
+    setError(null)
+    try {
+      const updated = await api(`/groups/api/groups/${encodeURIComponent(groupId)}/team-config`, {
+        method: 'PUT', body: JSON.stringify(config),
+      })
+      setConfig(updated.teamConfig)
+      setSaved('Team configuration saved.')
+      window.setTimeout(() => setSaved(null), 2500)
+    } catch (cause) {
+      setError(errorOf(cause))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const patchRole = (index, patch) => {
+    setConfig((current) => {
+      if (current === null) return current
+      const roles = current.memberRoles.map((role, i) => (i === index ? { ...role, ...patch } : role))
+      return { ...current, memberRoles: roles }
+    })
+  }
+  const addRole = () => {
+    setConfig((current) => (current === null ? current : {
+      ...current,
+      memberRoles: [...current.memberRoles, {
+        id: `role-${Date.now().toString(36)}`, name: 'New Role', runtime: 'deepseek-harness',
+        profile: 'group-member', reasoningLevel: 'medium', maxInstances: 2,
+      }],
+    }))
+  }
+  const removeRole = (index) => {
+    setConfig((current) => (current === null ? current : {
+      ...current,
+      memberRoles: current.memberRoles.filter((_, i) => i !== index),
+    }))
+  }
+
+  if (config === null) return React.createElement(Spinner)
+
+  return React.createElement('div', { className: 'ag-col' },
+    error !== null && React.createElement(ErrorLine, { message: error }),
+    React.createElement('div', { className: 'ag-toolbar' },
+      React.createElement(Button, { variant: 'primary', size: 'sm', onClick: () => void save(), disabled: busy }, busy ? 'Saving…' : 'Save Team Configuration'),
+      React.createElement(Button, { variant: 'ghost', size: 'sm', onClick: addRole, icon: React.createElement(primitives.IconPlusOutline16, {}) }, 'Add Role'),
+      saved !== null && React.createElement('span', { className: 'ag-note' }, saved),
+    ),
+    React.createElement('div', { className: 'ag-note', style: { marginBottom: 8 } },
+      'Configured Roles define HOW each kind of member spawns (runtime / model / reasoning / profile / max instances). Running instances appear on the Team tab.'),
+    React.createElement('div', { className: 'ag-col' },
+      React.createElement(RoleCard, {
+        role: config.leaderRole, leader: true,
+        runtimes, onPatch: () => undefined, onRemove: () => undefined,
+      }),
+      config.memberRoles.map((role, index) => React.createElement(RoleCard, {
+        key: role.id, role, runtimes,
+        onPatch: (patch) => patchRole(index, patch),
+        onRemove: () => removeRole(index),
+      })),
+    ),
+  )
+}
+
+function RoleCard({ role, leader, runtimes, onPatch, onRemove }) {
+  const runtime = runtimes.find((r) => r.id === role.runtime)
+  const unavailable = runtime !== undefined && !runtime.available
+  const models = runtime?.capabilities?.models === true ? (runtime.models ?? []) : []
+  const levels = (runtime?.reasoningLevels?.length ?? 0) > 0 ? runtime.reasoningLevels : [{ id: 'low', label: 'Low' }, { id: 'medium', label: 'Medium' }, { id: 'high', label: 'High' }]
+  return React.createElement('div', { style: { border: '1px solid var(--dsw-alias-border-l1)', borderRadius: 10, padding: 10, marginBottom: 10, background: 'var(--dsw-alias-bg-layer-1)' } },
+    React.createElement('div', { className: 'ag-toolbar', style: { marginBottom: 6 } },
+      React.createElement('strong', null, role.name),
+      React.createElement('span', { className: 'ag-monoblock' }, role.id),
+      leader && React.createElement('span', { className: 'ag-badge' }, 'leader'),
+      runtime === undefined && React.createElement('span', { className: 'ag-badge err' }, `runtime "${role.runtime}" not registered`),
+      unavailable && React.createElement('span', { className: 'ag-badge warn' }, 'Not configured'),
+      runtime !== undefined && runtime.available && React.createElement('span', { className: 'ag-badge ok' }, 'Available'),
+      !leader && React.createElement(Button, { variant: 'ghost', size: 'sm', onClick: onRemove, style: { marginLeft: 'auto' } }, 'Remove'),
+    ),
+    React.createElement('div', { className: 'ag-form', style: { gap: 6 } },
+      leader && React.createElement('label', null, 'Description', React.createElement('input', { className: 'ag-input', value: role.description ?? '', disabled: true, style: { padding: 4, borderRadius: 6, border: '1px solid var(--dsw-alias-border-l1)', background: 'var(--dsw-alias-bg-layer-2)', color: 'var(--dsw-alias-label-primary)' } })),
+      React.createElement('div', { className: 'ag-col', style: { flexDirection: 'row', gap: 8, flexWrap: 'wrap' } },
+        React.createElement('label', null, 'Runtime',
+          React.createElement('select', { className: 'ag-input', value: role.runtime, disabled: leader, onChange: (e) => onPatch({ runtime: e.target.value }), style: { padding: 4, borderRadius: 6, border: '1px solid var(--dsw-alias-border-l1)', background: 'var(--dsw-alias-bg-layer-2)', color: 'var(--dsw-alias-label-primary)' } },
+            runtimes.length === 0 ? React.createElement('option', { value: role.runtime }, role.runtime)
+              : runtimes.map((r) => React.createElement('option', { key: r.id, value: r.id }, r.name)),
+          )),
+        React.createElement('label', null, 'Model',
+          React.createElement('select', { className: 'ag-input', value: role.model ?? '', disabled: leader, onChange: (e) => onPatch({ model: e.target.value === '' ? undefined : e.target.value }), style: { padding: 4, borderRadius: 6, border: '1px solid var(--dsw-alias-border-l1)', background: 'var(--dsw-alias-bg-layer-2)', color: 'var(--dsw-alias-label-primary)' } },
+            React.createElement('option', { value: '' }, '— default —'),
+            models.map((m) => React.createElement('option', { key: m.id, value: m.id }, m.name ?? m.id)),
+          )),
+        React.createElement('label', null, 'Reasoning',
+          React.createElement('select', { className: 'ag-input', value: role.reasoningLevel ?? '', disabled: leader, onChange: (e) => onPatch({ reasoningLevel: e.target.value === '' ? undefined : e.target.value }), style: { padding: 4, borderRadius: 6, border: '1px solid var(--dsw-alias-border-l1)', background: 'var(--dsw-alias-bg-layer-2)', color: 'var(--dsw-alias-label-primary)' } },
+            React.createElement('option', { value: '' }, '— default —'),
+            levels.map((level) => React.createElement('option', { key: level.id, value: level.id }, level.label)),
+          )),
+        React.createElement('label', null, 'Profile',
+          React.createElement('input', { className: 'ag-input', value: role.profile ?? '', disabled: leader, onChange: (e) => onPatch({ profile: e.target.value }), style: { padding: 4, borderRadius: 6, border: '1px solid var(--dsw-alias-border-l1)', background: 'var(--dsw-alias-bg-layer-2)', color: 'var(--dsw-alias-label-primary)' } }),
+        ),
+        React.createElement('label', null, 'Max instances',
+          React.createElement('input', { className: 'ag-input', type: 'number', min: 1, value: role.maxInstances ?? '', disabled: leader, onChange: (e) => onPatch({ maxInstances: e.target.value === '' ? undefined : Number(e.target.value) }), style: { width: 80, padding: 4, borderRadius: 6, border: '1px solid var(--dsw-alias-border-l1)', background: 'var(--dsw-alias-bg-layer-2)', color: 'var(--dsw-alias-label-primary)' } }),
+        ),
+      ),
+      !leader && React.createElement('label', null, 'Role instructions (system prompt)',
+        React.createElement('textarea', { className: 'ag-input', rows: 2, value: role.systemPrompt ?? '', onChange: (e) => onPatch({ systemPrompt: e.target.value }), style: { padding: 4, borderRadius: 6, border: '1px solid var(--dsw-alias-border-l1)', background: 'var(--dsw-alias-bg-layer-2)', color: 'var(--dsw-alias-label-primary)', fontFamily: 'inherit' } }),
+      ),
+    ),
   )
 }
 
