@@ -3,6 +3,12 @@
 # package's node_modules so dev/build/test resolve the SAME versions the
 # running `dsh web` uses. In production the profile's healed module fallback
 # supplies these; this script no-ops when no local dsh installation exists.
+#
+# Layouts handled:
+#   nested  — dsh installed under nvm/pnpm stores:
+#             <global>/ @deepseek-ai/dsh/node_modules/@deepseek-ai/cordis
+#   flat    — dsh installed with plain `npm i -g`:
+#             <global>/ @deepseek-ai/cordis  (deps hoisted to the global root)
 set -euo pipefail
 
 PKG_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -10,9 +16,17 @@ NPM_GLOBAL_ROOT="${NPM_GLOBAL_ROOT:-}"
 if [ -z "$NPM_GLOBAL_ROOT" ]; then
   NPM_GLOBAL_ROOT="$(node -p "require('node:child_process').execSync('npm root -g').toString().trim()")" 2>/dev/null || true
 fi
-CANDIDATE="${NPM_GLOBAL_ROOT:-}/@deepseek-ai/dsh/node_modules/@deepseek-ai"
-if [ ! -d "$CANDIDATE" ]; then
-  echo "[agent-groups] no local dsh installation at $CANDIDATE; skipping dev links"
+GLOBAL_ROOT="${NPM_GLOBAL_ROOT:-}"
+
+CANDIDATE=""
+for c in "$GLOBAL_ROOT/@deepseek-ai/dsh/node_modules/@deepseek-ai" "$GLOBAL_ROOT/@deepseek-ai"; do
+  if [ -d "$c/cordis" ]; then
+    CANDIDATE="$c"
+    break
+  fi
+done
+if [ -z "$CANDIDATE" ]; then
+  echo "[agent-groups] no local dsh installation (checked $GLOBAL_ROOT); skipping dev links"
   exit 0
 fi
 
@@ -23,9 +37,15 @@ for p in cordis dsh-tools dsh-llm dsh-session dsh-agent dsh-host-webserver dsh-s
   fi
 done
 # zod used by the domain spec must be the single runtime instance (zod v4)
-DASH_ROOT="$(dirname "$(dirname "$CANDIDATE")")"  # dsh package dir
-if [ -e "$DASH_ROOT/node_modules/zod" ]; then
+ZOD=""
+for z in "$CANDIDATE/../zod" "$GLOBAL_ROOT/zod" "$GLOBAL_ROOT/@deepseek-ai/dsh/node_modules/zod"; do
+  if [ -e "$z/package.json" ]; then
+    ZOD="$z"
+    break
+  fi
+done
+if [ -n "$ZOD" ]; then
   rm -rf "$PKG_DIR/node_modules/zod"
-  ln -sfn "$DASH_ROOT/node_modules/zod" "$PKG_DIR/node_modules/zod"
+  ln -sfn "$ZOD" "$PKG_DIR/node_modules/zod"
 fi
-echo "[agent-groups] dev links ready under $PKG_DIR/node_modules/@deepseek-ai"
+echo "[agent-groups] dev links ready under $PKG_DIR/node_modules/@deepseek-ai (from $CANDIDATE)"
