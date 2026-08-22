@@ -1,0 +1,3 @@
+name: Agent Group · Group Member
+description: 面向 DSH Agent Groups 的 Member 模式：由 Leader 从 Agent 档案物化的持久团队成员。仅负责分配到的任务，可用 shell/fs/jobs/skill 等常规工具完成工作，通过 Group Channel 公开交流或向 Leader 私报；不含 delegation/plan/goal —— Member 永不能派生 peer 或宣布 Mission 完成。
+order: 60

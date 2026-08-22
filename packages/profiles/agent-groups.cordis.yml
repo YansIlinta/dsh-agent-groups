@@ -1,0 +1,9 @@
+# DSH Agent Groups — web profile patch fragment.
+#
+# Append this file's single patch entry (the `- insert:` block) to your web
+# profile's `cordis.patch.yml` to mount the agent-groups host plugin. The
+# plugin resolves to the `@dsh-agent-groups/host` package installed into the
+# profile's module tree. Install with `scripts/install-web-profile.sh`.
+- insert:
+    - id: agent-groups
+      name: '@dsh-agent-groups/host'

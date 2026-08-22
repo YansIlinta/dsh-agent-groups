@@ -1,0 +1,16 @@
+{
+  "name": "@dsh-agent-groups/monorepo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.7.0",
+  "description": "DSH Agent Groups — a multi-agent group product layer on top of DeepSeek Harness (independent plugin, zero DSH source modification)",
+  "scripts": {
+    "build": "npm --prefix packages/host run build && node scripts/build-native-client.mjs",
+    "build:native": "node scripts/build-native-client.mjs",
+    "typecheck": "npm --prefix packages/host run typecheck",
+    "test": "npm --prefix packages/host run test",
+    "install-web-profile": "bash scripts/install-web-profile.sh",
+    "relaunch-web": "bash scripts/relaunch-web.sh"
+  }
+}

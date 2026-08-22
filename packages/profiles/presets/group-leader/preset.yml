@@ -1,0 +1,3 @@
+name: Agent Group · Team Lead
+description: 面向 DSH Agent Groups 的 Leader 模式：从一个会话成为 Agent Group 的 Team Lead，可创建 Mission、从 Agent 档案物化 Members、分解工作流与任务、分配/验证/重计划并最终完成 Mission。随附 group-leader preset：leader_* 工具集与 Team Lead 协议；保留 standard 的 shell/fs/jobs/skill/plan/goal/web 工具，不含 delegation（Leader 的子代理就是组内 Members）。
+order: 50

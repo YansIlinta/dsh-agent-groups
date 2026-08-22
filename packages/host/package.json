@@ -1,0 +1,58 @@
+{
+  "name": "@dsh-agent-groups/host",
+  "version": "0.1.0",
+  "description": "DSH Agent Groups host plugin: durable group/mission/task/channel services, leader & member tools with enforced communication policy, and the group dashboard web API.",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./leader": {
+      "types": "./lib/leader.d.ts",
+      "default": "./lib/leader.js"
+    },
+    "./member": {
+      "types": "./lib/member.d.ts",
+      "default": "./lib/member.js"
+    },
+    "./types": {
+      "types": "./lib/core-types.d.ts",
+      "default": "./lib/core-types.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-locale"
+      ],
+      "platform": "web"
+    }
+  },
+  "files": [
+    "lib"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.test.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "postinstall": "bash scripts/link-dsh-deps.sh"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.0"
+  },
+  "dependencies": {
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.7"
+  }
+}

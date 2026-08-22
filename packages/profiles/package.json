@@ -1,0 +1,10 @@
+{
+  "name": "@dsh-agent-groups/profiles",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DSH Agent Groups deployment assets: the group-leader and group-member agent presets, and the web-profile patch fragment that mounts the host plugin.",
+  "files": [
+    "presets",
+    "agent-groups.cordis.yml"
+  ]
+}
