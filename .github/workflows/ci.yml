@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: packages/host/package-lock.json
+
+      # The host package compiles against the exact DSH runtime packages
+      # (linked by scripts/link-dsh-deps.sh). Install the same rc.6 release
+      # the web profile runs so typecheck/tests/build match production.
+      - name: Install exact DSH runtime (0.1.0-rc.6)
+        run: sudo npm install -g @deepseek-ai/dsh@0.1.0-rc.6
+
+      - name: Install host deps (postinstall links DSH packages)
+        run: npm ci
+        working-directory: packages/host
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Tests
+        run: npm test
+
+      - name: Build (host + native client bundle)
+        run: npm run build
+
+      - name: Native bundle syntax check
+        run: node --check packages/host/lib/client.js
