@@ -6,7 +6,7 @@
 #   4. insert the host plugin row into the web profile's cordis patch layer
 # Reversible: remove the inserted `agent-groups` row and the copied dirs.
 set -euo pipefail
-export PATH="/home/ubuntu/.nvm/versions/node/v22.23.1/bin:$PATH"
+export PATH="$(dirname "$(command -v node)"):$PATH"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 HOST_PKG="$ROOT/packages/host"

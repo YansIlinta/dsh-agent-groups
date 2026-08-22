@@ -4,6 +4,7 @@
 // byte-compatible with the loader's own round-trip.
 //
 // Usage: node scripts/patch-profile.mjs <patchFile> <id> <name>
+import { execSync } from 'node:child_process'
 import { readFileSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { homedir } from 'node:os'
@@ -21,7 +22,9 @@ const require = createRequire(import.meta.url)
 function resolveYaml() {
   const candidates = [
     join(homedir(), '.dsh', 'node_modules', 'yaml'),
-    '/home/ubuntu/.nvm/versions/node/v22.23.1/lib/node_modules/@deepseek-ai/dsh/node_modules/yaml',
+    join(homedir(), '.dsh', 'profiles', 'node_modules', 'yaml'),
+    // global npm root fallback (where dsh itself is installed)
+    join(execSync('npm root -g', { encoding: 'utf8' }).trim(), '@deepseek-ai', 'dsh', 'node_modules', 'yaml'),
   ]
   for (const candidate of candidates) {
     try {

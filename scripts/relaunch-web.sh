@@ -2,7 +2,7 @@
 # Restart the local dsh web server (127.0.0.1:8080) so the profile patch and
 # installed Agent Groups plugin take effect.
 set -euo pipefail
-export PATH="/home/ubuntu/.nvm/versions/node/v22.23.1/bin:$PATH"
+export PATH="$(dirname "$(command -v node)"):$PATH"
 
 echo "[agent-groups] stopping dsh web…"
 pkill -f 'dsh we[b]' 2>/dev/null || echo "[agent-groups] no existing dsh web process"
