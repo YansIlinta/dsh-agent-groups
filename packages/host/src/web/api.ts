@@ -223,6 +223,44 @@ export async function handleApi(
     return
   }
 
+  if (rest.length === 3 && rest[0] === 'groups' && rest[2] === 'leader-chat' && method === 'POST') {
+    const body = (await readJsonBody(req)) ?? {}
+    const text = typeof body.text === 'string' ? body.text : ''
+    if (text.trim() === '') {
+      sendJson(res, 400, { error: 'text required' })
+      return
+    }
+    sendJson(res, 200, await host.userMessageToLeader(rest[1]!, text))
+    return
+  }
+
+  // ── V0.5: runtime sessions + pending provider requests ───────────────────
+
+  if (rest.length === 3 && rest[0] === 'groups' && rest[2] === 'runtime' && method === 'GET') {
+    // Advanced/debug view: provider thread/session ids live HERE, not in the
+    // primary UI. Never includes credentials.
+    sendJson(res, 200, host.runtimeSessionsView(rest[1]!))
+    return
+  }
+
+  if (rest.length === 3 && rest[0] === 'groups' && rest[2] === 'requests' && method === 'GET') {
+    sendJson(res, 200, host.snapshot(rest[1]!, compatibility).runtimeRequests)
+    return
+  }
+
+  if (rest.length === 6 && rest[0] === 'groups' && rest[2] === 'members' && rest[4] === 'runtime' && rest[5] === 'respond' && method === 'POST') {
+    const body = (await readJsonBody(req)) ?? {}
+    const requestId = stringOf(body.requestId, 'requestId')
+    const action = stringOf(body.action, 'action')
+    const answered = await host.respondRuntimeRequest(rest[1]!, rest[3]!, requestId, action, body.payload)
+    if (!answered) {
+      sendJson(res, 409, { error: 'no pending request with that id (already answered or expired)' })
+      return
+    }
+    sendJson(res, 200, { ok: true })
+    return
+  }
+
   // ── members ───────────────────────────────────────────────────────────────
 
   if (rest.length === 3 && rest[0] === 'groups' && rest[2] === 'members' && method === 'POST') {

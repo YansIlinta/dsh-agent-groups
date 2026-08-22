@@ -28,6 +28,18 @@ export type AgentMemberStatus =
   | 'failed'
   | 'left'
 
+/** V0.5: live runtime-session state surfaced in the Team UI. */
+export type MemberRuntimeState =
+  | 'starting'
+  | 'idle'
+  | 'working'
+  | 'waiting_input'
+  | 'needs_approval'
+  | 'interrupted'
+  | 'disconnected'
+  | 'failed'
+  | 'closed'
+
 /** Task state machine. Review/Failed are product-level, derived in product metadata. */
 export type TaskStatus =
   | 'pending'
@@ -139,6 +151,43 @@ export interface GroupMember {
   readonly model?: string
   /** V0.4: effective reasoning level this instance was spawned with. */
   readonly reasoningLevel?: string
+  /**
+   * V0.5: durable runtime-session metadata — enough to RE-ATTACH the same
+   * provider conversation after a DSH/plugin restart. Never contains
+   * credentials (auth stays owned by the installed runtime/host).
+   */
+  readonly runtimeSession?: RuntimeSessionDurable
+}
+
+/** V0.5: serializable session metadata persisted on the member record. */
+export interface RuntimeSessionDurable {
+  readonly runtime: string
+  /** DSH provider id (preserved across restarts so resume never drifts). */
+  readonly provider?: string
+  readonly providerSessionId?: string
+  readonly providerThreadId?: string
+  readonly workspace?: string
+  readonly model?: string
+  readonly reasoningLevel?: string
+  readonly state?: string
+  readonly lastTurnId?: string
+  readonly lastTaskId?: string
+  readonly createdAt?: number
+  readonly updatedAt?: number
+}
+
+/** V0.5: one pending provider request (approval / input) for the UI. */
+export interface RuntimeRequestView {
+  readonly requestId: string
+  readonly requestKind: 'approval' | 'input' | 'permission'
+  readonly memberId: string
+  readonly memberName: string
+  readonly turnId?: string
+  readonly taskId?: string
+  readonly description: string
+  readonly timestamp: number
+  readonly defaultAction?: string
+  readonly allowedActions?: readonly string[]
 }
 
 // ── Tasks (第 5/6/12 节) ───────────────────────────────────────────────────
@@ -278,6 +327,21 @@ export type ActivityType =
   | 'member_runtime_failed'
   | 'member_runtime_stopped'
   | 'team_config_updated'
+  // V0.5: runtime session + turn milestones (durable; deltas stay ephemeral)
+  | 'runtime_session_started'
+  | 'runtime_session_resumed'
+  | 'runtime_session_ready'
+  | 'runtime_session_disconnected'
+  | 'runtime_session_failed'
+  | 'runtime_session_closed'
+  | 'runtime_turn_started'
+  | 'runtime_turn_completed'
+  | 'runtime_turn_failed'
+  | 'runtime_turn_cancelled'
+  | 'runtime_approval_required'
+  | 'runtime_input_required'
+  | 'runtime_approval_answered'
+  | 'runtime_request_answered'
 
 export interface ActivityEvent {
   readonly id: ActivityId
@@ -307,7 +371,13 @@ export interface GroupUpdate {
 /** Full Agent Groups page state for one group (§15–18). */
 export interface GroupSnapshot {
   readonly group: GroupRecord
-  readonly members: ReadonlyArray<GroupMember & { readonly liveStatus: AgentMemberStatus }>
+  readonly members: ReadonlyArray<GroupMember & {
+    readonly liveStatus: AgentMemberStatus
+    /** V0.5: live runtime-session state (from the session registry). */
+    readonly runtimeState?: MemberRuntimeState
+    /** V0.5: current active turn id (debug/advanced surface). */
+    readonly currentTurnId?: string
+  }>
   readonly tasks: readonly GroupTask[]
   readonly channel: readonly ChannelMessage[]
   readonly privateMessages: readonly PrivateMessage[]
@@ -315,6 +385,8 @@ export interface GroupSnapshot {
   readonly profiles: readonly AgentProfile[]
   readonly leaderLive: boolean
   readonly compatibility: CompatibilityReport
+  /** V0.5: pending provider requests (approval / input) for this group. */
+  readonly runtimeRequests: readonly RuntimeRequestView[]
 }
 
 // ── Compatibility diagnostic (第 27 节) ───────────────────────────────────

@@ -114,6 +114,19 @@ function injectCss() {
 .ag-note{color:var(--dsw-alias-label-secondary);font-size:12px}
 .ag-form{display:flex;flex-direction:column;gap:10px;padding:4px 0}
 .ag-form label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--dsw-alias-label-secondary)}
+.ag-badge-rt{text-transform:none;cursor:default}
+.ag-badge-rt.info{color:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary)}
+.ag-requests{border:1px solid var(--dsw-alias-state-warn-primary);border-radius:8px;padding:8px 10px;margin-bottom:10px;display:flex;flex-direction:column;gap:8px;background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 8%, transparent)}
+.ag-request{display:flex;gap:10px;align-items:center}
+.ag-row-actions{display:flex;gap:6px}
+.ag-danger{color:var(--dsw-alias-state-error-primary)}
+.ag-row-selected td{background:var(--dsw-alias-bg-layer-1)}
+.ag-inspect-row td{background:var(--dsw-alias-bg-layer-1);border-bottom:1px solid var(--dsw-alias-border-l1)}
+.ag-inspect{padding:6px 8px;font-size:12px}
+.ag-inspect-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:6px 16px}
+.ag-kv{display:flex;flex-direction:column;gap:1px}
+.ag-kv .ag-note{font-size:11px;text-transform:uppercase;letter-spacing:.03em}
+.ag-turn-id{font-size:11px}
 `
   document.head.appendChild(style)
 }
@@ -148,6 +161,40 @@ function statusBadge(status) {
     : status === 'blocked' || status === 'failed' || status === 'left' ? 'err'
       : status === 'in_progress' || status === 'running' || status === 'provisioning' ? 'warn' : ''
   return React.createElement('span', { className: `ag-badge ${kind}` }, String(status))
+}
+
+/** V0.5: live runtime-session state chip (Idle/Working/Waiting…). */
+const RUNTIME_STATE_LABELS = {
+  starting: 'Starting',
+  idle: 'Idle',
+  working: 'Working',
+  waiting_input: 'Waiting for input',
+  needs_approval: 'Needs approval',
+  interrupted: 'Interrupted',
+  disconnected: 'Disconnected',
+  failed: 'Failed',
+  closed: 'Closed',
+}
+
+function runtimeStateChip(state) {
+  if (!state) return null
+  const label = RUNTIME_STATE_LABELS[state] ?? String(state)
+  const kind = state === 'working' || state === 'starting' ? 'warn'
+    : state === 'needs_approval' || state === 'waiting_input' ? 'info'
+      : state === 'disconnected' || state === 'failed' ? 'err'
+        : 'ok'
+  return React.createElement('span', { className: `ag-badge ag-badge-rt ${kind}`, title: `Runtime session state: ${label}` }, label)
+}
+
+function shortId(id) {
+  return typeof id === 'string' ? id.slice(0, 8) : String(id)
+}
+
+function kv(label, value) {
+  return React.createElement('div', { className: 'ag-kv' },
+    React.createElement('span', { className: 'ag-note' }, label),
+    React.createElement('span', null, value),
+  )
 }
 
 // ── sidebar trigger (sidebar.footer.action) ────────────────────────────────
@@ -364,7 +411,7 @@ function CreateGroupDialog({ onClose, onCreated }) {
 
 // ── group detail: tabs ─────────────────────────────────────────────────────
 
-const TABS = ['overview', 'tasks', 'team', 'channel', 'activity', 'roles']
+const TABS = ['overview', 'tasks', 'team', 'channel', 'leader', 'workspace', 'activity', 'roles']
 
 function GroupDetail({ groupId, tab, onBack, onTab }) {
   const [snap, setSnap] = React.useState(null)
@@ -417,8 +464,10 @@ function GroupDetail({ groupId, tab, onBack, onTab }) {
           ),
           tab === 'overview' && React.createElement(OverviewTab, { snap }),
           tab === 'tasks' && React.createElement(TasksTab, { snap }),
-          tab === 'team' && React.createElement(TeamTab, { snap }),
+          tab === 'team' && React.createElement(TeamTab, { snap, onRefresh: () => load() }),
           tab === 'channel' && React.createElement(ChannelTab, { snap, onMessage: load }),
+          tab === 'leader' && React.createElement(LeaderChatTab, { snap, onMessage: load }),
+          tab === 'workspace' && React.createElement(WorkspaceTab, { snap, onMessage: load }),
           tab === 'activity' && React.createElement(ActivityTab, { snap }),
           tab === 'roles' && React.createElement(RolesTab, { snap }),
         ),
@@ -505,12 +554,41 @@ function TasksTab({ snap }) {
   )
 }
 
-function TeamTab({ snap }) {
+function TeamTab({ snap, onRefresh }) {
   const { members, tasks, group } = snap
   const [addOpen, setAddOpen] = React.useState(false)
+  const [inspected, setInspected] = React.useState(null)
+  const [responding, setResponding] = React.useState(null)
   const live = members.filter((m) => m.status !== 'left')
   const taskTitle = (id) => tasks.find((t) => t.taskId === id)?.subject ?? '—'
+  const requests = snap.runtimeRequests ?? []
+  const answer = (request, action) => {
+    if (responding !== null) return
+    setResponding(request.requestId)
+    api(`/groups/api/groups/${encodeURIComponent(group.groupId)}/members/${encodeURIComponent(request.memberId)}/runtime/respond`, {
+      method: 'POST',
+      body: JSON.stringify({ requestId: request.requestId, action, payload: action === 'answer' ? prompt(`${request.description}\n\nAnswer:`) ?? '' : undefined }),
+    }).then(onRefresh).catch((err) => { window.alert(errorOf(err)) }).finally(() => setResponding(null))
+  }
   return React.createElement('div', { className: 'ag-col' },
+    requests.length > 0 && React.createElement('div', { className: 'ag-requests' },
+      React.createElement('div', { className: 'ag-note', style: { fontWeight: 600 } }, 'Runtime requests — the agent is waiting for you'),
+      requests.map((request) =>
+        React.createElement('div', { key: request.requestId, className: 'ag-request' },
+          React.createElement('div', { className: 'ag-col', style: { gap: 2, flex: 1 } },
+            React.createElement('span', null,
+              request.requestKind === 'input' ? '✎' : '⚠', ' ', request.description,
+            ),
+            React.createElement('span', { className: 'ag-note' }, `${request.memberName} · ${RUNTIME_STATE_LABELS[request.requestKind === 'input' ? 'waiting_input' : 'needs_approval']} · ${fmtTime(request.timestamp)}`),
+          ),
+          request.requestKind === 'input'
+            ? React.createElement(Button, { variant: 'primary', size: 'sm', disabled: responding !== null, onClick: () => answer(request, 'answer') }, 'Answer')
+            : React.createElement('div', { className: 'ag-row-actions' },
+                React.createElement(Button, { variant: 'outline', size: 'sm', className: 'ag-danger', disabled: responding !== null, onClick: () => answer(request, 'decline') }, 'Decline'),
+                React.createElement(Button, { variant: 'primary', size: 'sm', disabled: responding !== null, onClick: () => answer(request, 'accept') }, 'Accept'),
+              ),
+        )),
+    ),
     React.createElement('div', { className: 'ag-toolbar' },
       React.createElement(Button, { variant: 'primary', size: 'sm', icon: React.createElement(primitives.IconPlusOutline16, {}), onClick: () => setAddOpen(true) }, 'Add Member'),
       React.createElement('span', { className: 'ag-note', style: { marginLeft: 'auto' } }, `${live.filter((m) => m.role === 'member').length} member(s)`),
@@ -527,16 +605,56 @@ function TeamTab({ snap }) {
           React.createElement('th', null, 'Current task'),
         )),
       React.createElement('tbody', null,
-        live.map((member) =>
-          React.createElement('tr', { key: member.sessionId },
-            React.createElement('td', null, React.createElement('strong', null, member.name), member.role === 'leader' && React.createElement('span', { className: 'ag-badge', style: { marginLeft: 6 } }, 'leader')),
-            React.createElement('td', null, member.roleId ?? member.displayRole ?? member.role),
-            React.createElement('td', { className: 'ag-monoblock' }, member.runtime ?? '—'),
-            React.createElement('td', { className: 'ag-monoblock' }, member.model ?? '—'),
-            React.createElement('td', null, member.reasoningLevel ?? '—'),
-            React.createElement('td', null, statusBadge(member.liveStatus ?? member.status)),
-            React.createElement('td', { className: 'ag-note' }, member.currentTaskId !== undefined ? taskTitle(member.currentTaskId) : member.role === 'leader' ? 'orchestrating' : 'idle'),
-          )),
+        live.map((member) => {
+          const selected = inspected === member.sessionId
+          return React.createElement(React.Fragment, { key: member.sessionId },
+            React.createElement('tr', {
+              className: selected ? 'ag-row-selected' : undefined,
+              onClick: () => setInspected(selected ? null : member.sessionId),
+              style: { cursor: 'pointer' },
+            },
+              React.createElement('td', null, React.createElement('strong', null, member.name), member.role === 'leader' && React.createElement('span', { className: 'ag-badge', style: { marginLeft: 6 } }, 'leader')),
+              React.createElement('td', null, member.roleId ?? member.displayRole ?? member.role),
+              React.createElement('td', { className: 'ag-monoblock' }, member.runtime ?? '—'),
+              React.createElement('td', { className: 'ag-monoblock' }, member.model ?? '—'),
+              React.createElement('td', null, member.reasoningLevel ?? '—'),
+              React.createElement('td', null,
+                statusBadge(member.liveStatus ?? member.status),
+                ' ',
+                runtimeStateChip(member.runtimeState),
+              ),
+              React.createElement('td', { className: 'ag-note' },
+                member.currentTaskId !== undefined ? taskTitle(member.currentTaskId) : member.role === 'leader' ? 'orchestrating' : 'idle',
+                member.currentTurnId !== undefined && React.createElement('span', { className: 'ag-note ag-turn-id' }, ` · turn ${shortId(member.currentTurnId)}`),
+              ),
+            ),
+            selected && React.createElement('tr', { className: 'ag-inspect-row' },
+              React.createElement('td', { colSpan: 7 },
+                React.createElement('div', { className: 'ag-inspect' },
+                  React.createElement('div', { className: 'ag-inspect-grid' },
+                    kv('Session state', runtimeStateChip(member.runtimeState) ?? member.status),
+                    kv('Current task', member.currentTaskId !== undefined ? taskTitle(member.currentTaskId) : '—'),
+                    kv('Current turn', member.currentTurnId ?? '—'),
+                    kv('Role runtime', member.runtime ?? '—'),
+                    kv('Model', member.model ?? '—'),
+                    kv('Reasoning', member.reasoningLevel ?? '—'),
+                    member.runtimeSession !== undefined && kv('Last activity', fmtTime(member.runtimeSession.updatedAt)),
+                  ),
+                  member.runtimeSession !== undefined && React.createElement('div', { className: 'ag-note', style: { marginTop: 8 } },
+                    'Advanced (debug): ',
+                    React.createElement('span', { className: 'ag-monoblock' },
+                      [
+                        member.runtimeSession.providerSessionId !== undefined ? `providerSession=${member.runtimeSession.providerSessionId}` : null,
+                        member.runtimeSession.providerThreadId !== undefined ? `thread=${member.runtimeSession.providerThreadId}` : null,
+                        member.runtimeSession.lastTurnId !== undefined ? `lastTurn=${member.runtimeSession.lastTurnId}` : null,
+                      ].filter(Boolean).join(' · ') || '—',
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          )
+        }),
       ),
     ),
     addOpen && React.createElement(AddMemberModal, { groupId: group.groupId, onClose: () => setAddOpen(false) }),
@@ -662,6 +780,142 @@ function ChannelTab({ snap, onMessage }) {
   )
 }
 
+
+function LeaderChatTab({ snap, onMessage }) {
+  const groupId = snap.group.groupId
+  const [messages, setMessages] = React.useState([])
+  const [draft, setDraft] = React.useState('')
+  const [busy, setBusy] = React.useState(false)
+  const [error, setError] = React.useState(null)
+
+  const load = React.useCallback(() => {
+    setError(null)
+    api(`/groups/api/groups/${encodeURIComponent(groupId)}/leader-chat`).then(setMessages).catch((err) => setError(errorOf(err)))
+  }, [groupId])
+
+  React.useEffect(() => { load() }, [load])
+
+  const send = async () => {
+    if (busy || draft.trim() === '') return
+    setBusy(true)
+    setError(null)
+    try {
+      await api(`/groups/api/groups/${encodeURIComponent(groupId)}/leader-chat`, {
+        method: 'POST', body: JSON.stringify({ text: draft.trim() }),
+      })
+      setDraft('')
+      load()
+      onMessage()
+    } catch (cause) {
+      setError(errorOf(cause))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return React.createElement('div', { className: 'ag-col' },
+    error !== null && React.createElement(ErrorLine, { message: error }),
+    messages.length === 0
+      ? React.createElement(EmptyLine, null, 'No leader chat yet — send a direct instruction to the Leader.')
+      : React.createElement('div', { style: { maxHeight: '42vh', overflow: 'auto', marginBottom: 8 } },
+          messages.map((message) =>
+            React.createElement('div', { key: message.id, className: 'ag-msg' },
+              React.createElement('div', { className: 'ag-col', style: { flex: 1 } },
+                React.createElement('div', null,
+                  React.createElement('strong', null, message.senderName),
+                  React.createElement('span', { className: 'ag-badge', style: { marginLeft: 6 } }, message.direction === 'user-to-leader' ? 'User' : 'Leader'),
+                ),
+                React.createElement('div', null, message.text),
+              ),
+              React.createElement('span', { className: 'when' }, fmtTime(message.timestamp)),
+            ),
+          ),
+        ),
+    React.createElement('div', { className: 'ag-toolbar', style: { marginBottom: 0 } },
+      React.createElement('div', { style: { flex: 1, minWidth: 0 } },
+        React.createElement(Input, {
+          value: draft,
+          onChange: (e) => setDraft(e.target.value),
+          onKeyDown: (e) => { if (e.key === 'Enter') void send() },
+          placeholder: 'Send a private instruction to the Leader…',
+          style: { width: '100%' },
+        }),
+      ),
+      React.createElement(Button, { variant: 'primary', size: 'sm', onClick: () => void send(), disabled: busy || draft.trim() === '' },
+        busy ? '…' : 'Send',
+      ),
+    ),
+  )
+}
+
+function WorkspaceTab({ snap, onMessage }) {
+  const groupId = snap.group.groupId
+  const [view, setView] = React.useState({ notes: '', notesUpdatedAt: null, artifacts: [] })
+  const [draftNotes, setDraftNotes] = React.useState('')
+  const [busy, setBusy] = React.useState(false)
+  const [error, setError] = React.useState(null)
+
+  const load = React.useCallback(() => {
+    setError(null)
+    api(`/groups/api/groups/${encodeURIComponent(groupId)}/workspace`).then((data) => {
+      setView(data)
+      setDraftNotes(data.notes ?? '')
+    }).catch((err) => setError(errorOf(err)))
+  }, [groupId])
+
+  React.useEffect(() => { load() }, [load])
+
+  const saveNotes = async () => {
+    if (busy) return
+    setBusy(true)
+    setError(null)
+    try {
+      await api(`/groups/api/groups/${encodeURIComponent(groupId)}/notes`, {
+        method: 'PUT', body: JSON.stringify({ notes: draftNotes }),
+      })
+      load()
+      onMessage()
+    } catch (cause) {
+      setError(errorOf(cause))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return React.createElement('div', { className: 'ag-col' },
+    error !== null && React.createElement(ErrorLine, { message: error }),
+    React.createElement('label', { style: { fontWeight: 600 } }, 'Shared Notes'),
+    React.createElement('textarea', {
+      rows: 5,
+      value: draftNotes,
+      onChange: (e) => setDraftNotes(e.target.value),
+      style: { padding: 8, borderRadius: 8, border: '1px solid var(--dsw-alias-border-l1)', background: 'var(--dsw-alias-bg-layer-1)', color: 'var(--dsw-alias-label-primary)', fontFamily: 'inherit' },
+    }),
+    React.createElement('div', { className: 'ag-toolbar' },
+      React.createElement(Button, { variant: 'primary', size: 'sm', onClick: () => void saveNotes(), disabled: busy }, busy ? 'Saving…' : 'Save Notes'),
+    ),
+    React.createElement('div', { style: { marginTop: 12, fontWeight: 600 } }, 'Artifacts'),
+    (view.artifacts ?? []).length === 0
+      ? React.createElement(EmptyLine, null, 'No artifacts yet — results will appear here as members complete tasks.')
+      : React.createElement('table', { className: 'ag-table' },
+          React.createElement('thead', null,
+            React.createElement('tr', null,
+              React.createElement('th', null, 'Path'),
+              React.createElement('th', null, 'Source'),
+              React.createElement('th', null, 'Task'),
+            )),
+          React.createElement('tbody', null,
+            view.artifacts.map((artifact) =>
+              React.createElement('tr', { key: artifact.taskId + ':' + artifact.path },
+                React.createElement('td', { className: 'ag-monoblock' }, artifact.path),
+                React.createElement('td', null, artifact.source),
+                React.createElement('td', { className: 'ag-note' }, artifact.taskSubject),
+              )),
+          ),
+        ),
+  )
+}
+
 function ActivityTab({ snap }) {
   const { activity } = snap
   if (activity.length === 0) {
@@ -696,10 +950,11 @@ function RolesTab({ snap }) {
   const [error, setError] = React.useState(null)
   const [saved, setSaved] = React.useState(null)
   const [busy, setBusy] = React.useState(false)
+  const [initialConfig, setInitialConfig] = React.useState(null)
 
   const load = React.useCallback(() => {
     setError(null)
-    api(`/groups/api/groups/${encodeURIComponent(groupId)}/team-config`).then(setConfig).catch((err) => setError(errorOf(err)))
+    api(`/groups/api/groups/${encodeURIComponent(groupId)}/team-config`).then((data) => { setConfig(data); setInitialConfig(data) }).catch((err) => setError(errorOf(err)))
     api('/groups/api/runtimes').then(setRuntimes).catch(() => undefined)
   }, [groupId])
 
@@ -745,6 +1000,45 @@ function RolesTab({ snap }) {
       memberRoles: current.memberRoles.filter((_, i) => i !== index),
     }))
   }
+  const duplicateRole = (role) => {
+    setConfig((current) => (current === null ? current : {
+      ...current,
+      memberRoles: [...current.memberRoles, {
+        ...role,
+        id: `role-${Date.now().toString(36)}`,
+        name: `${role.name} Copy`,
+      }],
+    }))
+  }
+  const exportConfig = () => {
+    if (config === null) return
+    const json = JSON.stringify(config, null, 2)
+    try {
+      if (navigator.clipboard?.writeText !== undefined) navigator.clipboard.writeText(json)
+    } catch { /* clipboard unavailable */ }
+    setSaved('Team configuration copied to clipboard.')
+    window.setTimeout(() => setSaved(null), 2500)
+  }
+  const importConfig = () => {
+    if (config === null) return
+    const raw = window.prompt('Paste Team Configuration JSON')
+    if (raw === null || raw.trim() === '') return
+    try {
+      const parsed = JSON.parse(raw)
+      if (parsed === null || typeof parsed !== 'object' || !Array.isArray(parsed.memberRoles)) throw new Error('invalid team config')
+      setConfig(parsed)
+      setSaved('Imported configuration — review and save.')
+      window.setTimeout(() => setSaved(null), 2500)
+    } catch (cause) {
+      setError(errorOf(cause))
+    }
+  }
+  const resetConfig = () => {
+    if (initialConfig === null) return
+    setConfig(initialConfig)
+    setSaved('Reset to last saved configuration.')
+    window.setTimeout(() => setSaved(null), 2500)
+  }
 
   if (config === null) return React.createElement(Spinner)
 
@@ -753,6 +1047,9 @@ function RolesTab({ snap }) {
     React.createElement('div', { className: 'ag-toolbar' },
       React.createElement(Button, { variant: 'primary', size: 'sm', onClick: () => void save(), disabled: busy }, busy ? 'Saving…' : 'Save Team Configuration'),
       React.createElement(Button, { variant: 'ghost', size: 'sm', onClick: addRole, icon: React.createElement(primitives.IconPlusOutline16, {}) }, 'Add Role'),
+      React.createElement(Button, { variant: 'ghost', size: 'sm', onClick: exportConfig }, 'Export'),
+      React.createElement(Button, { variant: 'ghost', size: 'sm', onClick: importConfig }, 'Import'),
+      React.createElement(Button, { variant: 'ghost', size: 'sm', onClick: resetConfig, disabled: initialConfig === null }, 'Reset'),
       saved !== null && React.createElement('span', { className: 'ag-note' }, saved),
     ),
     React.createElement('div', { className: 'ag-note', style: { marginBottom: 8 } },
@@ -766,12 +1063,13 @@ function RolesTab({ snap }) {
         key: role.id, role, runtimes,
         onPatch: (patch) => patchRole(index, patch),
         onRemove: () => removeRole(index),
+        onDuplicate: (role) => duplicateRole(role),
       })),
     ),
   )
 }
 
-function RoleCard({ role, leader, runtimes, onPatch, onRemove }) {
+function RoleCard({ role, leader, runtimes, onPatch, onRemove, onDuplicate }) {
   const runtime = runtimes.find((r) => r.id === role.runtime)
   const unavailable = runtime !== undefined && !runtime.available
   const models = runtime?.capabilities?.models === true ? (runtime.models ?? []) : []
@@ -784,7 +1082,8 @@ function RoleCard({ role, leader, runtimes, onPatch, onRemove }) {
       runtime === undefined && React.createElement('span', { className: 'ag-badge err' }, `runtime "${role.runtime}" not registered`),
       unavailable && React.createElement('span', { className: 'ag-badge warn' }, 'Not configured'),
       runtime !== undefined && runtime.available && React.createElement('span', { className: 'ag-badge ok' }, 'Available'),
-      !leader && React.createElement(Button, { variant: 'ghost', size: 'sm', onClick: onRemove, style: { marginLeft: 'auto' } }, 'Remove'),
+      !leader && React.createElement(Button, { variant: 'ghost', size: 'sm', onClick: () => onDuplicate(role), style: { marginLeft: 'auto' } }, 'Duplicate'),
+      !leader && React.createElement(Button, { variant: 'ghost', size: 'sm', onClick: onRemove }, 'Remove'),
     ),
     React.createElement('div', { className: 'ag-form', style: { gap: 6 } },
       leader && React.createElement('label', null, 'Description', React.createElement('input', { className: 'ag-input', value: role.description ?? '', disabled: true, style: { padding: 4, borderRadius: 6, border: '1px solid var(--dsw-alias-border-l1)', background: 'var(--dsw-alias-bg-layer-2)', color: 'var(--dsw-alias-label-primary)' } })),

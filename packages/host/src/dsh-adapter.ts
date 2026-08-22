@@ -43,9 +43,21 @@ export interface AgentRuntimeAdapter {
   /** Create a durable member Agent (a continuable teammate of the Leader). */
   createMemberAgent(spec: MemberCreateSpec): Promise<void>
   liveAgent(sessionId: string): LiveAgent | undefined
-  resumeAgent(sessionId: string): Promise<LiveAgent | undefined>
+  /**
+   * Resume a persisted member session with the member's OWN effective
+   * configuration (V0.5: `spec` re-applies the original provider/model and
+   * re-installs the reasoning effort — the global default model is NEVER used
+   * to resume a role-configured member).
+   */
+  resumeAgent(sessionId: string, spec?: Partial<MemberCreateSpec>): Promise<LiveAgent | undefined>
   /** Live-first, else cold-resume; returns the live agent when recoverable. */
   ensureLive(sessionId: string): Promise<LiveAgent | undefined>
+  /**
+   * V0.5: live-first, else cold-resume, else CREATE the member agent with
+   * `spec`. Every member session flows through this so a restarted host
+   * attaches to the SAME durable DSH session with its ORIGINAL configuration.
+   */
+  ensureAgent(sessionId: string, spec: MemberCreateSpec): Promise<LiveAgent | undefined>
   /** Deliver a waking turn (used for DMs and task assignments). */
   deliver(sessionId: string, content: ContentBlock[], source: MessageSource): Promise<boolean>
   /** Inject non-waking context for the next step (used for notices). */
@@ -66,6 +78,7 @@ export function createNoopAdapter(): AgentRuntimeAdapter {
     liveAgent() { return undefined },
     async resumeAgent() { return undefined },
     async ensureLive() { return undefined },
+    async ensureAgent() { return undefined },
     async deliver() { return false },
     inject() {},
     interrupt() { return false },
@@ -112,6 +125,30 @@ export class DshAgentRuntimeAdapter implements AgentRuntimeAdapter {
     return { provider: selection.provider, model: selection.model }
   }
 
+  /**
+   * V0.5: one setup for BOTH create and resume — the member's OWN effective
+   * configuration (provider/model/reasoningLevel) is installed on every
+   * attach, so a role-configured member NEVER drifts to the global default.
+   */
+  private memberSetup(spec: { cwd?: string; provider?: string; model?: string; reasoningLevel?: string }): (agentCtx: Context) => Promise<void> {
+    return async (agentCtx: Context) => {
+      // The member world: work tools + group member tools + member section,
+      // taken from the shipped `group-member` agent preset.
+      await this.agentPresets.mount(agentCtx, MEMBER_PRESET_ID)
+      const provider = spec.provider ?? this.selection().provider
+      const model = spec.model ?? this.selection().model
+      // Role-configured reasoning effort rides the agent-scoped model
+      // selection (the DSH entry point for reasoning strength per agent).
+      if (provider !== undefined && model !== undefined && spec.reasoningLevel !== undefined) {
+        const effort = ReasoningEffortId(spec.reasoningLevel)
+        agentCtx.effect(() => installModelSelection(agentCtx, {
+          current: { provider, model, reasoningEffort: effort },
+          assembled: undefined,
+        }))
+      }
+    }
+  }
+
   async createMemberAgent(spec: MemberCreateSpec): Promise<void> {
     const sessionId = SessionId(spec.sessionId)
     const selection = this.selection()
@@ -128,20 +165,7 @@ export class DshAgentRuntimeAdapter implements AgentRuntimeAdapter {
         provider,
         model,
       },
-      setup: async (agentCtx: Context) => {
-        // The member world: work tools + group member tools + member section,
-        // taken from the shipped `group-member` agent preset.
-        await this.agentPresets.mount(agentCtx, MEMBER_PRESET_ID)
-        // V0.4: role-configured reasoning effort rides the agent-scoped model
-        // selection (the DSH entry point for reasoning strength per agent).
-        if (provider !== undefined && model !== undefined && spec.reasoningLevel !== undefined) {
-          const effort = ReasoningEffortId(spec.reasoningLevel)
-          agentCtx.effect(() => installModelSelection(agentCtx, {
-            current: { provider, model, reasoningEffort: effort },
-            assembled: undefined,
-          }))
-        }
-      },
+      setup: this.memberSetup(spec),
     })
     this.handles.set(spec.sessionId, handle)
   }
@@ -152,20 +176,20 @@ export class DshAgentRuntimeAdapter implements AgentRuntimeAdapter {
     return { sessionId, agent, status: agent.status }
   }
 
-  async resumeAgent(sessionId: string): Promise<LiveAgent | undefined> {
+  async resumeAgent(sessionId: string, spec?: Partial<MemberCreateSpec>): Promise<LiveAgent | undefined> {
     const existing = this.liveAgent(sessionId)
     if (existing !== undefined) return existing
+    const selection = this.selection()
+    const provider = spec?.provider ?? selection.provider
+    const model = spec?.model ?? selection.model
     try {
-      const selection = this.selection()
       const handle = await this.agents.resume({
         resumeSessionId: SessionId(sessionId),
         agentOptions: {
-          provider: selection.provider,
-          model: selection.model,
+          provider,
+          model,
         },
-        setup: async (agentCtx: Context) => {
-          await this.agentPresets.mount(agentCtx, MEMBER_PRESET_ID)
-        },
+        setup: this.memberSetup(spec ?? { provider, model }),
       })
       this.handles.set(sessionId, handle)
       return this.liveAgent(sessionId)
@@ -178,6 +202,17 @@ export class DshAgentRuntimeAdapter implements AgentRuntimeAdapter {
     const live = this.liveAgent(sessionId)
     if (live !== undefined) return live
     return this.resumeAgent(sessionId)
+  }
+
+  /** V0.5: live → resume → create, always with the member's own config. */
+  async ensureAgent(sessionId: string, spec: MemberCreateSpec): Promise<LiveAgent | undefined> {
+    const live = this.liveAgent(sessionId)
+    if (live !== undefined) return live
+    const resumed = await this.resumeAgent(sessionId, spec)
+    if (resumed !== undefined) return resumed
+    // No persisted session: create fresh (same durable identity).
+    await this.createMemberAgent({ ...spec, sessionId })
+    return this.liveAgent(sessionId)
   }
 
   async deliver(sessionId: string, content: ContentBlock[], source: MessageSource): Promise<boolean> {

@@ -30,6 +30,9 @@ import { LeaderRegistry } from './leader-registry.js'
 import { RuntimeRegistry } from './runtime/registry.js'
 import { DeepSeekHarnessRuntimeProvider } from './runtime/deepseek-harness.js'
 import { CodexRuntimeProvider } from './runtime/codex.js'
+import { ExternalAgentBridge } from './runtime/bridge.js'
+import { ClaudeCodeRuntimeProvider } from './runtime/claude-code.js'
+import { ClaudeRuntimeProvider } from './runtime/claude.js'
 
 export { GroupHost } from './group-host.js'
 export { GroupError, type GroupErrorCode } from './group-service.js'
@@ -44,9 +47,31 @@ export { MemoryStore } from './store.js'
 export type { TableStore } from './store.js'
 export { RuntimeRegistry, RuntimeError } from './runtime/registry.js'
 export { DeepSeekHarnessRuntimeProvider } from './runtime/deepseek-harness.js'
-export { CodexRuntimeProvider } from './runtime/codex.js'
+export { CodexRuntimeProvider, CODEX_FALLBACK_MODELS } from './runtime/codex.js'
+export { CodexAppServerConnection, CodexProtocolError, CodexBinaryProcessHost } from './runtime/codex-protocol.js'
+export type { CodexProcessHost, CodexChildLike, CodexInboundMessage, RequestId } from './runtime/codex-protocol.js'
+export { ClaudeCodeRuntimeProvider } from './runtime/claude-code.js'
+export { ClaudeRuntimeProvider, CLAUDE_FALLBACK_MODELS } from './runtime/claude.js'
+export type { ClaudeQueryFactory, ClaudeQueryLike, ClaudeQueryParams } from './runtime/claude.js'
+export type { RuntimeSession, RuntimeTurnHandle, RuntimeTurnResult, RuntimeTurnInput, RuntimeSessionInfo, RuntimeSessionStatus, SessionRuntimeProvider } from './runtime/base.js'
+export { isSessionProvider, DEFAULT_REASONING_LEVELS } from './runtime/base.js'
+export type { RuntimeEvent, RuntimeSessionEvent, RuntimeTurnEvent, RuntimePendingRequest, RuntimeEventListener } from './runtime/events.js'
 export { teamConfigFor, templateTeamConfig, ROLE_TEMPLATES, LEADER_ROLE, GENERALIST_ROLE } from './runtime/team-config.js'
 export type { AgentRuntimeProvider, RuntimeAgentHandle, RuntimeAgentConfig, RuntimeCapabilities, ModelDescriptor, ReasoningOption } from './runtime/base.js'
+export { createRuntimeMessage, deliverRuntimeMessage, runtimeMessageText } from './runtime/message.js'
+export type { RuntimeMessage, RuntimeMessageType, RuntimePriority, RuntimeMessageSink, CreateRuntimeMessageInput } from './runtime/message.js'
+export { PromptCompiler, compileAgentPrompt, compilePrompt, estimateTokens, DEFAULT_MAX_CONTEXT_TOKENS } from './prompt-compiler.js'
+export { ExternalAgentBridge } from './runtime/bridge.js'
+export { AgentContextService, createEmptyCursor } from './runtime/context.js'
+export { RuntimeRecovery } from './runtime/recovery.js'
+export type { RecoveryOptions } from './runtime/recovery.js'
+export { RUNTIME_PRESETS, ROLE_PRESETS, TEAM_PRESETS, getRuntimePreset, getRolePreset, getTeamPreset, resolveRolePreset, resolveTeamPreset } from './runtime/presets.js'
+export type { RuntimePreset, RolePreset, TeamPreset, TeamPresetRoleRef } from './runtime/presets.js'
+export type { AgentContextCursor, AgentContextDelta } from './runtime/context.js'
+export { BRIDGE_MARKER, parseBridgeAction, codexBridgeInstructions, executeBridgeAction } from './runtime/codex-bridge.js'
+export type { CodexBridgeAction } from './runtime/codex-bridge.js'
+export type { ExternalBridgeMethod, ExternalBridgeParams, ExternalAgentContext, ExternalBridgeCall } from './runtime/bridge.js'
+export type { PromptSection, PromptCompileOptions, CompiledPrompt, CompiledPromptSection, AgentPromptLayers, AgentTaskPrompt, AgentRelevantContext } from './prompt-compiler.js'
 export * from './core-types.js'
 
 export const name = 'agent-groups'
@@ -100,16 +125,26 @@ export async function apply(ctx: Context): Promise<void> {
   )
   const leaders = new LeaderRegistry(stores.leaders)
 
-  // V0.4: runtime registry — role-based spawns resolve through providers.
+  // V0.4/V0.5: runtime registry — role-based spawns resolve through providers.
   const runtimes = new RuntimeRegistry()
   runtimes.register(new DeepSeekHarnessRuntimeProvider(
     adapter,
     { currentSelection: () => (agentDefaultModel?.currentSelection() ?? {}) },
   ))
+  let codexBridge: ExternalAgentBridge | undefined
+  // V0.5: the persistent Codex App Server provider (one thread per member).
   runtimes.register(new CodexRuntimeProvider())
+  // V0.5: the persistent Claude Agent SDK provider (resume-by-session-id).
+  runtimes.register(new ClaudeRuntimeProvider())
+  // Legacy bridge-based Claude Code CLI provider (kept for stored roles).
+  runtimes.register(new ClaudeCodeRuntimeProvider({ getBridge: () => codexBridge }))
 
   const host = new GroupHost({ groups, tasks, channel, privateMessages, activity, profiles, notifier, adapter, leaders, runtimes })
+  codexBridge = new ExternalAgentBridge(host)
   ctx.provide('groupHost', host)
+
+  // V0.5: re-attach durable member sessions after a host restart.
+  void host.resumeAllMemberRuntimes()
 
   // Policy: no raw peer messaging for group members (defense-in-depth).
   installMemberPeerContactPolicy(ctx, groups)

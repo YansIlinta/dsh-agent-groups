@@ -50,3 +50,24 @@ shell.overlay  ── AgentGroupsPage (groups list → group detail tabs)
 - CSS: single `ag-` prefixed stylesheet injected by the bundle, only
   `--dsw-alias-*` variables — no global selectors, no leak.
 - Old standalone UI removed only after the native page is verified.
+## V0.5 — runtime session surface (parity notes)
+
+- **Member status** now shows BOTH the durable lifecycle badge and a live
+  **runtime-session chip** (Idle / Working / Waiting for input / Needs
+  approval / Disconnected / Failed / Starting / Closed), rendered with the
+  existing `ag-badge` token classes (`--dsw-alias-state-*`); no second design
+  system was introduced.
+- **Pending provider requests** (approvals / input) are surfaced as a compact
+  panel on the Team tab with Accept / Decline / Answer actions
+  (`POST /groups/:id/members/:member/runtime/respond`); the Host contract
+  enforces membership/role checks, never prompts.
+- **Member inspection** (click a row) shows Role / Runtime / Model /
+  Reasoning / Session state / Current task / Current turn / Last activity;
+  provider thread/session ids live in the "Advanced (debug)" line — kept out
+  of the primary surface by design (requirement §15).
+- **Known divergence (documented, requirement §17):** the page still uses one
+  `ag-` prefixed local stylesheet scoped to the shell overlay, because rc.6
+  does not export a public stylesheet/component bundle for a standalone
+  full-frame page; every color/spacing value derives from `--dsw-alias-*`
+  tokens and DSH primitives (`Button`, icon set) are used for interactive
+  chrome. No DSH source code was copied into this repository.

@@ -36,6 +36,45 @@ Duurable: group/mission/workstreams/tasks/channel/private/timeline (DSH storage 
 | Members | Instances carry roleId/runtime/model/reasoningLevel; `currentTaskId` is now actually recorded on assign/claim (was a dead field); external process exits auto-submit a result draft; remove-member → left first so a runtime-exit callback cannot resurrect it. |
 | Activity | `member_spawn_requested` / `member_runtime_starting` / `member_runtime_started` / `member_runtime_failed` / `member_runtime_stopped` / `team_config_updated` (no credentials in payloads). |
 
+### V0.5 — persistent sessions & turns (the one-shot problem is gone)
+
+| Area | What changed |
+| --- | --- |
+| Runtime contract | Process lifetime, session lifetime, turn lifetime and task lifetime are SEPARATE concepts. `RuntimeSession` (one persistent provider conversation per member) → `runTurn` → `RuntimeTurnHandle`/`RuntimeTurnResult`; normalized events (`session.*`, `turn.*`, `turn.approval.required`, `turn.input.required`, `turn.permission.denied`). A process exiting is NEVER a successful task result — crashes produce `session.disconnected`/`turn.failed` and fail the attached task loudly. |
+| Codex | Replaced one-shot `codex exec` with the persistent **Codex App Server** over its JSONL protocol (`codex-protocol.ts`: bounded parser, request correlation, timeouts, malformed handling, crash → reconnect, graceful shutdown). One member = one durable Codex **thread**; tasks are turns, Leader corrections steer the running turn (`turn/steer`); `thread/resume` re-attaches after restarts. Model availability is discovered dynamically via `model/list` (marked fallback only). |
+| Claude | New `claude` runtime via the installed **Claude Agent SDK** (`@anthropic-ai/claude-agent-sdk`): persistent multi-turn sessions resumed by session id (`options.resume`), explicit per-query config (cwd/model/permission mode/allowed+disallowed tools/system prompt/setting sources), abort-based interrupt, deny-by-policy tool permissions surfaced as events. Project/system settings follow the SDK's standard cascade unless a role pins `settingSources`. |
+| DSH members | DSH members are durable sessions too (`turnCompletion: 'claimed'`); **resume configuration drift fixed**: the member's own provider/model/reasoning is persisted and re-installed on every resume (`ensureAgent`), never the global default. Regression-tested end to end. |
+| Completion | Task completion = a completed **TURN** → normalized result → completion claim; the Leader/Verifier still verifies. Claims are correlated by turn id — a late event from an old turn can never complete a newer turn. |
+| Approval/input | `Agent needs approval` / `Agent needs input` states surface in the Team UI (pending request with member/task/turn/description/timestamp) and can be answered (Host contract: `respondRuntimeRequest`; default policy decline — no blanket auto-approve). |
+| Activity | Durable `runtime_session_*` / `runtime_turn_*` / `runtime_approval_required` / `runtime_input_required` milestones; token/output deltas stay ephemeral. |
+| Persistence | `runtimeSession` metadata on the member record (provider/thread/session ids, model, reasoning, last turn/task — **never credentials**); optional schema → legacy groups keep loading. |
+| Failure vocabulary | `SESSION_START_FAILED`, `SESSION_RESUME_FAILED`, `TURN_START_FAILED`, `TURN_TIMEOUT`, `TURN_INTERRUPTED`, `RUNTIME_DISCONNECTED` + the existing `RUNTIME/MODEL/REASONING_UNAVAILABLE` codes. No silent fallback to another runtime. |
+| Tests | Fake JSONL app-server suite (protocol + provider), fake SDK suite (Claude), GroupHost turn/race/restart suite, DSH resume regression, exit-never-completes regression. 40+ new deterministic tests; real-binary smoke suite is credential-gated (`AGENT_GROUPS_CODEX_SMOKE=1`). |
+
+```text
+Group
+  └── Member
+       └── Runtime Session        (Codex thread / Claude session / DSH session)
+            ├── Turn 1 ← task A ───────────┐
+            ├── Turn 2 ← leader follow-up  ├─ same session, results + claims
+            └── Turn 3 ← task B ───────────┘
+Task  ─────── completion claim (verified by Leader/Verifier)
+```
+
+### Current implementation status (Phase 1–8)
+
+The codebase now includes the full multi-runtime Agent Groups workspace core:
+
+- **Runtime message abstraction** — structured `RuntimeMessage` types, task/thread/priority metadata, text fallback for legacy runtimes.
+- **PromptCompiler** — layered prompt composition with token budgets; task / acceptance criteria / leader instructions are never trimmed.
+- **External Agent Bridge** — `group_get_context`, `group_get_task`, `group_list_tasks`, `group_claim_task`, `group_post`, `group_report_to_leader`, `group_read_channel`, `group_complete_task`, `group_get_workspace`, `group_get_messages`.
+- **Codex Runtime Bridge** — Codex can emit structured bridge actions during `codex exec`; stdout tail remains fallback/crash recovery only.
+- **Claude Code Runtime** — symmetric bridge-aware provider for Claude Code.
+- **Context cursor + delta** — agents only receive Base Context + Current Task + Relevant Messages + Changes Since Cursor.
+- **Preset architecture** — Runtime Preset / Role Preset / Team Preset three-layer configuration.
+- **Native UI** — Leader Chat and Workspace tabs added; Configuration supports Export / Import / Reset / Duplicate Role.
+- **Runtime recovery** — stale provisioning members can be recovered to failed; duplicate completion and stale revision guards are covered by tests.
+
 ### V0.2 — the team workspace
 
 | Area | What was added |
@@ -169,6 +208,7 @@ It boots the **same cordis storage stack** over a throwaway root and drives the 
 - **V0.2** — team templates (slots + valid profiles); task editing (fields/CAS/guards + `task_updated`); user hold → board blocked without DAG changes; channel reply + pin/unpin with history kept; mission notes durable; pause gate blocks dispatch but keeps messaging; archive hides/restores and blocks mutations; duplicate copies mission/workstreams and re-materializes members (completion/archive required); known-leader registry + Agent Groups page creation with template members; user↔leader private directions; **backward compatibility** — V0.1 group/task/channel/private records still parse with the extended schema.
 - **V0.4 roles & runtimes** — role templates & derivation; old-group migration; team-config persistence + validation; role-based spawn picks the configured runtime/model/reasoning/profile/workspace; instance limits; unavailable runtime / invalid model / invalid reasoning fail clearly; legacy spawn compatibility; external exit auto-result and failure handling; remove/exit race; registry semantics; API routes for `/groups/api/runtimes` and `/groups/api/groups/:id/team-config`.
 - **V0.3 API routes** — the `/groups/api/*` dispatcher is now covered with fake request/response harnesses: broadcast and members POSTs are no longer shadowed by the group-action branch, group actions still dispatch, unknown sub-paths 404 cleanly, collections return JSON.
+- **Phase 1–8** — runtime message abstraction; PromptCompiler; External Agent Bridge; Codex bridge actions; Claude Code runtime; context cursor/delta; preset architecture; Leader Chat + Workspace UI; Configuration export/import/reset/duplicate; runtime recovery and duplicate-completion guards.
 
 ## Design notes & constraints honored
 

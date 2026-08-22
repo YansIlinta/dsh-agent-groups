@@ -239,7 +239,7 @@ describe('V0.4: role-based spawn', () => {
     expect(member.roleId).toBeUndefined()
   })
 
-  it('external exit with code 0 submits a result draft for the current task', async () => {
+  it('V0.5: a process exit NEVER completes a task — only a completed TURN does', async () => {
     const { groupHost, provider } = makeRoleHost()
     const group = await groupHost.initGroup('lead-1', { name: 'T', objective: 'demo', acceptanceCriteria: ['x'] })
     await groupHost.updateTeamConfig(group.groupId, TEN_MEMBER_TEAM, 'User')
@@ -248,12 +248,15 @@ describe('V0.4: role-based spawn', () => {
     await groupHost.assignTask('lead-1', { taskId: task.taskId, ownerId: member.sessionId })
     const assigned = groupHost.tasks.listTasks(group.groupId).find((t) => t.taskId === task.taskId)!
     expect(assigned.ownerId).toBe(member.sessionId)
-    // external process finishes
+    // The legacy process exits successfully — this must NOT become a result.
     provider.finish(member.sessionId, 0, 'implemented everything')
     await new Promise((resolve) => setTimeout(resolve, 20))
     const after = groupHost.tasks.listTasks(group.groupId).find((t) => t.taskId === task.taskId)!
-    expect(after.result?.summary).toBe('implemented everything')
-    expect(after.result?.completionClaim).toBe(true)
+    expect(after.result).toBeUndefined()
+    expect(['pending', 'in_progress']).toContain(after.status)
+    // ... and the member is marked failed (a runtime without a completed turn).
+    const memberAfter = groupHost.groups.listMembers(group.groupId, () => undefined).find((m) => m.sessionId === member.sessionId)!
+    expect(memberAfter.status).toBe('failed')
     expect(groupHost.activity.list(group.groupId).some((a) => a.type === 'member_runtime_stopped')).toBe(true)
   })
 

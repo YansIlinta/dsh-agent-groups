@@ -46,8 +46,11 @@ import { groupMessageSource } from './message-source.js'
 import { LeaderRegistry } from './leader-registry.js'
 import { listTemplates, requireTemplate, templateMemberSlots } from './template-registry.js'
 import { RuntimeRegistry, RuntimeError } from './runtime/registry.js'
-import type { AgentRuntimeProvider, RuntimeAgentHandle } from './runtime/base.js'
+import { isSessionProvider, type AgentRuntimeProvider, type RuntimeAgentConfig, type RuntimeAgentHandle, type RuntimeSession, type RuntimeSessionInfo, type RuntimeTurnHandle, type RuntimeTurnResult } from './runtime/base.js'
+import type { RuntimeEvent, RuntimePendingRequest } from './runtime/events.js'
+import type { MemberRuntimeState, RuntimeRequestView } from './core-types.js'
 import { teamConfigFor } from './runtime/team-config.js'
+import { createRuntimeMessage, runtimeMessageText } from './runtime/message.js'
 
 export function textContent(text: string): ContentBlock[] {
   return [{ type: 'text', text }]
@@ -73,7 +76,8 @@ export class GroupHost {
   readonly leaders: LeaderRegistry
   readonly runtimes: RuntimeRegistry
   private readonly adapter: AgentRuntimeAdapter
-  private readonly externalHandles = new Map<string, RuntimeAgentHandle>()
+  /** V0.5: per-member live runtime sessions (session ⊃ turns ⊃ tasks). */
+  private readonly memberRuntimes = new Map<string, MemberRuntime>()
 
   constructor(options: {
     groups: GroupService
@@ -202,7 +206,7 @@ export class GroupHost {
     const model = override?.model ?? role.model
     const reasoningLevel = override?.reasoningLevel ?? role.reasoningLevel
     const capabilities = await provider.getCapabilities()
-    if (model !== undefined && capabilities.models) {
+    if (model !== undefined && capabilities.models && capabilities.dynamicModels !== false) {
       const models = await provider.listModels()
       if (models.length > 0 && !models.some((m) => m.id === model)) {
         throw new GroupError('MODEL_UNAVAILABLE', `model "${model}" is not available on the ${provider.name} runtime`)
@@ -222,19 +226,45 @@ export class GroupHost {
       payload: { role: roleId, runtime: role.runtime, model, reasoningLevel },
     })
     const agentId = randomUUID()
-    let handle: RuntimeAgentHandle
+    const roleConfig: RuntimeAgentConfig = {
+      groupId,
+      agentId,
+      role: roleId,
+      profile: role.profile,
+      model,
+      reasoningLevel,
+      systemPrompt: role.systemPrompt,
+      workspace: group.cwd,
+      parentMemberId: group.leaderSessionId,
+      metadata: role.metadata,
+    }
     try {
-      handle = await provider.spawnAgent({
-        groupId,
-        agentId,
-        role: roleId,
-        profile: role.profile,
-        model,
-        reasoningLevel,
-        systemPrompt: role.systemPrompt,
-        workspace: group.cwd,
-        parentMemberId: group.leaderSessionId,
-      })
+      if (isSessionProvider(provider)) {
+        // V0.5: sessions are created in a lazy 'starting' state — the provider
+        // conversation (Codex thread / Claude session / DSH agent) attaches on
+        // the first turn or on resume after a restart.
+        const session = await provider.createSession(roleConfig)
+        this.attachMemberRuntime(groupId, agentId, roleConfig, session)
+      } else {
+        // Legacy provider: process handle, no session semantics.
+        const handle = await provider.spawnAgent(roleConfig)
+        this.memberRuntimes.set(agentId, {
+          kind: 'legacy',
+          groupId,
+          memberId: agentId,
+          config: roleConfig,
+          handle,
+          state: 'starting',
+          pendingRequests: new Map(),
+          activeTurn: undefined,
+          turnSeq: 0,
+        })
+        // NEVER treat exit as success: exit only records a stopped/failed
+        // runtime (a completed TURN is the only completion path).
+        void handle.waitExit()
+          .then((result) => this.onLegacyRuntimeExit(groupId, agentId, result))
+          .catch(() => undefined)
+      }
     } catch (error) {
       await this.activity.append({
         groupId,
@@ -255,10 +285,8 @@ export class GroupHost {
       runtime: role.runtime,
       model,
       reasoningLevel,
+      runtimeSession: this.runtimeMetadata(agentId),
     })
-    this.externalHandles.set(agentId, handle)
-    // External runtimes resolve on exit → record the member's result draft.
-    void handle.waitExit().then((result) => this.onRuntimeExit(group.groupId, agentId, result)).catch(() => undefined)
 
     await this.activity.append({
       groupId,
@@ -276,29 +304,379 @@ export class GroupHost {
     return member
   }
 
-  /** External process exit → auto result draft for the member's current task. */
-  private async onRuntimeExit(groupId: GroupId, agentId: string, result: { code: number; output: string }): Promise<void> {
-    this.externalHandles.delete(agentId)
+  // ── V0.5 member runtime registry (sessions ⊃ turns ⊃ tasks) ───────────────
+
+  /**
+   * Attach a live provider session to a member and start forwarding normalized
+   * runtime events into the Activity Timeline + member state machine.
+   */
+  private attachMemberRuntime(groupId: GroupId, memberId: string, config: RuntimeAgentConfig, session: RuntimeSession): void {
+    const entry: MemberRuntime = {
+      kind: 'session',
+      groupId,
+      memberId,
+      config,
+      session,
+      state: 'starting',
+      pendingRequests: new Map(),
+      activeTurn: undefined,
+      turnSeq: 0,
+    }
+    this.memberRuntimes.set(memberId, entry)
+    session.subscribe((event) => this.onRuntimeEvent(memberId, event))
+  }
+
+  /** Re-attach after a host restart using the durable member record. */
+  private async resumeMemberRuntime(group: GroupRecord, member: GroupMember): Promise<void> {
+    if (this.memberRuntimes.has(member.sessionId)) return
+    if (member.runtime === undefined || member.runtimeSession === undefined) return
+    const provider = this.runtimes.get(member.runtime)
+    if (provider === undefined || !isSessionProvider(provider)) return
+    const resumed = await provider.createSession({
+      groupId: group.groupId,
+      agentId: member.sessionId,
+      role: member.roleId ?? 'generalist',
+      model: member.model,
+      reasoningLevel: member.reasoningLevel,
+      workspace: group.cwd,
+      parentMemberId: group.leaderSessionId,
+      metadata: { provider: member.runtimeSession.provider },
+    }, member.runtimeSession as RuntimeSessionInfo)
+    this.attachMemberRuntime(group.groupId, member.sessionId, {
+      groupId: group.groupId,
+      agentId: member.sessionId,
+      role: member.roleId ?? 'generalist',
+      model: member.model,
+      reasoningLevel: member.reasoningLevel,
+      workspace: group.cwd,
+      parentMemberId: group.leaderSessionId,
+    }, resumed)
+    this.setRuntimeState(member.sessionId, 'starting')
+  }
+
+  /** Serializable durable metadata for the member record (no secrets ever). */
+  private runtimeMetadata(memberId: string): import('./core-types.js').RuntimeSessionDurable | undefined {
+    const entry = this.memberRuntimes.get(memberId)
+    if (entry === undefined || entry.kind !== 'session') return undefined
+    const info = entry.session.info()
+    return {
+      runtime: info.runtime,
+      provider: info.provider,
+      providerSessionId: info.providerSessionId,
+      providerThreadId: info.providerThreadId,
+      workspace: info.workspace,
+      model: info.model,
+      reasoningLevel: info.reasoningLevel,
+      state: info.state,
+      lastTurnId: info.lastTurnId,
+      lastTaskId: info.lastTaskId,
+      createdAt: info.createdAt,
+      updatedAt: info.updatedAt,
+    }
+  }
+
+  private persistRuntimeMetadata(groupId: GroupId, memberId: string): void {
+    const durable = this.runtimeMetadata(memberId)
+    if (durable === undefined) return
+    void this.groups.patchMember(groupId, memberId, { runtimeSession: durable }).catch(() => undefined)
+  }
+
+  private setRuntimeState(memberId: string, state: MemberRuntimeState): void {
+    const entry = this.memberRuntimes.get(memberId)
+    if (entry === undefined) return
+    if (entry.state === state) return
+    entry.state = state
+    this.notifier.emit(entry.groupId, 'member', undefined)
+  }
+
+  private runtimeStateOf(memberId: string): MemberRuntimeState | undefined {
+    return this.memberRuntimes.get(memberId)?.state
+  }
+
+  private activeTurnOf(memberId: string): { turnId: string; taskId?: string } | undefined {
+    return this.memberRuntimes.get(memberId)?.activeTurn
+  }
+
+  private requestsForGroup(groupId: GroupId): RuntimeRequestView[] {
+    const views: RuntimeRequestView[] = []
+    for (const entry of this.memberRuntimes.values()) {
+      if (entry.groupId !== groupId) continue
+      for (const request of entry.pendingRequests.values()) {
+        const member = this.groups.getMembership(groupId, entry.memberId)
+        views.push({
+          requestId: request.requestId,
+          requestKind: request.requestKind,
+          memberId: entry.memberId,
+          memberName: member?.name ?? entry.memberId.slice(0, 8),
+          turnId: request.turnId,
+          taskId: request.taskId,
+          description: request.description,
+          timestamp: request.timestamp,
+          defaultAction: request.defaultAction,
+          allowedActions: request.allowedActions,
+        })
+      }
+    }
+    return views
+  }
+
+  /** Normalized runtime event → durable activity + member state machine. */
+  private onRuntimeEvent(memberId: string, event: RuntimeEvent): void {
+    const entry = this.memberRuntimes.get(memberId)
+    if (entry === undefined || entry.kind !== 'session') return // late event after removal
+    const groupId = entry.groupId
+    const member = this.groups.getMembership(groupId, memberId)
+    const actorName = member?.name ?? memberId.slice(0, 8)
+
+    switch (event.type) {
+      case 'session.started': {
+        this.setRuntimeState(memberId, 'starting')
+        if (event.metadata?.resumed !== true && !this.hasDurableSessionMetadata(entry)) {
+          void this.activity.append({ groupId, type: 'runtime_session_started', actorName, refMemberId: memberId, payload: { runtime: entry.session.info().runtime } })
+        }
+        return
+      }
+      case 'session.ready': {
+        if (this.hasDurableSessionMetadata(entry)) {
+          this.setRuntimeState(memberId, 'idle')
+          void this.activity.append({ groupId, type: 'runtime_session_resumed', actorName, refMemberId: memberId, payload: { runtime: entry.session.info().runtime } })
+        } else {
+          this.setRuntimeState(memberId, 'idle')
+          void this.activity.append({ groupId, type: 'runtime_session_ready', actorName, refMemberId: memberId, payload: { runtime: entry.session.info().runtime, providerThreadId: event.providerThreadId } })
+        }
+        this.persistRuntimeMetadata(groupId, memberId)
+        return
+      }
+      case 'session.disconnected': {
+        this.setRuntimeState(memberId, 'disconnected')
+        void this.activity.append({ groupId, type: 'runtime_session_disconnected', actorName, refMemberId: memberId, payload: { reason: event.reason } })
+        void this.groups.patchMember(groupId, memberId, { error: event.reason ?? 'runtime session disconnected', status: 'failed' }).catch(() => undefined)
+        this.persistRuntimeMetadata(groupId, memberId)
+        return
+      }
+      case 'session.failed': {
+        this.setRuntimeState(memberId, 'failed')
+        void this.activity.append({ groupId, type: 'runtime_session_failed', actorName, refMemberId: memberId, payload: { reason: event.reason } })
+        void this.groups.patchMember(groupId, memberId, { error: event.reason ?? 'runtime session failed', status: 'failed' }).catch(() => undefined)
+        this.persistRuntimeMetadata(groupId, memberId)
+        return
+      }
+      case 'session.closed': {
+        this.setRuntimeState(memberId, 'closed')
+        void this.activity.append({ groupId, type: 'runtime_session_closed', actorName, refMemberId: memberId, payload: { reason: event.reason } })
+        this.persistRuntimeMetadata(groupId, memberId)
+        return
+      }
+      case 'turn.started': {
+        this.setRuntimeState(memberId, 'working')
+        void this.activity.append({ groupId, type: 'runtime_turn_started', actorName, refMemberId: memberId, refTaskId: event.taskId, payload: { turnId: event.turnId } })
+        this.persistRuntimeMetadata(groupId, memberId)
+        return
+      }
+      case 'turn.output.delta':
+      case 'turn.reasoning.delta':
+      case 'turn.tool.started':
+      case 'turn.tool.completed':
+        return // ephemeral streaming — NEVER written to the durable store
+      case 'turn.approval.required': {
+        entry.pendingRequests.set(event.request.requestId, event.request)
+        this.setRuntimeState(memberId, 'needs_approval')
+        void this.activity.append({ groupId, type: 'runtime_approval_required', actorName, refMemberId: memberId, refTaskId: event.request.taskId, payload: { requestId: event.request.requestId, description: event.request.description, turnId: event.request.turnId } })
+        this.notifier.emit(groupId, 'member', undefined)
+        return
+      }
+      case 'turn.input.required': {
+        entry.pendingRequests.set(event.request.requestId, event.request)
+        this.setRuntimeState(memberId, 'waiting_input')
+        void this.activity.append({ groupId, type: 'runtime_input_required', actorName, refMemberId: memberId, refTaskId: event.request.taskId, payload: { requestId: event.request.requestId, description: event.request.description, turnId: event.request.turnId } })
+        this.notifier.emit(groupId, 'member', undefined)
+        return
+      }
+      case 'turn.permission.denied': {
+        this.setRuntimeState(memberId, entry.activeTurn !== undefined ? 'working' : 'idle')
+        return
+      }
+      case 'turn.completed': {
+        // Late events from an OLD turn never touch the current one.
+        if (entry.activeTurn !== undefined && entry.activeTurn.turnId !== event.turnId) return
+        const completedTask = entry.activeTurn?.taskId ?? event.taskId
+        entry.activeTurn = undefined
+        this.setRuntimeState(memberId, 'idle')
+        void this.activity.append({ groupId, type: 'runtime_turn_completed', actorName, refMemberId: memberId, refTaskId: completedTask, payload: { turnId: event.turnId, status: event.result.status } })
+        // A COMPLETED TURN, not a process exit, is the completion claim:
+        this.onTurnCompleted(memberId, event.turnId, completedTask, event.result)
+        this.persistRuntimeMetadata(groupId, memberId)
+        return
+      }
+      case 'turn.failed': {
+        if (entry.activeTurn !== undefined && entry.activeTurn.turnId !== event.turnId) return
+        const failedTask = entry.activeTurn?.taskId ?? event.taskId
+        entry.activeTurn = undefined
+        this.setRuntimeState(memberId, 'idle')
+        void this.activity.append({ groupId, type: 'runtime_turn_failed', actorName, refMemberId: memberId, refTaskId: failedTask, payload: { turnId: event.turnId, reason: event.reason } })
+        this.onTurnFailed(memberId, failedTask, event.reason)
+        this.persistRuntimeMetadata(groupId, memberId)
+        return
+      }
+      case 'turn.cancelled': {
+        if (entry.activeTurn !== undefined && entry.activeTurn.turnId !== event.turnId) return
+        const cancelledTask = entry.activeTurn?.taskId ?? event.taskId
+        entry.activeTurn = undefined
+        this.setRuntimeState(memberId, 'idle')
+        void this.activity.append({ groupId, type: 'runtime_turn_cancelled', actorName, refMemberId: memberId, refTaskId: cancelledTask, payload: { turnId: event.turnId, reason: event.reason } })
+        this.persistRuntimeMetadata(groupId, memberId)
+        return
+      }
+      case 'provider.error': {
+        void this.activity.append({ groupId, type: 'member_runtime_failed', actorName, refMemberId: memberId, payload: { code: event.code, error: event.message } })
+        return
+      }
+    }
+  }
+
+  /** Did this member enter the process with durable session metadata? */
+  private hasDurableSessionMetadata(entry: SessionMemberRuntime): boolean {
+    const member = this.groups.getMembership(entry.groupId, entry.memberId)
+    if (member === undefined) return false
+    return member.runtimeSession !== undefined && member.runtimeSession.providerSessionId !== undefined
+  }
+
+  /**
+   * Turn-safe completion: the claim lands on the task that THIS turn was
+   * started for (`turn.taskId`), never on whatever the member is currently
+   * assigned — a late event from Turn A can never complete Turn B.
+   */
+  private async onTurnCompleted(memberId: string, turnId: string, taskId: string | undefined, result: RuntimeTurnResult): Promise<void> {
+    const entry = this.memberRuntimes.get(memberId)
+    if (entry === undefined || entry.kind !== 'session') return
+    if (entry.activeTurn !== undefined) return // a newer turn is active
+    const groupId = entry.groupId
+    const member = this.groups.getMembership(groupId, memberId)
+    if (member === undefined || member.status === 'left') return
+    if (result.status !== 'completed') return
+    const target = taskId ?? member.currentTaskId
+    if (target === undefined) {
+      // Conversational turn without an attached task — nothing to claim.
+      return
+    }
+    try {
+      const task = this.tasks.requireTask(groupId, target)
+      if (task.status === 'in_progress' || task.status === 'pending' || task.status === 'blocked') {
+        await this.tasks.complete(groupId, target, memberId, {
+          summary: result.summary ?? `${member.name} finished the task.`,
+          artifacts: result.artifacts ?? [],
+          changedFiles: result.changedFiles,
+          tests: result.tests as AgentTaskResult['tests'],
+          risks: result.risks,
+          unresolved: result.unresolved,
+          completionClaim: true,
+        })
+        await this.groups.patchMember(groupId, memberId, { lastActiveAt: Date.now(), currentTaskId: undefined })
+        const leader = this.groups.getMembership(groupId, this.groups.requireGroup(groupId).leaderSessionId)
+        if (leader !== undefined) {
+          await this.adapter.deliver(
+            leader.sessionId,
+            textContent(this.completionNotice(memberId, this.tasks.requireTask(groupId, target))),
+            groupMessageSource(groupId, { direction: 'member-to-leader', label: 'task completion notice' }),
+          )
+        }
+      }
+    } catch {
+      // Task missing/closed — the claim is dropped loudly (activity already
+      // recorded the turn result).
+    }
+  }
+
+  /** A failed turn fails the attached task LOUDLY (no silent successes). */
+  private async onTurnFailed(memberId: string, taskId: string | undefined, reason: string | undefined): Promise<void> {
+    const entry = this.memberRuntimes.get(memberId)
+    if (entry === undefined || entry.kind !== 'session') return
+    if (entry.activeTurn !== undefined) return
+    const groupId = entry.groupId
+    const member = this.groups.getMembership(groupId, memberId)
+    if (member === undefined || member.status === 'left') return
+    const target = taskId ?? member.currentTaskId
+    if (target === undefined) return
+    try {
+      const task = this.tasks.requireTask(groupId, target)
+      if (task.status === 'in_progress' || task.status === 'pending' || task.status === 'blocked') {
+        await this.tasks.markFailed(groupId, target, memberId, reason ?? 'runtime turn failed')
+        await this.groups.patchMember(groupId, memberId, { error: reason ?? 'runtime turn failed' })
+      }
+    } catch {
+      // task already closed — fine
+    }
+  }
+
+  /**
+   * Deliver one task assignment / leader follow-up to a member runtime:
+   * - session idle → a new turn (task) on the SAME provider conversation;
+   * - session running → a steer/follow-up on the SAME turn (Codex turn/steer,
+   *   Claude queued); the leader's correction is never a brand-new agent;
+   * - DSH members → a waking deliver (their claims come from the tools);
+   * - legacy handles → text input (no exit-based completion ever).
+   */
+  private async deliverToMemberRuntime(groupId: GroupId, memberId: string, text: string, taskId?: string): Promise<boolean> {
+    const entry = this.memberRuntimes.get(memberId)
+    if (entry === undefined) {
+      // A runtime member with no live session after a restart: resume failed
+      // or was never attempted — fail LOUDLY, never start a fresh conversation
+      // silently (requirement §21).
+      const member = this.groups.getMembership(groupId, memberId)
+      if (member?.runtime !== undefined && member.status !== 'left') {
+        throw new GroupError('SESSION_RESUME_FAILED', `member ${member.name} has no live runtime session; the provider session could not be resumed — retry the task after resume, or spawn a new member`)
+      }
+      return false
+    }
+    if (entry.kind === 'session') {
+      const session = entry.session
+      if (entry.activeTurn !== undefined || entry.state === 'working') {
+        try {
+          await session.sendFollowup?.({ text, taskId, turnKind: taskId !== undefined ? 'task' : 'followup' })
+        } catch (error) {
+          // A steer failure is LOUD (provider.error already streamed); fall
+          // back to starting a new turn rather than dropping the instruction.
+          void error
+          await session.runTurn({ text, taskId, turnKind: taskId !== undefined ? 'task' : 'followup' })
+        }
+        // The running turn is now the member's delivery vehicle for the NEW
+        // task too; when it completes, the claim targets this retargeted id.
+        if (entry.activeTurn !== undefined && taskId !== undefined) {
+          entry.activeTurn = { turnId: entry.activeTurn.turnId, taskId }
+        }
+        return true
+      }
+      let handle
+      try {
+        handle = await session.runTurn({ text, taskId, turnKind: taskId !== undefined ? 'task' : 'followup' })
+      } catch (error) {
+        if (error instanceof GroupError) throw error
+        throw new GroupError('TURN_START_FAILED', `failed to start a runtime turn for member: ${error instanceof Error ? error.message : String(error)}`)
+      }
+      entry.activeTurn = { turnId: handle.turnId, taskId: handle.taskId }
+      return true
+    }
+    // legacy handle
+    try {
+      await entry.handle.deliver?.({ type: 'task_assignment', groupId, senderId: 'leader', recipientId: memberId, taskId, timestamp: Date.now(), payload: { text } })
+        ?? entry.handle.sendInput?.(text)
+    } catch {
+      return false
+    }
+    return true
+  }
+
+  /** Legacy provider exit: NEVER a successful task result. Records stopped/failed. */
+  private async onLegacyRuntimeExit(groupId: GroupId, agentId: string, result: { code: number; output: string }): Promise<void> {
     let member: GroupMember
     try {
       member = this.groups.requireMember(groupId, agentId)
     } catch {
       return // member already removed
     }
-    if (member.status === 'left') return // removed before the exit landed
+    if (member.status === 'left') return
+    this.memberRuntimes.delete(agentId)
     if (result.code === 0) {
-      const taskId = member.currentTaskId
-      if (taskId !== undefined) {
-        const task = this.tasks.requireTask(groupId, taskId)
-        if (task.result === undefined && (task.status === 'in_progress' || task.status === 'pending' || task.status === 'blocked')) {
-          const summary = result.output.trim().slice(-1200) || `${member.name} finished the task.`
-          await this.tasks.complete(groupId, taskId, agentId, {
-            summary,
-            artifacts: [],
-            completionClaim: true,
-          })
-        }
-      }
       await this.activity.append({
         groupId,
         type: 'member_runtime_stopped',
@@ -306,6 +684,7 @@ export class GroupHost {
         refMemberId: agentId,
         payload: { exitCode: 0, role: member.roleId, runtime: member.runtime },
       })
+      await this.groups.patchMember(groupId, agentId, { status: 'failed', error: 'runtime process exited without a completed turn' })
     } else {
       const snippet = result.output.trim().slice(-300)
       await this.activity.append({
@@ -496,21 +875,46 @@ export class GroupHost {
   async assignTask(actor: string, input: { taskId: string; ownerId: string; expectedRevision?: number; deliver?: boolean }): Promise<GroupTask> {
     const { group } = this.leaderActor(actor)
     this.groups.assertDispatchable(group)
-    this.groups.requireMember(group.groupId, input.ownerId)
+    const ownerRecord = this.groups.requireMember(group.groupId, input.ownerId)
     const task = await this.tasks.assign(group.groupId, input.taskId, input.ownerId, actor, input.expectedRevision)
     // record the member's current task (external runtimes cannot claim themselves)
     await this.groups.patchMember(group.groupId, input.ownerId, { currentTaskId: task.taskId })
     if (input.deliver !== false) {
-      const delivered = await this.adapter.deliver(
-        input.ownerId,
-        textContent(this.taskBrief(group, task)),
-        groupMessageSource(group.groupId, { direction: 'leader-to-member', label: 'task assignment' }),
-      )
-      if (!delivered) {
-        const handle = this.externalHandles.get(input.ownerId)
-        if (handle?.sendInput !== undefined) {
-          await handle.sendInput(this.taskBrief(group, task))
-        }
+      const message = createRuntimeMessage({
+        type: 'task_assignment',
+        groupId: group.groupId,
+        senderId: actor,
+        recipientId: input.ownerId,
+        taskId: task.taskId,
+        priority: task.priority,
+        payload: {
+          taskId: task.taskId,
+          subject: task.subject,
+          description: task.description,
+          kind: task.kind,
+          acceptanceCriteria: task.acceptanceCriteria,
+          writeScopes: task.writeScopes,
+          blockedBy: task.blockedBy,
+          taskBrief: this.taskBrief(group, task),
+        },
+      })
+      const text = runtimeMessageText(message)
+      if (this.memberRuntimes.has(input.ownerId)) {
+        // Runtime members route through their persistent SESSION: the
+        // assignment becomes a TURN (or a steer on the running turn), and the
+        // session ensures the member's OWN configuration on attach.
+        await this.deliverToMemberRuntime(group.groupId, input.ownerId, text, task.taskId)
+      } else if (ownerRecord.runtime !== undefined) {
+        // A runtime member with no live session = resume failed or was never
+        // attempted — fail LOUDLY; never start a fresh conversation silently.
+        throw new GroupError('SESSION_RESUME_FAILED', `member ${ownerRecord.name} has no live runtime session; the provider session could not be resumed — retry the task after resume, or spawn a new member`)
+      } else {
+        // Plain DSH profile members keep the waking deliver path.
+        await this.adapter.deliver(
+          input.ownerId,
+          textContent(text),
+          groupMessageSource(group.groupId, { direction: 'leader-to-member', label: 'task assignment' }),
+        )
       }
     }
     return task
@@ -564,11 +968,17 @@ export class GroupHost {
       direction: 'leader-to-member',
       text: input.text,
     })
-    await this.adapter.deliver(
-      member.sessionId,
-      textContent(`[Private message from Leader]\n${input.text}`),
-      groupMessageSource(group.groupId, { direction: 'leader-to-member', label: 'private message from Leader' }),
-    )
+    // V0.5: the leader's follow-up reaches the member's RUNTIME — the same
+    // Codex thread / Claude session / DSH agent (never a brand-new agent).
+    if (this.memberRuntimes.has(member.sessionId)) {
+      await this.deliverToMemberRuntime(group.groupId, member.sessionId, `[Private message from Leader]\n${input.text}`)
+    } else {
+      await this.adapter.deliver(
+        member.sessionId,
+        textContent(`[Private message from Leader]\n${input.text}`),
+        groupMessageSource(group.groupId, { direction: 'leader-to-member', label: 'private message from Leader' }),
+      )
+    }
     return message
   }
 
@@ -580,7 +990,16 @@ export class GroupHost {
   async interruptMember(actor: string, input: { memberSessionId: string; reason: string }): Promise<boolean> {
     const { group } = this.leaderActor(actor)
     this.groups.requireMember(group.groupId, input.memberSessionId)
-    const ok = this.adapter.interrupt(input.memberSessionId, input.reason)
+    let ok = this.adapter.interrupt(input.memberSessionId, input.reason)
+    const entry = this.memberRuntimes.get(input.memberSessionId)
+    if (entry?.kind === 'session' && entry.session.interrupt !== undefined) {
+      try {
+        await entry.session.interrupt(input.reason)
+        ok = true
+      } catch {
+        ok = ok // DSH interrupt already handled it
+      }
+    }
     await this.groups.patchMember(group.groupId, input.memberSessionId, { error: `interrupted: ${input.reason}` })
     await this.activity.append({
       groupId: group.groupId,
@@ -611,16 +1030,16 @@ export class GroupHost {
 
   // ── Member operations ─────────────────────────────────────────────────────
 
-  async claimTask(actor: string, input: { taskId: string; expectedRevision?: number }): Promise<GroupTask> {
-    const { group } = this.memberContext(actor)
+  async claimTask(actor: string, input: { taskId: string; expectedRevision?: number }, groupId?: GroupId): Promise<GroupTask> {
+    const { group } = this.memberContext(actor, groupId)
     this.groups.assertDispatchable(group)
     const task = await this.tasks.claim(group.groupId, input.taskId, actor, input.expectedRevision)
     await this.groups.patchMember(group.groupId, actor, { currentTaskId: task.taskId })
     return task
   }
 
-  async completeTask(actor: string, input: { taskId: string; summary: string; artifacts: string[]; changedFiles?: string[]; tests?: AgentTaskResult['tests']; risks?: string[]; unresolved?: string[]; completionClaim: boolean }): Promise<GroupTask> {
-    const { group } = this.memberContext(actor)
+  async completeTask(actor: string, input: { taskId: string; summary: string; artifacts: string[]; changedFiles?: string[]; tests?: AgentTaskResult['tests']; risks?: string[]; unresolved?: string[]; completionClaim: boolean }, groupId?: GroupId): Promise<GroupTask> {
+    const { group } = this.memberContext(actor, groupId)
     const task = await this.tasks.complete(group.groupId, input.taskId, actor, {
       summary: input.summary,
       artifacts: input.artifacts,
@@ -630,7 +1049,13 @@ export class GroupHost {
       unresolved: input.unresolved,
       completionClaim: input.completionClaim,
     })
-    await this.groups.patchMember(group.groupId, actor, { lastActiveAt: Date.now() })
+    await this.groups.patchMember(group.groupId, actor, { lastActiveAt: Date.now(), currentTaskId: undefined })
+    // DSH members claim their own completion → the runtimes settle to idle.
+    const entry = this.memberRuntimes.get(actor)
+    if (entry?.kind === 'session') {
+      this.setRuntimeState(actor, 'idle')
+      this.persistRuntimeMetadata(group.groupId, actor)
+    }
     const leader = this.groups.getMembership(group.groupId, group.leaderSessionId)
     if (leader !== undefined) {
       await this.adapter.deliver(
@@ -652,13 +1077,13 @@ export class GroupHost {
     ].join('\n')
   }
 
-  async postChannel(actor: string, input: { text: string; replyToMessageId?: string }): Promise<ChannelMessage> {
-    const { group } = this.memberContext(actor)
+  async postChannel(actor: string, input: { text: string; replyToMessageId?: string }, groupId?: GroupId): Promise<ChannelMessage> {
+    const { group } = this.memberContext(actor, groupId)
     return this.channel.post(group.groupId, { senderId: actor, senderName: this.actorDisplayName(actor), text: input.text, replyToMessageId: input.replyToMessageId })
   }
 
-  async reportToLeader(actor: string, input: { text: string }): Promise<PrivateMessage> {
-    const { group } = this.memberContext(actor)
+  async reportToLeader(actor: string, input: { text: string }, groupId?: GroupId): Promise<PrivateMessage> {
+    const { group } = this.memberContext(actor, groupId)
     const message = await this.privateMessages.send(group.groupId, {
       senderId: actor,
       senderName: this.actorDisplayName(actor),
@@ -918,13 +1343,16 @@ export class GroupHost {
     this.groups.assertMutable(group)
     const member = this.groups.requireMember(group.groupId, memberSessionId)
     if (member.role === 'leader') throw new GroupError('CONFLICT', 'the Leader cannot be removed')
-    // Mark the member left FIRST so a concurrent runtime-exit callback (from
-    // stop) cannot resurrect it; then stop the external process / DSH handle.
+    // Mark the member left FIRST so a concurrent runtime callback (from the
+    // session or a stop) cannot resurrect it; then close the runtime session
+    // / dispose the DSH handle.
     await this.groups.removeMember(group.groupId, memberSessionId)
-    const handle = this.externalHandles.get(memberSessionId)
-    if (handle !== undefined) {
-      this.externalHandles.delete(memberSessionId)
-      await handle.stop()
+    const entry = this.memberRuntimes.get(memberSessionId)
+    this.memberRuntimes.delete(memberSessionId)
+    if (entry?.kind === 'session') {
+      await entry.session.close().catch(() => undefined)
+    } else if (entry?.kind === 'legacy') {
+      await entry.handle.stop().catch(() => undefined)
     }
     await this.adapter.disposeMember(memberSessionId)
     await this.activity.append({
@@ -1101,7 +1529,12 @@ export class GroupHost {
     const leaderLive = this.adapter.liveAgent(group.leaderSessionId) !== undefined
     return {
       group,
-      members,
+      members: members.map((member) => ({
+        ...member,
+        liveStatus: member.liveStatus,
+        runtimeState: this.runtimeStateOf(member.sessionId),
+        currentTurnId: this.activeTurnOf(member.sessionId)?.turnId,
+      })),
       tasks: this.tasks.listTasks(groupId),
       channel: this.channel.list(groupId),
       privateMessages: this.privateMessages.listForGroup(groupId, group.leaderSessionId),
@@ -1109,6 +1542,71 @@ export class GroupHost {
       profiles: this.profiles.list(),
       leaderLive,
       compatibility,
+      runtimeRequests: this.requestsForGroup(groupId),
+    }
+  }
+
+  // ── V0.5: runtime request answering (approval / input / permission) ───────
+
+  /**
+   * Answer a pending provider request (approval / user input) surfaced by the
+   * Team UI. The Host contract is policy, not prompts: membership/role checks
+   * happen here; the provider never auto-approves.
+   */
+  async respondRuntimeRequest(groupId: GroupId, memberId: string, requestId: string, action: string, payload?: unknown): Promise<boolean> {
+    const group = this.groups.requireGroup(groupId)
+    this.groups.assertMutable(group)
+    this.groups.requireMember(groupId, memberId)
+    const entry = this.memberRuntimes.get(memberId)
+    if (entry === undefined || entry.kind !== 'session') return false
+    const request = entry.pendingRequests.get(requestId)
+    if (request === undefined) return false
+    const answered = await entry.session.respondToRequest?.(requestId, action, payload) ?? false
+    if (answered) {
+      entry.pendingRequests.delete(requestId)
+      await this.activity.append({
+        groupId,
+        type: request.requestKind === 'input' ? 'runtime_request_answered' : 'runtime_approval_answered',
+        actorName: 'User',
+        refMemberId: memberId,
+        refTaskId: request.taskId,
+        payload: { requestId, action, requestKind: request.requestKind },
+      })
+      this.setRuntimeState(memberId, entry.activeTurn !== undefined ? 'working' : 'idle')
+      this.notifier.emit(groupId, 'member', undefined)
+    }
+    return answered
+  }
+
+  /** V0.5: advanced/debug runtime view (thread/session ids belong HERE, not
+   * in the primary UI). Never includes credentials. */
+  runtimeSessionsView(groupId: GroupId): unknown[] {
+    const out: unknown[] = []
+    for (const entry of this.memberRuntimes.values()) {
+      if (entry.groupId !== groupId) continue
+      if (entry.kind === 'session') {
+        out.push({ memberId: entry.memberId, ...entry.session.info() })
+      } else {
+        out.push({ memberId: entry.memberId, runtime: 'legacy-process', state: entry.state, external: true })
+      }
+    }
+    return out
+  }
+
+  /** V0.5: re-attach every durable member session after a host restart. */
+  async resumeAllMemberRuntimes(): Promise<void> {
+    for (const group of this.groups.listGroups()) {
+      const members = this.groups.listMembers(group.groupId, () => undefined)
+      for (const member of members) {
+        if (member.role !== 'member' || member.status === 'left') continue
+        try {
+          await this.resumeMemberRuntime(group, member)
+        } catch {
+          // A member whose provider session cannot resume stays in the roster
+          // with its durable metadata; the next dispatch fails loudly with
+          // SESSION_RESUME_FAILED instead of silently creating a fresh one.
+        }
+      }
     }
   }
 
@@ -1143,6 +1641,38 @@ function resolveLiveStatus(durable: AgentMemberStatus, live: 'running' | 'idle' 
   if (live === 'running') return 'running'
   if (live === 'idle') return 'idle'
   return 'inactive'
+}
+
+/**
+ * V0.5: one member's live runtime — a persistent provider session with an
+ * active-turn cursor and pending provider requests. The session is created
+ * once per member and survives across tasks; turn ids correlate events so a
+ * late event from an old turn can never complete a newer turn.
+ */
+type MemberRuntime = SessionMemberRuntime | LegacyMemberRuntime
+
+interface SessionMemberRuntime {
+  readonly kind: 'session'
+  readonly groupId: GroupId
+  readonly memberId: string
+  readonly config: RuntimeAgentConfig
+  readonly session: RuntimeSession
+  state: MemberRuntimeState
+  readonly pendingRequests: Map<string, RuntimePendingRequest>
+  activeTurn: { turnId: string; taskId?: string } | undefined
+  turnSeq: number
+}
+
+interface LegacyMemberRuntime {
+  readonly kind: 'legacy'
+  readonly groupId: GroupId
+  readonly memberId: string
+  readonly config: RuntimeAgentConfig
+  readonly handle: RuntimeAgentHandle
+  state: MemberRuntimeState
+  readonly pendingRequests: Map<string, RuntimePendingRequest>
+  activeTurn: { turnId: string; taskId?: string } | undefined
+  turnSeq: number
 }
 
 const PRESET_METADATA_NAME = /^name:\s*(.+)$/m

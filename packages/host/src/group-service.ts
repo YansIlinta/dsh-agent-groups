@@ -48,6 +48,13 @@ export type GroupErrorCode =
   | 'MODEL_UNAVAILABLE'
   | 'REASONING_UNAVAILABLE'
   | 'SPAWN_FAILED'
+  // V0.5: loud runtime failure vocabulary (requirement §21)
+  | 'SESSION_START_FAILED'
+  | 'SESSION_RESUME_FAILED'
+  | 'TURN_START_FAILED'
+  | 'TURN_TIMEOUT'
+  | 'TURN_INTERRUPTED'
+  | 'RUNTIME_DISCONNECTED'
 
 export interface MissionInput {
   readonly objective: string
@@ -428,7 +435,7 @@ export class GroupService {
   async patchMember(
     groupId: GroupId,
     sessionId: string,
-    patch: Partial<Pick<GroupMember, 'status' | 'currentTaskId' | 'error' | 'lastActiveAt' | 'name'>>,
+    patch: Partial<Pick<GroupMember, 'status' | 'currentTaskId' | 'error' | 'lastActiveAt' | 'name' | 'runtimeSession'>>,
   ): Promise<GroupMember | undefined> {
     const key = scopedKey(groupId, sessionId)
     try {

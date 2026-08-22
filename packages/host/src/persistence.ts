@@ -59,6 +59,20 @@ const ACTIVITY_TYPES = [
   'member_runtime_failed',
   'member_runtime_stopped',
   'team_config_updated',
+  'runtime_session_started',
+  'runtime_session_resumed',
+  'runtime_session_ready',
+  'runtime_session_disconnected',
+  'runtime_session_failed',
+  'runtime_session_closed',
+  'runtime_turn_started',
+  'runtime_turn_completed',
+  'runtime_turn_failed',
+  'runtime_turn_cancelled',
+  'runtime_approval_required',
+  'runtime_input_required',
+  'runtime_approval_answered',
+  'runtime_request_answered',
 ] as const
 
 const profileSchema = z.object({
@@ -131,6 +145,21 @@ const groupSchema = z.object({
   teamConfig: teamConfigSchema.optional(),
 })
 
+const runtimeSessionSchema = z.object({
+  runtime: str,
+  provider: str.optional(),
+  providerSessionId: str.optional(),
+  providerThreadId: str.optional(),
+  workspace: str.optional(),
+  model: str.optional(),
+  reasoningLevel: str.optional(),
+  state: str.optional(),
+  lastTurnId: str.optional(),
+  lastTaskId: str.optional(),
+  createdAt: z.number().optional(),
+  updatedAt: z.number().optional(),
+})
+
 const memberSchema = z.object({
   sessionId: str,
   groupId: str,
@@ -147,6 +176,8 @@ const memberSchema = z.object({
   runtime: str.optional(),
   model: str.optional(),
   reasoningLevel: str.optional(),
+  // V0.5: durable runtime-session metadata (optional → legacy members load).
+  runtimeSession: runtimeSessionSchema.optional(),
 })
 
 const taskResultSchema = z.object({
