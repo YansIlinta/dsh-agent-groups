@@ -19,9 +19,10 @@ jobs:
 
       # The host package compiles against the exact DSH runtime packages
       # (linked by scripts/link-dsh-deps.sh). Install the same rc.6 release
-      # the web profile runs so typecheck/tests/build match production.
+      # the web profile runs into the SAME npm prefix npm ci's lifecycle
+      # scripts see (setup-node's global dir), so `npm root -g` matches.
       - name: Install exact DSH runtime (0.1.0-rc.6)
-        run: sudo npm install -g @deepseek-ai/dsh@0.1.0-rc.6
+        run: npm install -g @deepseek-ai/dsh@0.1.0-rc.6
 
       - name: Install host deps (postinstall links DSH packages)
         run: npm ci
