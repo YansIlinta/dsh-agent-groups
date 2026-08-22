@@ -1,6 +1,6 @@
 /**
  * Known-leader registry (V0.2): durable list of sessions that acted as group
- * Leaders (populated on first leader tool use / init). The dashboard uses it
+ * Leaders (populated on first leader tool use / init). The Agent Groups page uses it
  * for the "Create Group" leader picker — the web layer cannot see requester
  * sessions, so the picker must be explicit.
  * @module @dsh-agent-groups/host

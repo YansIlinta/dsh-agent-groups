@@ -20,8 +20,8 @@ Duurable: group/mission/workstreams/tasks/channel/private/timeline (DSH storage 
   - A global `tools/pre-execute` gate denies raw peer tools (`send_message`, `subagent*`, `workflow`, `ralph`, …) to any group member (defense in depth on top of tool-set scoping).
   - Group Channel = durable public feed; members use `group_post` / `group_report_to_leader`.
 - **Two-level task model** — `GroupTaskMetadata` (kind, acceptance criteria, capabilities, priority, tags, write scopes, retry-of, verifier ids) over the DAG node, plus an `AgentTaskResult` (summary, artifacts, changed files, tests, risks, unresolved, `completionClaim`). A member claiming completion is **not** verification.
-- **Write-scope overlap warnings** — prefix-based detection between non-terminal tasks, surfaced to the Leader and dashboard.
-- **Activity Timeline** — durable event stream (`mission_created` … `verification_failed`), streamed live to the dashboard via SSE.
+- **Write-scope overlap warnings** — prefix-based detection between non-terminal tasks, surfaced to the Leader and the Agent Groups page.
+- **Activity Timeline** — durable event stream (`mission_created` … `verification_failed`), streamed live to the Agent Groups page via SSE.
 - **Native page** — the UI is a DSH client bundle (`dsh.client` declaration, `/plugins/@dsh-agent-groups/host/client.js`): an “Agent Groups” entry in the sidebar footer and a full-frame page on the shell overlay. Group list → group detail tabs (Overview/Tasks/Team/Channel/Activity) → create-group dialog, live through `/groups/api/*` + SSE. No iframe, no second app shell, no `/groups/` site.
 - **Compatibility diagnostic at boot** — prints the DSH Agent Groups banner and **fails loud** if a required DSH surface is missing.
 
@@ -29,7 +29,7 @@ Duurable: group/mission/workstreams/tasks/channel/private/timeline (DSH storage 
 
 | Area | What was added |
 | --- | --- |
-| Team Management | 4 built-in **Team Templates** (Software/Research/Content/General), Create Group UI with template picker, **Custom Team Builder**, add/remove/rename members with display roles, **Team Graph**, member inspector (task history, posts, private messages, activity), **Pause/Resume** (dispatch gate), **Archive/Restore**, **Duplicate** (mission/template copied; members re-materialized; history never copied), group **settings** (name, max members), known-leader registry for safe dashboard-side creation |
+| Team Management | 4 built-in **Team Templates** (Software/Research/Content/General), Create Group UI with template picker, **Custom Team Builder**, add/remove/rename members with display roles, **Team Graph**, member inspector (task history, posts, private messages, activity), **Pause/Resume** (dispatch gate), **Archive/Restore**, **Duplicate** (mission/template copied; members re-materialized; history never copied), group **settings** (name, max members), known-leader registry for safe page-side creation |
 | Task Management | Kanban board (Ready/Blocked/Running/Review/Done/Failed) with **drag Quick-ready ⇄ Blocked via user “hold”**, task **editing** (title/description/priority/tags/dependencies), **priority urgent**, **tags**, search/filter by member/priority/tag, dependency graph (depends on / blocks), write-scope hints, per-task activity & related messages |
 | Messaging | **User ↔ Leader chat** (durable, separate from the team channel), **user broadcast** to the channel, channel **replies** (threads), **pins**, **search + sender filter**, @mention highlighting |
 | Workspace | **Shared Notes** (leader/user editable, durable, member-readable), **Artifact browser** derived from structured results (open text preview, copy path), workspace view |
@@ -143,7 +143,7 @@ node scripts/demo-v02.mjs            # full V0.2 narrative, throwaway storage ro
 node scripts/demo-v02.mjs --keep     # keep the storage root for inspection
 ```
 
-It boots the **same cordis storage stack** over a throwaway root and drives the real product facade through the whole V0.2 flow: team templates → dashboard group creation (Software Team) → leader decomposition (DAG/priority/tags) → assignments → members claim/complete → verification → task edit + hold → channel posts/reply/pin/broadcast → leader chat → shared notes → workspace artifacts → activity feed → pause gate → completion + duplicate → archive/restore → **durability across a simulated process reload**. Agent sessions are simulated with the no-op adapter — the live agent demo still needs one real Team Lead session in the DSH GUI (demo steps above).
+It boots the **same cordis storage stack** over a throwaway root and drives the real product facade through the whole V0.2 flow: team templates → Agent Groups page creation (Software Team) → leader decomposition (DAG/priority/tags) → assignments → members claim/complete → verification → task edit + hold → channel posts/reply/pin/broadcast → leader chat → shared notes → workspace artifacts → activity feed → pause gate → completion + duplicate → archive/restore → **durability across a simulated process reload**. Agent sessions are simulated with the no-op adapter — the live agent demo still needs one real Team Lead session in the DSH GUI (demo steps above).
 
 ## Tests (§26 + V0.2 + V0.3)
 
@@ -153,7 +153,7 @@ It boots the **same cordis storage stack** over a throwaway root and drives the 
 - **Channel** — durable ordered feed with no duplicates, one notification per post, private one-way scoping, durability across a reload.
 - **Conflicts** — nested/identical/disjoint write scopes, non-terminal-only reporting.
 - **Profiles** — built-ins present, register/get/remove over the durable table.
-- **V0.2** — team templates (slots + valid profiles); task editing (fields/CAS/guards + `task_updated`); user hold → board blocked without DAG changes; channel reply + pin/unpin with history kept; mission notes durable; pause gate blocks dispatch but keeps messaging; archive hides/restores and blocks mutations; duplicate copies mission/workstreams and re-materializes members (completion/archive required); known-leader registry + dashboard group creation with template members; user↔leader private directions; **backward compatibility** — V0.1 group/task/channel/private records still parse with the extended schema.
+- **V0.2** — team templates (slots + valid profiles); task editing (fields/CAS/guards + `task_updated`); user hold → board blocked without DAG changes; channel reply + pin/unpin with history kept; mission notes durable; pause gate blocks dispatch but keeps messaging; archive hides/restores and blocks mutations; duplicate copies mission/workstreams and re-materializes members (completion/archive required); known-leader registry + Agent Groups page creation with template members; user↔leader private directions; **backward compatibility** — V0.1 group/task/channel/private records still parse with the extended schema.
 - **V0.3 API routes** — the `/groups/api/*` dispatcher is now covered with fake request/response harnesses: broadcast and members POSTs are no longer shadowed by the group-action branch, group actions still dispatch, unknown sub-paths 404 cleanly, collections return JSON.
 
 ## Design notes & constraints honored

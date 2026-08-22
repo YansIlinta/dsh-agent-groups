@@ -2,7 +2,7 @@
  * Shared data vocabulary for DSH Agent Groups. Every value in this file is
  * plain JSON-serializable data (optional fields are stored only when present);
  * it is the contract between the host services, the model-facing tools, and
- * the dashboard web API.
+ * the Agent Groups page web API.
  * @module @dsh-agent-groups/host
  */
 
@@ -205,7 +205,7 @@ export interface ChannelMessage {
   readonly senderName: string
   readonly timestamp: number
   readonly kind: ChannelMessageKind
-  /** Plain text render of the content blocks (dashboard + model-facing). */
+  /** Plain text render of the content blocks (Agent Groups page + model-facing). */
   readonly text: string
   readonly refTaskId?: TaskId
   /** V0.2: thread parent for simple replies. */
@@ -280,7 +280,7 @@ export interface ActivityEvent {
 /** Plain identity of one web client connection (browser tab). */
 export type WebClientId = string
 
-/** SSE delta pushed to dashboard clients. */
+/** SSE delta pushed to Agent Groups clients. */
 export interface GroupUpdate {
   readonly seq: number
   readonly groupId: GroupId
@@ -288,7 +288,7 @@ export interface GroupUpdate {
   readonly event?: ActivityEvent
 }
 
-/** Full dashboard state for one group (§15–18). */
+/** Full Agent Groups page state for one group (§15–18). */
 export interface GroupSnapshot {
   readonly group: GroupRecord
   readonly members: ReadonlyArray<GroupMember & { readonly liveStatus: AgentMemberStatus }>
@@ -349,7 +349,7 @@ export interface WorkspaceArtifact {
   readonly createdAt: number
 }
 
-/** Compact group list item for the dashboard home (第 42/43 节). */
+/** Compact group list item for the Agent Groups page home (第 42/43 节). */
 export interface GroupListItem {
   readonly groupId: GroupId
   readonly name: string

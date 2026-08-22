@@ -3,7 +3,7 @@
  * of the DeepSeek Harness checkout: it composes only public Cordis services
  * (`ctx.storageDomain`, `ctx.webServer`, `ctx.agents`, `ctx.agentPresets`,
  * `ctx.tools`, `ctx.systemPrompt`), opens a plugin-owned durable domain, and
- * serves the group dashboard on the same webserver as the DSH GUI.
+ * serves the group Agent Groups page on the same webserver as the DSH GUI.
  *
  * Mount this plugin into a profile (the shipped overlay in
  * `@dsh-agent-groups/profiles`) and compose sessions from the `group-leader`

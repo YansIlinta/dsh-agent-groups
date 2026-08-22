@@ -178,7 +178,7 @@ export const LEADER_TOOLS: readonly GroupToolDef[] = [
   },
   {
     name: 'leader_broadcast',
-    description: 'Post a message to the Group Channel, visible to every member and the dashboard. Optionally reply to an existing channel message.',
+    description: 'Post a message to the Group Channel, visible to every member and the Agent Groups page. Optionally reply to an existing channel message.',
     parameters: {
       text: { type: string, required: true, description: 'Channel message text.' },
       replyToMessageId: { type: string, description: 'Channel message id this post replies to (simple thread).' },
@@ -187,7 +187,7 @@ export const LEADER_TOOLS: readonly GroupToolDef[] = [
   },
   {
     name: 'leader_reply_user',
-    description: 'Reply to the user in the dashboard Leader Chat. The reply appears there and in your normal chat.',
+    description: 'Reply to the user in the Agent Groups Leader Chat. The reply appears there and in your normal chat.',
     parameters: {
       text: { type: string, required: true, description: 'Reply text for the user.' },
     },
@@ -195,7 +195,7 @@ export const LEADER_TOOLS: readonly GroupToolDef[] = [
   },
   {
     name: 'leader_update_notes',
-    description: 'Update the shared Mission Notes (constraints, decisions, context) — durable and shown in the dashboard Workspace.',
+    description: 'Update the shared Mission Notes (constraints, decisions, context) — durable and shown in the Agent Groups workspace.',
     parameters: {
       notes: { type: string, required: true, description: 'Full notes text (replaces previous notes).' },
     },

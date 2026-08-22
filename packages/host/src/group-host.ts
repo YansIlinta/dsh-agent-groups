@@ -530,7 +530,7 @@ export class GroupHost {
     return this.adapter.deliver(group.leaderSessionId, textContent(text), { kind: 'user' })
   }
 
-  /** V0.2: Leader replies to the user inside the dashboard Leader Chat. */
+  /** V0.2: Leader replies to the user inside the Agent Groups page Leader Chat. */
   async leaderReplyToUser(actor: string, input: { text: string }): Promise<PrivateMessage> {
     const { group } = this.leaderActor(actor)
     return this.privateMessages.send(group.groupId, {
@@ -565,7 +565,7 @@ export class GroupHost {
   // ── V0.2: user console (create / manage team) ─────────────────────────────
 
   /**
-   * Create a group from the dashboard: binds a KNOWN leader session (one that
+   * Create a group from the Agent Groups page: binds a KNOWN leader session (one that
    * already acted as a Leader) so the role model is never bypassed; the bound
    * session must own no group yet. Optional team template materializes the
    * member slots immediately (custom member lists allowed instead).
@@ -599,7 +599,7 @@ export class GroupHost {
       senderId: 'system',
       senderName: 'System',
       kind: 'system',
-      text: `Group "${group.name}" created via the dashboard with mission: ${input.objective}`,
+      text: `Group "${group.name}" created via the Agent Groups page with mission: ${input.objective}`,
     })
     let slots: Array<{ role?: string; profile: string; name?: string }> = input.members ?? []
     if (input.templateId !== undefined && slots.length === 0) {
@@ -629,7 +629,7 @@ export class GroupHost {
     return this.groups.requireGroup(group.groupId)
   }
 
-  /** V0.2: dashboard "Add Member" — same gates as the leader spawn path. */
+  /** V0.2: Agent Groups page "Add Member" — same gates as the leader spawn path. */
   async userSpawnMember(groupId: GroupId, input: { profileId: string; name?: string; displayRole?: string }): Promise<GroupMember> {
     const group = this.groups.requireGroup(groupId)
     this.groups.assertMutable(group)
@@ -707,7 +707,7 @@ export class GroupHost {
       senderId: 'system',
       senderName: 'System',
       kind: 'system',
-      text: `Group duplicated from "${group.name}" via the dashboard.`,
+      text: `Group duplicated from "${group.name}" via the Agent Groups page.`,
     })
     return copy
   }
@@ -724,21 +724,21 @@ export class GroupHost {
     return this.groups.updateGroupSettings(group.groupId, patch, 'User')
   }
 
-  /** V0.2: dashboard task editing (leader/user console; 第 12 节). */
+  /** V0.2: Agent Groups page task editing (leader/user console; 第 12 节). */
   async userEditTask(groupId: GroupId, taskId: string, patch: TaskUpdatePatch): Promise<GroupTask> {
     const group = this.groups.requireGroup(groupId)
     this.groups.assertMutable(group)
     return this.tasks.updateTask(group.groupId, taskId, 'user', patch)
   }
 
-  /** V0.2: dashboard hold/release (kanban Ready ↔ Blocked, 第 13 节). */
+  /** V0.2: Agent Groups page hold/release (kanban Ready ↔ Blocked, 第 13 节). */
   async userHoldTask(groupId: GroupId, taskId: string, held: boolean): Promise<GroupTask> {
     const group = this.groups.requireGroup(groupId)
     this.groups.assertMutable(group)
     return this.tasks.setHeld(group.groupId, taskId, 'user', held)
   }
 
-  /** V0.2: dashboard pin/unpin (第 22 节). */
+  /** V0.2: Agent Groups page pin/unpin (第 22 节). */
   async userPinMessage(groupId: GroupId, messageId: string, pinned: boolean): Promise<ChannelMessage> {
     const group = this.groups.requireGroup(groupId)
     this.groups.assertMutable(group)
@@ -803,7 +803,7 @@ export class GroupHost {
     })
   }
 
-  /** V0.2: templates exposed to the dashboard (第 3/4 节). */
+  /** V0.2: templates exposed to the Agent Groups page (第 3/4 节). */
   templates(): readonly TeamTemplate[] {
     return listTemplates()
   }
