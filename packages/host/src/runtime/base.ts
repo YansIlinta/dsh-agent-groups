@@ -95,16 +95,26 @@ export interface RuntimeAgentConfig {
   readonly metadata?: Readonly<Record<string, unknown>>
 }
 
-// ── V0.5: sessions & turns ──────────────────────────────────────────────────
+// ── V0.5/V0.6: sessions & turns ─────────────────────────────────────────────
 
-/** Durable runtime-session state machine. */
+/**
+ * Durable runtime-session state machine.
+ *
+ * V0.6 alignment with the product vocabulary:
+ *  - `working`  — a turn is executing (was `running`);
+ *  - `needs_approval` — a provider approval request is pending;
+ *  - `reconnecting`  — the provider transport crashed and the SAME provider
+ *    conversation is being re-attached (never a silent fresh conversation).
+ */
 export type RuntimeSessionStatus =
   | 'starting'
   | 'idle'
-  | 'running'
+  | 'working'
   | 'waiting_input'
+  | 'needs_approval'
   | 'interrupted'
   | 'disconnected'
+  | 'reconnecting'
   | 'failed'
   | 'closed'
 
@@ -160,9 +170,25 @@ export interface RuntimeSessionInfo {
 }
 
 /**
+ * V0.6: the outcome of steering the active turn. `steered` means the provider
+ * accepted the guidance INTO the currently executing turn; `queued` means the
+ * provider could not (or must not) inject it live and it is queued as the
+ * NEXT turn on the SAME session. The Host records the distinction so the UI
+ * can show "steered" vs "queued" truthfully.
+ */
+export type SteerOutcome = { readonly steered: true } | { readonly queued: true }
+
+/**
  * One persistent provider conversation for one Group Member. Created by the
  * provider, kept alive across tasks, resumed after host restarts where the
  * provider supports it.
+ *
+ * V0.6: the turn lifecycle is explicit and never conflated:
+ *  - `startTaskTurn`  — START a new turn (task or followup); throws while busy;
+ *  - `steerActiveTurn` — steering/correction INTO the currently active turn;
+ *  - `queueTaskTurn`  — a NEW task turn queued for after the active turn;
+ *  - `queueFollowup`  — next-turn guidance queued for after the active turn.
+ * A turn's task binding is set at start and NEVER rebinds.
  */
 export interface RuntimeSession {
   /** Durable member id (GroupMember.sessionId). */
@@ -174,15 +200,29 @@ export interface RuntimeSession {
 
   /** Start (or reconnect) the provider conversation. */
   start(): Promise<void>
-  /** Start a new turn on this session. */
-  runTurn(input: RuntimeTurnInput): Promise<RuntimeTurnHandle>
   /**
-   * Conversational follow-up: continue the CURRENT running turn where the
-   * provider supports steering (Codex `turn/steer`), or queue as the next
-   * turn. Implementations decide; the caller never creates a new agent for a
-   * follow-up.
+   * Start a new turn on this session. THROWS while another turn is active —
+   * a busy member must be steered or queued, never double-run. The returned
+   * handle's `taskId` is the turn's immutable task binding.
    */
-  sendFollowup?(input: RuntimeTurnInput): Promise<void>
+  startTaskTurn(input: RuntimeTurnInput): Promise<RuntimeTurnHandle>
+  /**
+   * Steering for the CURRENTLY ACTIVE turn. Providers that cannot steer a
+   * live query return `{ queued: true }` (the guidance becomes the next turn
+   * on the SAME session) instead of pretending injection. A typed failure is
+   * thrown — never silently dropped.
+   */
+  steerActiveTurn?(input: RuntimeTurnInput): Promise<SteerOutcome>
+  /**
+   * Queue a NEW TASK as a future turn on this session (executed after the
+   * active turn reaches a terminal state). Never rebinds the active turn.
+   */
+  queueTaskTurn?(input: RuntimeTurnInput): Promise<void>
+  /**
+   * Queue next-turn guidance (a correction that could not steer live) on this
+   * session. Never rebinds the active turn.
+   */
+  queueFollowup?(input: RuntimeTurnInput): Promise<void>
   /** Interrupt the running turn. */
   interrupt(reason?: string): Promise<void>
   /** Answer a pending provider request (approval / input / permission). */

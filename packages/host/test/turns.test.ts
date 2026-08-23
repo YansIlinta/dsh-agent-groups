@@ -103,14 +103,14 @@ class FakeThreadSession implements RuntimeSession {
     this.emit({ type: 'session.ready', memberId: this.memberId, timestamp: Date.now(), providerSessionId: this.providerSessionId, providerThreadId: this.providerThreadId })
   }
 
-  async runTurn(input: RuntimeTurnInput): Promise<RuntimeTurnHandle> {
+  async startTaskTurn(input: RuntimeTurnInput): Promise<RuntimeTurnHandle> {
     await this.start()
     if (this.active !== undefined) throw new Error('busy')
     const turnId = `turn-${++this.provider.turnCounter}`
     let settle!: (result: RuntimeTurnResult) => void
     const completion = new Promise<RuntimeTurnResult>((resolve) => { settle = resolve })
     this.active = { turnId, taskId: input.taskId, settle, text: input.text }
-    this.status = 'running'
+    this.status = 'working'
     this.provider.startedTurns.push({ memberId: this.memberId, turnId, taskId: input.taskId, threadId: this.providerThreadId, text: input.text })
     this.emit({ type: 'turn.started', turnId, taskId: input.taskId, memberId: this.memberId, timestamp: Date.now() })
     return {
@@ -121,12 +121,72 @@ class FakeThreadSession implements RuntimeSession {
     }
   }
 
-  async sendFollowup(input: RuntimeTurnInput): Promise<void> {
-    if (this.active !== undefined) {
-      this.provider.followups.push({ memberId: this.memberId, text: input.text, turnId: this.active.turnId })
-      return
+  /**
+   * V0.6: steering semantics on the fake — records the steer, or (with
+   * `provider.steerThrows`) fails with a typed error after emitting
+   * `turn.queued`; or (with `provider.queueSteers`) reports `{queued}` like a
+   * provider that cannot steer a live query.
+   */
+  async steerActiveTurn(input: RuntimeTurnInput): Promise<{ steered: true } | { queued: true }> {
+    const active = this.active
+    if (this.provider.steerThrows && active !== undefined) {
+      this.provider.steers.push({ memberId: this.memberId, turnId: active.turnId, text: input.text })
+      this.emit({
+        type: 'turn.queued',
+        memberId: this.memberId,
+        timestamp: Date.now(),
+        kind: 'followup',
+        text: input.text,
+        taskId: input.taskId,
+        behindTurnId: active.turnId,
+      })
+      throw new Error('TURN_STEER_FAILED: fake steer rejected')
     }
-    await this.runTurn({ ...input, turnKind: 'followup' })
+    if (active !== undefined) {
+      if (this.provider.queueSteers) {
+        this.emit({
+          type: 'turn.queued',
+          memberId: this.memberId,
+          timestamp: Date.now(),
+          kind: 'followup',
+          text: input.text,
+          taskId: input.taskId,
+          behindTurnId: active.turnId,
+        })
+        return { queued: true }
+      }
+      this.provider.steers.push({ memberId: this.memberId, turnId: active.turnId, text: input.text })
+      this.emit({ type: 'turn.steered', turnId: active.turnId, taskId: active.taskId, memberId: this.memberId, timestamp: Date.now() })
+      return { steered: true }
+    }
+    await this.startTaskTurn({ ...input, turnKind: 'followup' })
+    return { steered: true }
+  }
+
+  /** V0.6: queue a NEW TASK as a future turn (host-driven drain). */
+  async queueTaskTurn(input: RuntimeTurnInput): Promise<void> {
+    this.emit({
+      type: 'turn.queued',
+      memberId: this.memberId,
+      timestamp: Date.now(),
+      kind: 'task',
+      text: input.text,
+      taskId: input.taskId,
+      behindTurnId: this.active?.turnId,
+    })
+  }
+
+  /** V0.6: queue next-turn guidance on the same session. */
+  async queueFollowup(input: RuntimeTurnInput): Promise<void> {
+    this.emit({
+      type: 'turn.queued',
+      memberId: this.memberId,
+      timestamp: Date.now(),
+      kind: 'followup',
+      text: input.text,
+      taskId: input.taskId,
+      behindTurnId: this.active?.turnId,
+    })
   }
 
   async interrupt(reason?: string): Promise<void> {
@@ -143,7 +203,7 @@ class FakeThreadSession implements RuntimeSession {
     if (request === undefined) return false
     this.provider.answers.push({ memberId: this.memberId, requestId, action, payload })
     this.pendingRequests.delete(requestId)
-    this.status = 'running'
+    this.status = 'working'
     return true
   }
 
@@ -196,11 +256,12 @@ class FakeThreadSession implements RuntimeSession {
     this.emit({ type: 'turn.completed', turnId, taskId, memberId: this.memberId, timestamp: Date.now(), result: { status: 'completed', summary } })
   }
 
-  requestApproval(requestId: string, description: string): void {
+  requestApproval(requestId: string, description: string, options: { deadline?: number } = {}): void {
     const request: RuntimePendingRequest = {
       requestId, requestKind: 'approval', memberId: this.memberId,
       turnId: this.active?.turnId, taskId: this.active?.taskId,
       description, params: {}, timestamp: Date.now(), defaultAction: 'decline', allowedActions: ['accept', 'decline'],
+      deadline: options.deadline, timeoutAction: 'decline',
     }
     this.pendingRequests.set(requestId, request)
     this.emit({ type: 'turn.approval.required', turnId: request.turnId, memberId: this.memberId, timestamp: Date.now(), request })
@@ -216,6 +277,37 @@ class FakeThreadSession implements RuntimeSession {
     this.status = 'waiting_input'
     this.emit({ type: 'turn.input.required', turnId: request.turnId, memberId: this.memberId, timestamp: Date.now(), request })
   }
+
+  /** V0.6: emit a request timeout (as the provider does after its deadline). */
+  emitRequestTimeout(requestId: string, action: string, delivered = true): void {
+    const request = this.pendingRequests.get(requestId)
+    this.pendingRequests.delete(requestId)
+    this.status = 'working'
+    this.emit({
+      type: 'request.timeout',
+      memberId: this.memberId,
+      timestamp: Date.now(),
+      requestId,
+      requestKind: request?.requestKind ?? 'approval',
+      turnId: request?.turnId,
+      taskId: request?.taskId,
+      action,
+      delivered,
+    })
+  }
+
+  /** V0.6: a provider-initiated turn (the Host did not start it). */
+  startUnmanagedTurn(taskId: string | undefined, text: string): void {
+    if (this.active !== undefined) throw new Error('busy')
+    const turnId = `turn-${++this.provider.turnCounter}`
+    let settle!: (result: RuntimeTurnResult) => void
+    const completion = new Promise<RuntimeTurnResult>((resolve) => { settle = resolve })
+    this.active = { turnId, taskId, settle, text }
+    this.status = 'working'
+    this.provider.startedTurns.push({ memberId: this.memberId, turnId, taskId, threadId: this.providerThreadId, text })
+    this.emit({ type: 'turn.started', turnId, taskId, memberId: this.memberId, timestamp: Date.now() })
+    void completion
+  }
 }
 
 class FakeThreadProvider implements AgentRuntimeProvider {
@@ -223,11 +315,16 @@ class FakeThreadProvider implements AgentRuntimeProvider {
   readonly name = 'Fake Thread Runtime'
   readonly sessions = new Map<string, FakeThreadSession>()
   readonly startedTurns: Array<{ memberId: string; turnId: string; taskId?: string; threadId?: string; text: string }> = []
-  readonly followups: Array<{ memberId: string; turnId: string; text: string }> = []
+  /** V0.6: accepted steers into the ACTIVE turn. */
+  readonly steers: Array<{ memberId: string; turnId: string; text: string }> = []
   readonly answers: Array<{ memberId: string; requestId: string; action: string; payload?: unknown }> = []
   readonly resumedThreads: Array<{ memberId: string; threadId?: string }> = []
   turnCounter = 0
   resumeThrows = false
+  /** V0.6: steerActiveTurn throws after recording a queued follow-up. */
+  steerThrows = false
+  /** V0.6: steerActiveTurn reports {queued} (provider cannot steer live). */
+  queueSteers = false
   available = true
 
   isAvailable(): boolean { return this.available }
@@ -334,19 +431,20 @@ describe('V0.5: persistent sessions & turn-based task completion', () => {
     expect(types.filter((t) => t === 'runtime_turn_completed').length).toBe(2)
   })
 
-  it('Leader follow-up reaches the SAME session/turn (never a new agent)', async () => {
+  it('Leader follow-up steers the SAME running turn (never a new agent)', async () => {
     const stores = makeStores()
     const provider = new FakeThreadProvider()
     const host = makeTurnHost(stores, provider)
     const { groupId, memberId } = await seedTeam(host)
     const { taskId } = await assign(host, groupId, memberId, 'build it')
     await sleep(5)
-    // leader private message while the turn is RUNNING
+    // leader private message while the turn is RUNNING → steering, same turn
     await host.messageMember('lead-1', { memberSessionId: memberId, text: 'the verifier found a race in refreshToken() — fix only that' })
     await sleep(5)
-    expect(provider.followups).toHaveLength(1)
-    expect(provider.followups[0]!.turnId).toBe(provider.startedTurns[0]!.turnId)
-    expect(provider.followups[0]!.text).toContain('race in refreshToken')
+    expect(provider.steers).toHaveLength(1)
+    expect(provider.steers[0]!.turnId).toBe(provider.startedTurns[0]!.turnId)
+    expect(provider.steers[0]!.text).toContain('race in refreshToken')
+    expect(host.activity.list(groupId).some((a) => a.type === 'runtime_turn_steered')).toBe(true)
     // no brand-new agent/session was created
     expect(provider.sessions.size).toBe(1)
     provider.sessionOf(memberId)!.completeActiveTurn('race fixed')
@@ -398,7 +496,7 @@ describe('V0.5: persistent sessions & turn-based task completion', () => {
     expect(host.tasks.listTasks(groupId).find((t) => t.taskId === taskB.taskId)!.status).toBe('review')
   })
 
-  it('session crash → turn failed + member disconnected (NEVER a task success)', async () => {
+  it('session crash → turn failed + member DISCONNECTED (not a lifecycle failure)', async () => {
     const stores = makeStores()
     const provider = new FakeThreadProvider()
     const host = makeTurnHost(stores, provider)
@@ -410,10 +508,21 @@ describe('V0.5: persistent sessions & turn-based task completion', () => {
     const task = host.tasks.listTasks(groupId).find((t) => t.taskId === taskA.taskId)!
     expect(task.result).toBeUndefined()
     expect(task.status).toBe('failed')
+    // V0.6: a transport crash is NOT a member lifecycle failure — the member
+    // keeps its durable identity; the runtime is marked disconnected and the
+    // SAME provider conversation is re-attached on the next dispatch.
     const member = host.groups.listMembers(groupId, () => undefined).find((m) => m.sessionId === memberId)!
-    expect(member.status).toBe('failed')
+    expect(member.status).not.toBe('failed')
+    expect(host.snapshot(groupId, { dshVersion: 'test', checks: [], fatal: [] }).members.find((m) => m.sessionId === memberId)!.runtimeState).toBe('disconnected')
     expect(host.activity.list(groupId).some((a) => a.type === 'runtime_session_disconnected')).toBe(true)
     expect(host.activity.list(groupId).some((a) => a.type === 'runtime_turn_failed')).toBe(true)
+    // the same member + SAME thread resumes on the next dispatch (no fresh thread)
+    const taskB = await assign(host, groupId, memberId, 'retry after crash')
+    await sleep(5)
+    expect(provider.startedTurns[1]?.threadId).toBe(provider.startedTurns[0]?.threadId)
+    provider.sessionOf(memberId)!.completeActiveTurn('retry done')
+    await sleep(10)
+    expect(host.tasks.listTasks(groupId).find((t) => t.taskId === taskB.taskId)!.status).toBe('review')
   })
 
   it('a late event from old turn A never completes turn B', async () => {
@@ -545,23 +654,180 @@ describe('V0.5: persistent sessions & turn-based task completion', () => {
     expect(host.tasks.listTasks(groupId).find((t) => t.taskId === taskId)!.status).toBe('review')
   })
 
-  it('turn assignment while another task is running = correction on the SAME turn', async () => {
+  it('V0.6: Task B assigned while Task A runs is a QUEUED future turn — the active turn is NEVER retargeted', async () => {
     const stores = makeStores()
     const provider = new FakeThreadProvider()
     const host = makeTurnHost(stores, provider)
     const { groupId, memberId } = await seedTeam(host)
     const taskA = await assign(host, groupId, memberId, 'task a')
     await sleep(5)
-    // task B lands while turn A is still running → follow-up on the same turn
-    const taskB = await assign(host, groupId, memberId, 'task b (correction)')
+    // task B lands while turn A is still running → QUEUED, not merged into A
+    const taskB = await assign(host, groupId, memberId, 'task b')
     await sleep(5)
-    expect(provider.followups).toHaveLength(1)
-    expect(provider.startedTurns).toHaveLength(1)
+    expect(provider.startedTurns).toHaveLength(1) // B did NOT start a turn
+    expect(provider.steers).toHaveLength(0) // B is a task, not a correction
+    // the Host's authoritative queue sees the future turn
+    const snap = host.snapshot(groupId, { dshVersion: 'test', checks: [], fatal: [] })
+    const memberView = snap.members.find((m) => m.sessionId === memberId)!
+    expect(memberView.runtimeQueuedTurns).toHaveLength(1)
+    expect(memberView.runtimeQueuedTurns![0]!.kind).toBe('task')
+    expect(memberView.runtimeQueuedTurns![0]!.taskId).toBe(taskB.taskId)
+    expect(host.activity.list(groupId).some((a) => a.type === 'runtime_turn_queued')).toBe(true)
+
+    // turn A completes → task A settles with A's claim, THEN B starts on the
+    // SAME session and settles only B.
+    provider.sessionOf(memberId)!.completeActiveTurn('a done')
+    await sleep(15)
+    const taskAAfter = host.tasks.listTasks(groupId).find((t) => t.taskId === taskA.taskId)!
+    expect(taskAAfter.result?.summary).toBe('a done')
+    expect(taskAAfter.status).toBe('review')
+    // B's turn started AFTER A reached terminal state, same thread
+    expect(provider.startedTurns).toHaveLength(2)
+    expect(provider.startedTurns[1]!.taskId).toBe(taskB.taskId)
+    expect(provider.startedTurns[1]!.threadId).toBe(provider.startedTurns[0]!.threadId)
+    expect(provider.sessions.size).toBe(1)
+    // the queue is drained now
+    expect(host.snapshot(groupId, { dshVersion: 'test', checks: [], fatal: [] }).members.find((m) => m.sessionId === memberId)!.runtimeQueuedTurns).toBeUndefined()
     provider.sessionOf(memberId)!.completeActiveTurn('b done')
     await sleep(10)
-    // the claim lands on the member's CURRENT task (B) — turn-safe correlation
+    const taskBAfter = host.tasks.listTasks(groupId).find((t) => t.taskId === taskB.taskId)!
+    expect(taskBAfter.status).toBe('review')
+    expect(taskBAfter.result?.summary).toBe('b done')
+    // task A was never completed by turn B
+    expect(host.tasks.listTasks(groupId).find((t) => t.taskId === taskA.taskId)!.result?.summary).toBe('a done')
+  })
+
+  it('V0.6: a provider that cannot steer live queues the correction and runs it as the NEXT turn on the same session', async () => {
+    const stores = makeStores()
+    const provider = new FakeThreadProvider()
+    provider.queueSteers = true // Claude-like limitation
+    const host = makeTurnHost(stores, provider)
+    const { groupId, memberId } = await seedTeam(host)
+    const { taskId } = await assign(host, groupId, memberId, 'build it')
+    await sleep(5)
+    await host.messageMember('lead-1', { memberSessionId: memberId, text: 'queued correction: use the v2 API' })
+    await sleep(5)
+    expect(provider.steers).toHaveLength(0)
+    // the correction is visible as QUEUED (never pretended to be steered)
+    const snap = host.snapshot(groupId, { dshVersion: 'test', checks: [], fatal: [] })
+    const queued = snap.members.find((m) => m.sessionId === memberId)!.runtimeQueuedTurns!
+    expect(queued).toHaveLength(1)
+    expect(queued[0]!.kind).toBe('followup')
+    expect(queued[0]!.text).toContain('v2 API')
+    // after the task turn completes, the correction runs as the next turn
+    provider.sessionOf(memberId)!.completeActiveTurn('done')
+    await sleep(15)
+    expect(provider.startedTurns).toHaveLength(2)
+    expect(provider.startedTurns[1]!.text).toContain('v2 API')
+    expect(provider.startedTurns[1]!.taskId).toBeUndefined() // correction, no task binding
+    provider.sessionOf(memberId)!.completeActiveTurn('corrected')
+    await sleep(10)
+    expect(host.tasks.listTasks(groupId).find((t) => t.taskId === taskId)!.result?.summary).toBe('done')
+  })
+
+  it('V0.6: a failed steer can NEVER silently lose the correction (typed failure + reliable queueing)', async () => {
+    const stores = makeStores()
+    const provider = new FakeThreadProvider()
+    provider.steerThrows = true // Codex turn/steer failure
+    const host = makeTurnHost(stores, provider)
+    const { groupId, memberId } = await seedTeam(host)
+    const { taskId } = await assign(host, groupId, memberId, 'build it')
+    await sleep(5)
+    // the Leader's delivery must NOT pretend the steer was injected
+    await host.messageMember('lead-1', { memberSessionId: memberId, text: 'must not be lost: fix the race' })
+    await sleep(5)
+    expect(host.activity.list(groupId).some((a) => a.type === 'runtime_steer_failed')).toBe(true)
+    // the correction was queued, not dropped
+    const queued = host.snapshot(groupId, { dshVersion: 'test', checks: [], fatal: [] }).members.find((m) => m.sessionId === memberId)!.runtimeQueuedTurns!
+    expect(queued).toHaveLength(1)
+    expect(queued[0]!.kind).toBe('followup')
+    expect(queued[0]!.text).toContain('fix the race')
+    // it executes as the NEXT turn on the SAME session
+    provider.sessionOf(memberId)!.completeActiveTurn('done')
+    await sleep(15)
+    expect(provider.startedTurns[1]!.text).toContain('fix the race')
+    provider.sessionOf(memberId)!.completeActiveTurn('race fixed')
+    await sleep(10)
+    expect(host.tasks.listTasks(groupId).find((t) => t.taskId === taskId)!.status).toBe('review')
+  })
+
+  it('V0.6: interrupt returns the task to a defined retryable state and drains the queue', async () => {
+    const stores = makeStores()
+    const provider = new FakeThreadProvider()
+    const host = makeTurnHost(stores, provider)
+    const { groupId, memberId } = await seedTeam(host)
+    const taskA = await assign(host, groupId, memberId, 'long task')
+    await sleep(5)
+    const taskB = await assign(host, groupId, memberId, 'queued behind A')
+    await sleep(5)
+    await host.interruptMember('lead-1', { memberSessionId: memberId, reason: 'stop now' })
+    await sleep(15)
+    // cancellation policy: the interrupted task is retryable (pending), NOT
+    // success and NOT failure; the member stops carrying it
+    const taskAAfter = host.tasks.listTasks(groupId).find((t) => t.taskId === taskA.taskId)!
+    expect(taskAAfter.status).toBe('pending')
+    expect(taskAAfter.result).toBeUndefined()
+    const memberAfter = host.groups.listMembers(groupId, () => undefined).find((m) => m.sessionId === memberId)!
+    expect(memberAfter.currentTaskId).toBeUndefined()
+    expect(host.activity.list(groupId).some((a) => a.type === 'runtime_turn_cancelled')).toBe(true)
+    expect(host.activity.list(groupId).some((a) => a.type === 'task_reopened')).toBe(true)
+    // the queued task B starts after the interrupt (deterministic continuation)
+    expect(provider.startedTurns).toHaveLength(2)
+    expect(provider.startedTurns[1]!.taskId).toBe(taskB.taskId)
+    provider.sessionOf(memberId)!.completeActiveTurn('b after interrupt')
+    await sleep(10)
     expect(host.tasks.listTasks(groupId).find((t) => t.taskId === taskB.taskId)!.status).toBe('review')
-    expect(host.tasks.listTasks(groupId).find((t) => t.taskId === taskA.taskId)!.result).toBeUndefined()
+  })
+
+  it('V0.6: an approval request timeout produces an explicit event and a safe action', async () => {
+    const stores = makeStores()
+    const provider = new FakeThreadProvider()
+    const host = makeTurnHost(stores, provider)
+    const { groupId, memberId } = await seedTeam(host)
+    const { taskId } = await assign(host, groupId, memberId, 'work')
+    await sleep(5)
+    const session = provider.sessionOf(memberId)!
+    session.requestApproval('req-1', 'run: rm -rf /tmp/x', { deadline: Date.now() + 10 })
+    await sleep(5)
+    expect(host.snapshot(groupId, { dshVersion: 'test', checks: [], fatal: [] }).runtimeRequests).toHaveLength(1)
+    // the provider executes its safe default and emits the timeout
+    session.emitRequestTimeout('req-1', 'decline')
+    await sleep(5)
+    expect(host.snapshot(groupId, { dshVersion: 'test', checks: [], fatal: [] }).runtimeRequests).toHaveLength(0)
+    expect(host.activity.list(groupId).some((a) => a.type === 'runtime_request_timed_out')).toBe(true)
+    expect(host.activity.list(groupId).find((a) => a.type === 'runtime_request_timed_out')!.payload).toMatchObject({ requestId: 'req-1', action: 'decline' })
+    // the member resumes working afterwards
+    session.completeActiveTurn('done')
+    await sleep(10)
+    expect(host.tasks.listTasks(groupId).find((t) => t.taskId === taskId)!.status).toBe('review')
+  })
+
+  it('V0.6: a provider-initiated turn is adopted into the Host active-turn state', async () => {
+    const stores = makeStores()
+    const provider = new FakeThreadProvider()
+    const host = makeTurnHost(stores, provider)
+    const { groupId, memberId } = await seedTeam(host)
+    // the provider starts a turn the Host did not start (e.g. a drained queue)
+    provider.sessionOf(memberId)!.startUnmanagedTurn('task-x', 'provider-driven work')
+    await sleep(5)
+    const snap = host.snapshot(groupId, { dshVersion: 'test', checks: [], fatal: [] })
+    const view = snap.members.find((m) => m.sessionId === memberId)!
+    expect(view.runtimeState).toBe('working')
+    expect(view.currentTurnId).toBeDefined()
+    // the Host treats it as the active turn and blocks a new concurrent turn
+    await host.createTask('lead-1', { subject: 'y', description: 'y', kind: 'implementation', acceptanceCriteria: ['y'] })
+    const taskY = host.tasks.listTasks(groupId).find((t) => t.subject === 'y')!
+    await host.assignTask('lead-1', { taskId: taskY.taskId, ownerId: memberId })
+    await sleep(5)
+    expect(provider.startedTurns).toHaveLength(1) // no concurrent turn
+    expect(host.snapshot(groupId, { dshVersion: 'test', checks: [], fatal: [] }).members.find((m) => m.sessionId === memberId)!.runtimeQueuedTurns).toHaveLength(1)
+    provider.sessionOf(memberId)!.completeActiveTurn('provider work done')
+    await sleep(15)
+    // the queued task then runs and completes normally
+    expect(provider.startedTurns[1]!.taskId).toBe(taskY.taskId)
+    provider.sessionOf(memberId)!.completeActiveTurn('y done')
+    await sleep(10)
+    expect(host.tasks.listTasks(groupId).find((t) => t.taskId === taskY.taskId)!.status).toBe('review')
   })
 })
 

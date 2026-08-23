@@ -19,7 +19,7 @@
 import { textContent } from '../group-host.js'
 import { groupMessageSource } from '../message-source.js'
 import type { AgentRuntimeAdapter, MemberCreateSpec } from '../dsh-adapter.js'
-import { DEFAULT_REASONING_LEVELS, type AgentRuntimeProvider, type ModelDescriptor, type RuntimeAgentConfig, type RuntimeAgentHandle, type RuntimeCapabilities, type RuntimeSession, type RuntimeSessionInfo, type RuntimeSessionStatus, type RuntimeTurnHandle, type RuntimeTurnInput, type RuntimeTurnResult } from './base.js'
+import { DEFAULT_REASONING_LEVELS, type AgentRuntimeProvider, type ModelDescriptor, type RuntimeAgentConfig, type RuntimeAgentHandle, type RuntimeCapabilities, type RuntimeSession, type RuntimeSessionInfo, type RuntimeSessionStatus, type RuntimeTurnHandle, type RuntimeTurnInput, type RuntimeTurnResult, type SteerOutcome } from './base.js'
 import { runtimeMessageText, type RuntimeMessage } from './message.js'
 import type { RuntimeEvent, RuntimePendingRequest } from './events.js'
 
@@ -206,13 +206,13 @@ class DshMemberSession implements RuntimeSession {
     })
   }
 
-  async runTurn(input: RuntimeTurnInput): Promise<RuntimeTurnHandle> {
+  async startTaskTurn(input: RuntimeTurnInput): Promise<RuntimeTurnHandle> {
     await this.start()
     if (this.closed) throw new Error('session is closed')
     const turnId = input.metadata?.turnId !== undefined ? String(input.metadata.turnId) : `dsh-turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
     this.lastTurnId = turnId
     if (input.taskId !== undefined) this.lastTaskId = input.taskId
-    this.status = 'running'
+    this.status = 'working'
     this.emit({ type: 'turn.started', turnId, taskId: input.taskId, memberId: this.memberId, timestamp: Date.now() })
 
     const text = typeof input.text === 'string' ? input.text : String(input.text)
@@ -235,8 +235,59 @@ class DshMemberSession implements RuntimeSession {
 
   private readonly turnSettles = new Map<string, (result: RuntimeTurnResult) => void>()
 
-  async sendFollowup(input: RuntimeTurnInput): Promise<void> {
-    await this.runTurn({ ...input, turnKind: 'followup' })
+  /**
+   * V0.6: native DSH steering — `agent.steer()` submits next-step guidance
+   * into the member's CURRENT work (wakes if idle). When the agent is not
+   * live the guidance is represented as a queued next turn instead.
+   */
+  async steerActiveTurn(input: RuntimeTurnInput): Promise<SteerOutcome> {
+    const text = typeof input.text === 'string' ? input.text : String(input.text)
+    const steered = this.adapter.steer(this.memberId, textContent(text), groupMessageSource(this.config.groupId, { label: 'leader steering' }))
+    if (steered) {
+      const turnId = this.lastTurnId ?? ''
+      this.emit({ type: 'turn.steered', turnId, taskId: this.lastTaskId, memberId: this.memberId, timestamp: Date.now() })
+      return { steered: true }
+    }
+    // No live agent to steer — queue as the next turn on the same session.
+    this.emit({
+      type: 'turn.queued',
+      memberId: this.memberId,
+      timestamp: Date.now(),
+      kind: 'followup',
+      text,
+      taskId: input.taskId,
+      behindTurnId: this.lastTurnId,
+    })
+    return { queued: true }
+  }
+
+  /** V0.6: queue a NEW TASK as a future turn (delivered after the current
+   * task reaches a terminal state — the member's claim, or an interrupt). */
+  async queueTaskTurn(input: RuntimeTurnInput): Promise<void> {
+    const text = typeof input.text === 'string' ? input.text : String(input.text)
+    this.emit({
+      type: 'turn.queued',
+      memberId: this.memberId,
+      timestamp: Date.now(),
+      kind: 'task',
+      text,
+      taskId: input.taskId,
+      behindTurnId: this.lastTurnId,
+    })
+  }
+
+  /** V0.6: queue next-turn guidance on the same DSH session. */
+  async queueFollowup(input: RuntimeTurnInput): Promise<void> {
+    const text = typeof input.text === 'string' ? input.text : String(input.text)
+    this.emit({
+      type: 'turn.queued',
+      memberId: this.memberId,
+      timestamp: Date.now(),
+      kind: 'followup',
+      text,
+      taskId: input.taskId,
+      behindTurnId: this.lastTurnId,
+    })
   }
 
   async interrupt(reason?: string): Promise<void> {

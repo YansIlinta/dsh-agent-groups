@@ -37,8 +37,21 @@ export type MemberRuntimeState =
   | 'needs_approval'
   | 'interrupted'
   | 'disconnected'
+  | 'reconnecting'
   | 'failed'
   | 'closed'
+
+/** V0.6: one queued future turn on a member's session (authoritative host view). */
+export interface RuntimeQueuedTurn {
+  readonly seq: number
+  readonly kind: 'task' | 'followup'
+  readonly taskId?: string
+  /** Truncated preview of the queued instruction (UI never receives full briefs twice). */
+  readonly text: string
+  readonly queuedAt: number
+  /** The turn this was queued behind (the then-active turn), when known. */
+  readonly behindTurnId?: string
+}
 
 /** Task state machine. Review/Failed are product-level, derived in product metadata. */
 export type TaskStatus =
@@ -342,6 +355,11 @@ export type ActivityType =
   | 'runtime_input_required'
   | 'runtime_approval_answered'
   | 'runtime_request_answered'
+  // V0.6: queued future turns, steering, steer failures and request timeouts
+  | 'runtime_turn_queued'
+  | 'runtime_turn_steered'
+  | 'runtime_steer_failed'
+  | 'runtime_request_timed_out'
 
 export interface ActivityEvent {
   readonly id: ActivityId
@@ -377,6 +395,8 @@ export interface GroupSnapshot {
     readonly runtimeState?: MemberRuntimeState
     /** V0.5: current active turn id (debug/advanced surface). */
     readonly currentTurnId?: string
+    /** V0.6: authoritative queue of future turns on this member's session. */
+    readonly runtimeQueuedTurns?: readonly RuntimeQueuedTurn[]
   }>
   readonly tasks: readonly GroupTask[]
   readonly channel: readonly ChannelMessage[]

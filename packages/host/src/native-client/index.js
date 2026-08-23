@@ -163,7 +163,7 @@ function statusBadge(status) {
   return React.createElement('span', { className: `ag-badge ${kind}` }, String(status))
 }
 
-/** V0.5: live runtime-session state chip (Idle/Working/Waiting…). */
+/** V0.5/V0.6: live runtime-session state chip (Idle/Working/Waiting…). */
 const RUNTIME_STATE_LABELS = {
   starting: 'Starting',
   idle: 'Idle',
@@ -172,6 +172,7 @@ const RUNTIME_STATE_LABELS = {
   needs_approval: 'Needs approval',
   interrupted: 'Interrupted',
   disconnected: 'Disconnected',
+  reconnecting: 'Reconnecting',
   failed: 'Failed',
   closed: 'Closed',
 }
@@ -179,7 +180,7 @@ const RUNTIME_STATE_LABELS = {
 function runtimeStateChip(state) {
   if (!state) return null
   const label = RUNTIME_STATE_LABELS[state] ?? String(state)
-  const kind = state === 'working' || state === 'starting' ? 'warn'
+  const kind = state === 'working' || state === 'starting' || state === 'reconnecting' ? 'warn'
     : state === 'needs_approval' || state === 'waiting_input' ? 'info'
       : state === 'disconnected' || state === 'failed' ? 'err'
         : 'ok'
@@ -463,7 +464,7 @@ function GroupDetail({ groupId, tab, onBack, onTab }) {
               )),
           ),
           tab === 'overview' && React.createElement(OverviewTab, { snap }),
-          tab === 'tasks' && React.createElement(TasksTab, { snap }),
+          tab === 'tasks' && React.createElement(TasksTab, { snap, onRefresh: () => load() }),
           tab === 'team' && React.createElement(TeamTab, { snap, onRefresh: () => load() }),
           tab === 'channel' && React.createElement(ChannelTab, { snap, onMessage: load }),
           tab === 'leader' && React.createElement(LeaderChatTab, { snap, onMessage: load }),
@@ -520,36 +521,91 @@ function OverviewTab({ snap }) {
   )
 }
 
-function TasksTab({ snap }) {
-  const { tasks, members } = snap
+function TasksTab({ snap, onRefresh }) {
+  const { tasks, members, group } = snap
   const nameOf = (id) => members.find((m) => m.sessionId === id)?.name ?? id.slice(0, 8)
-  if (tasks.length === 0) {
-    return React.createElement(EmptyLine, null, 'No tasks yet. Ask the Leader to break the mission into tasks.')
+  const [creating, setCreating] = React.useState(false)
+  const [subject, setSubject] = React.useState('')
+  const [description, setDescription] = React.useState('')
+  const [assignee, setAssignee] = React.useState('')
+  const [busy, setBusy] = React.useState(false)
+  const [error, setError] = React.useState(null)
+  const memberOptions = members.filter((m) => m.role === 'member' && m.status !== 'left')
+  const create = async () => {
+    if (busy || subject.trim() === '') return
+    setBusy(true)
+    setError(null)
+    try {
+      await api(`/groups/api/groups/${encodeURIComponent(group.groupId)}/tasks`, {
+        method: 'POST',
+        body: JSON.stringify({
+          subject: subject.trim(),
+          description: description.trim() === '' ? undefined : description.trim(),
+          ...(assignee !== '' ? { ownerId: assignee } : {}),
+        }),
+      })
+      setCreating(false)
+      setSubject('')
+      setDescription('')
+      setAssignee('')
+      onRefresh()
+    } catch (err) {
+      setError(errorOf(err))
+    } finally {
+      setBusy(false)
+    }
   }
-  return React.createElement('table', { className: 'ag-table' },
-    React.createElement('thead', null,
-      React.createElement('tr', null,
-        React.createElement('th', null, 'Title'),
-        React.createElement('th', null, 'Status'),
-        React.createElement('th', null, 'Assignee'),
-        React.createElement('th', null, 'Dependencies'),
-        React.createElement('th', null, 'Updated'),
-      )),
-    React.createElement('tbody', null,
-      tasks.slice().sort((a, b) => b.updatedAt - a.updatedAt).map((task) =>
-        React.createElement('tr', { key: task.taskId },
-          React.createElement('td', null,
-            React.createElement('div', null, task.subject),
-            React.createElement('div', { className: 'ag-note' }, task.description.slice(0, 90)),
-          ),
-          React.createElement('td', null, statusBadge(task.status)),
-          React.createElement('td', null, task.ownerId !== undefined ? nameOf(task.ownerId) : '—'),
-          React.createElement('td', null,
-            task.blockedBy.length === 0 ? '—'
-              : task.blockedBy.map((id) => nameOf(id)).join(', '),
-          ),
-          React.createElement('td', { className: 'ag-monoblock' }, fmtTime(task.updatedAt)),
+  if (tasks.length === 0 && !creating) {
+    return React.createElement('div', { className: 'ag-col' },
+      React.createElement(EmptyLine, null, 'No tasks yet. Ask the Leader to break the mission into tasks, or create one below.'),
+      React.createElement('div', { className: 'ag-toolbar' },
+        React.createElement(Button, { variant: 'outline', size: 'sm', onClick: () => setCreating(true) }, 'New Task'),
+      ),
+    )
+  }
+  return React.createElement('div', { className: 'ag-col' },
+    React.createElement('div', { className: 'ag-toolbar' },
+      React.createElement(Button, { variant: 'outline', size: 'sm', onClick: () => setCreating((v) => !v) }, creating ? 'Cancel' : 'New Task'),
+      React.createElement('span', { className: 'ag-note', style: { marginLeft: 'auto' } }, `${tasks.length} task(s)`),
+    ),
+    creating && React.createElement('div', { className: 'ag-col', style: { border: '1px solid var(--dsw-alias-border-l1)', borderRadius: 10, padding: 10, marginBottom: 10, gap: 6 } },
+      error !== null && React.createElement(ErrorLine, { message: error }),
+      React.createElement('input', { className: 'ag-input', placeholder: 'Task subject', value: subject, onChange: (e) => setSubject(e.target.value), style: { padding: 6, borderRadius: 6, border: '1px solid var(--dsw-alias-border-l1)', background: 'var(--dsw-alias-bg-layer-2)', color: 'var(--dsw-alias-label-primary)' } }),
+      React.createElement('textarea', { className: 'ag-input', rows: 2, placeholder: 'Description (optional)', value: description, onChange: (e) => setDescription(e.target.value), style: { padding: 6, borderRadius: 6, border: '1px solid var(--dsw-alias-border-l1)', background: 'var(--dsw-alias-bg-layer-2)', color: 'var(--dsw-alias-label-primary)', fontFamily: 'inherit' } }),
+      React.createElement('div', { className: 'ag-toolbar' },
+        React.createElement('select', { className: 'ag-input', value: assignee, onChange: (e) => setAssignee(e.target.value), style: { padding: 6, borderRadius: 6, border: '1px solid var(--dsw-alias-border-l1)', background: 'var(--dsw-alias-bg-layer-2)', color: 'var(--dsw-alias-label-primary)' } },
+          React.createElement('option', { value: '' }, '— assign later —'),
+          memberOptions.map((m) => React.createElement('option', { key: m.sessionId, value: m.sessionId }, m.name)),
+        ),
+        React.createElement(Button, { variant: 'primary', size: 'sm', disabled: busy || subject.trim() === '', onClick: () => void create() }, busy ? 'Creating…' : 'Create'),
+      ),
+      React.createElement('div', { className: 'ag-note' }, 'Assigning to a busy member queues the task as a future turn on that member’s session.'),
+    ),
+    React.createElement('table', { className: 'ag-table' },
+      React.createElement('thead', null,
+        React.createElement('tr', null,
+          React.createElement('th', null, 'Title'),
+          React.createElement('th', null, 'Status'),
+          React.createElement('th', null, 'Assignee'),
+          React.createElement('th', null, 'Dependencies'),
+          React.createElement('th', null, 'Updated'),
         )),
+      React.createElement('tbody', null,
+        tasks.slice().sort((a, b) => b.updatedAt - a.updatedAt).map((task) =>
+          React.createElement('tr', { key: task.taskId },
+            React.createElement('td', null,
+              React.createElement('div', null, task.subject),
+              React.createElement('div', { className: 'ag-note' }, task.description.slice(0, 90)),
+            ),
+            React.createElement('td', null, statusBadge(task.status)),
+            React.createElement('td', null, task.ownerId !== undefined ? nameOf(task.ownerId) : '—'),
+            React.createElement('td', null,
+              task.blockedBy.length === 0 ? '—'
+                : task.blockedBy.map((id) => nameOf(id)).join(', '),
+            ),
+            React.createElement('td', { className: 'ag-monoblock' }, fmtTime(task.updatedAt)),
+          )),
+      ),
     ),
   )
 }
@@ -569,6 +625,32 @@ function TeamTab({ snap, onRefresh }) {
       method: 'POST',
       body: JSON.stringify({ requestId: request.requestId, action, payload: action === 'answer' ? prompt(`${request.description}\n\nAnswer:`) ?? '' : undefined }),
     }).then(onRefresh).catch((err) => { window.alert(errorOf(err)) }).finally(() => setResponding(null))
+  }
+  /** V0.6: user actions — correction into current work, or interrupt. */
+  const sendCorrection = (member) => {
+    const text = window.prompt(`Send a correction about ${member.name}'s current work`)
+    if (text === null || text.trim() === '') return
+    api(`/groups/api/groups/${encodeURIComponent(group.groupId)}/members/${encodeURIComponent(member.sessionId)}/correction`, {
+      method: 'POST', body: JSON.stringify({ text: text.trim() }),
+    }).then(onRefresh).catch((err) => { window.alert(errorOf(err)) })
+  }
+  const interrupt = (member) => {
+    const reason = window.prompt(`Interrupt ${member.name}'s current turn`, 'leader interrupt')
+    if (reason === null) return
+    api(`/groups/api/groups/${encodeURIComponent(group.groupId)}/members/${encodeURIComponent(member.sessionId)}/interrupt`, {
+      method: 'POST', body: JSON.stringify({ reason: reason.trim() === '' ? 'interrupted from the Agent Groups page' : reason.trim() }),
+    }).then(onRefresh).catch((err) => { window.alert(errorOf(err)) })
+  }
+  /** V0.6: queued future turns (tasks + corrections) on the member's session. */
+  const queuedChip = (member) => {
+    const queued = member.runtimeQueuedTurns ?? []
+    if (queued.length === 0) return null
+    const tasksN = queued.filter((q) => q.kind === 'task').length
+    const followsN = queued.filter((q) => q.kind === 'followup').length
+    const label = tasksN > 0 && followsN > 0
+      ? `queued: ${tasksN} task(s), ${followsN} correction(s)`
+      : tasksN > 0 ? `queued: ${tasksN} task(s)` : `queued: ${followsN} correction(s)`
+    return React.createElement('span', { className: 'ag-badge ag-badge-rt info', title: queued.map((q) => `${q.kind === 'task' ? 'task' : 'correction'}${q.taskId !== undefined ? ` (${q.taskId.slice(0, 8)})` : ''} — ${q.text.slice(0, 120)}`).join('\n') }, label)
   }
   return React.createElement('div', { className: 'ag-col' },
     requests.length > 0 && React.createElement('div', { className: 'ag-requests' },
@@ -622,6 +704,8 @@ function TeamTab({ snap, onRefresh }) {
                 statusBadge(member.liveStatus ?? member.status),
                 ' ',
                 runtimeStateChip(member.runtimeState),
+                ' ',
+                queuedChip(member),
               ),
               React.createElement('td', { className: 'ag-note' },
                 member.currentTaskId !== undefined ? taskTitle(member.currentTaskId) : member.role === 'leader' ? 'orchestrating' : 'idle',
@@ -639,6 +723,20 @@ function TeamTab({ snap, onRefresh }) {
                     kv('Model', member.model ?? '—'),
                     kv('Reasoning', member.reasoningLevel ?? '—'),
                     member.runtimeSession !== undefined && kv('Last activity', fmtTime(member.runtimeSession.updatedAt)),
+                  ),
+                  (member.runtimeQueuedTurns ?? []).length > 0 && React.createElement('div', { className: 'ag-col', style: { marginTop: 8, gap: 4 } },
+                    React.createElement('span', { className: 'ag-note', style: { fontWeight: 600 } }, 'Queued future turns (same session, start after the current turn ends)'),
+                    (member.runtimeQueuedTurns ?? []).map((q) =>
+                      React.createElement('div', { key: q.seq, className: 'ag-note', style: { display: 'flex', gap: 6, alignItems: 'baseline' } },
+                        React.createElement('span', { className: q.kind === 'task' ? 'ag-badge warn' : 'ag-badge info' }, q.kind === 'task' ? 'task' : 'correction'),
+                        React.createElement('span', null, q.text.slice(0, 140)),
+                        React.createElement('span', { className: 'ag-monoblock' }, q.taskId !== undefined ? q.taskId.slice(0, 8) : ''),
+                      ),
+                    ),
+                  ),
+                  member.role === 'member' && React.createElement('div', { className: 'ag-toolbar', style: { marginTop: 10 } },
+                    React.createElement(Button, { variant: 'outline', size: 'sm', icon: React.createElement(primitives.IconEditOutline16, {}), onClick: () => sendCorrection(member) }, 'Send correction'),
+                    React.createElement(Button, { variant: 'outline', size: 'sm', className: 'ag-danger', onClick: () => interrupt(member) }, 'Interrupt turn'),
                   ),
                   member.runtimeSession !== undefined && React.createElement('div', { className: 'ag-note', style: { marginTop: 8 } },
                     'Advanced (debug): ',

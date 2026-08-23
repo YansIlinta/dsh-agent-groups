@@ -8,7 +8,7 @@
  * sessions.
  */
 import { describe, expect, it, vi } from 'vitest'
-import { ClaudeRuntimeProvider } from '../src/runtime/claude.js'
+import { ClaudeRuntimeProvider, CLAUDE_FALLBACK_MODELS } from '../src/runtime/claude.js'
 import type { ClaudeQueryFactory, ClaudeQueryLike, ClaudeQueryParams } from '../src/runtime/claude.js'
 import type { SDKMessage } from '@anthropic-ai/claude-agent-sdk'
 import type { RuntimeEvent } from '../src/runtime/events.js'
@@ -78,14 +78,14 @@ describe('claude runtime provider (agent SDK)', () => {
     const session = await provider.createSession(BASE_CONFIG)
     const events = collectEvents(session)
 
-    const turn1 = await session.runTurn({ taskId: 'task-a', text: 'implement auth' })
+    const turn1 = await session.startTaskTurn({ taskId: 'task-a', text: 'implement auth' })
     const r1 = await turn1.waitForCompletion()
     expect(r1.status).toBe('completed')
     expect(r1.summary).toContain('task a done')
     expect(r1.output).toContain('step one done')
 
     // turn 2: the SAME provider session, now resumed
-    const turn2 = await session.runTurn({ taskId: 'task-b', text: 'reviewer pass' })
+    const turn2 = await session.startTaskTurn({ taskId: 'task-b', text: 'reviewer pass' })
     const r2 = await turn2.waitForCompletion()
     expect(r2.status).toBe('completed')
 
@@ -101,9 +101,9 @@ describe('claude runtime provider (agent SDK)', () => {
     const { factory, calls } = recordingFactory((_params) => fakeQuery([assistant('ok'), result('success', 'done')]))
     const provider = new ClaudeRuntimeProvider({ binPath: '/fake/claude', queryFactory: factory })
     const session = await provider.createSession(BASE_CONFIG)
-    const first = await session.runTurn({ taskId: 't1', text: 'a' })
+    const first = await session.startTaskTurn({ taskId: 't1', text: 'a' })
     await first.waitForCompletion()
-    const second = await session.runTurn({ taskId: 't2', text: 'b' })
+    const second = await session.startTaskTurn({ taskId: 't2', text: 'b' })
     await second.waitForCompletion()
     for (const call of calls) {
       expect(call.options.cwd).toBe('/ws')
@@ -133,7 +133,7 @@ describe('claude runtime provider (agent SDK)', () => {
     })
     for (const level of ['low', 'medium', 'high'] as const) {
       const session = await provider.createSession({ ...BASE_CONFIG, reasoningLevel: level })
-      const turn = await session.runTurn({ taskId: 't', text: 'go' })
+      const turn = await session.startTaskTurn({ taskId: 't', text: 'go' })
       await turn.waitForCompletion()
       await session.close(50)
     }
@@ -173,7 +173,7 @@ describe('claude runtime provider (agent SDK)', () => {
       },
     })
     const session = await provider.createSession(BASE_CONFIG)
-    const turn = await session.runTurn({ taskId: 'task-a', text: 'long' })
+    const turn = await session.startTaskTurn({ taskId: 'task-a', text: 'long' })
     await vi.waitFor(() => expect(halted).toBe(true))
     await session.interrupt('leader stop')
     const result = await turn.waitForCompletion()
@@ -189,7 +189,7 @@ describe('claude runtime provider (agent SDK)', () => {
       metadata: { allowedTools: ['Read', 'Edit', 'Write'] },
     })
     const events = collectEvents(session)
-    const turn = await session.runTurn({ taskId: 't1', text: 'work' })
+    const turn = await session.startTaskTurn({ taskId: 't1', text: 'work' })
     const canUseTool = calls[0]!.options.canUseTool as (tool: string, input: unknown, opts: Record<string, unknown>) => Promise<{ behavior: string; message?: string }>
     const denied = await canUseTool('Bash', { command: 'rm' }, { decisionReason: 'dangerous command' })
     expect(denied.behavior).toBe('deny')
@@ -217,12 +217,12 @@ describe('claude runtime provider (agent SDK)', () => {
     })
     const provider = new ClaudeRuntimeProvider({ binPath: '/fake/claude', queryFactory: factory })
     const session = await provider.createSession(BASE_CONFIG)
-    const turn1 = await session.runTurn({ taskId: 'task-a', text: 'work' })
+    const turn1 = await session.startTaskTurn({ taskId: 'task-a', text: 'work' })
     const r1 = await turn1.waitForCompletion()
     expect(r1.status).toBe('failed')
     expect(r1.summary).toContain('git merge failed')
     // same provider session continues
-    const turn2 = await session.runTurn({ taskId: 'task-b', text: 'retry' })
+    const turn2 = await session.startTaskTurn({ taskId: 'task-b', text: 'retry' })
     const r2 = await turn2.waitForCompletion()
     expect(r2.status).toBe('completed')
     expect(calls[1]!.options.resume).toBe('ses-1')
@@ -237,3 +237,86 @@ function waitForAbort(signal: AbortSignal | undefined): AsyncGenerator<SDKMessag
     })
   })() as AsyncGenerator<SDKMessage>
 }
+
+describe('V0.6: claude runtime hardening', () => {
+  it('a correction during an active query is represented as QUEUED and executes on the SAME session', async () => {
+    const { factory, calls } = recordingFactory((params, index) => {
+      const messages = index === 0
+        ? [assistant('working on it'), result('success', 'first task done')]
+        : [assistant('corrected'), result('success', 'correction applied')]
+      return fakeQuery(messages)
+    })
+    const provider = new ClaudeRuntimeProvider({ binPath: '/fake/claude', queryFactory: factory })
+    const session = await provider.createSession(BASE_CONFIG)
+    const events = collectEvents(session)
+    const turn1 = await session.startTaskTurn({ taskId: 'task-a', text: 'build it' })
+    // the SDK cannot steer a live query — this is represented truthfully
+    const outcome = await session.steerActiveTurn!({ text: 'correction: use the v2 API' })
+    expect(outcome).toEqual({ queued: true })
+    expect(events.some((e) => e.type === 'turn.queued' && e.kind === 'followup' && e.text.includes('v2 API'))).toBe(true)
+    expect(events.some((e) => e.type === 'turn.steered')).toBe(false)
+    const r1 = await turn1.waitForCompletion()
+    expect(r1.status).toBe('completed')
+    // the Host would drain here — same session, resume by the SAME session id
+    const turn2 = await session.startTaskTurn({ text: 'correction: use the v2 API', turnKind: 'followup' })
+    const r2 = await turn2.waitForCompletion()
+    expect(r2.status).toBe('completed')
+    expect(calls).toHaveLength(2)
+    expect(calls[1]!.options.resume).toBe('ses-1')
+    expect(session.info().providerSessionId).toBe('ses-1')
+    await session.close(50)
+  })
+
+  it('listModels performs REAL discovery through the SDK supportedModels() (marked fallback only on failure)', async () => {
+    const previous = process.env.ANTHROPIC_API_KEY
+    process.env.ANTHROPIC_API_KEY = 'test-key-for-discovery'
+    try {
+      const discovery = async () => ([
+        { value: 'claude-sonnet-5', resolvedModel: 'claude-sonnet-5', displayName: 'Sonnet 5', supportedEffortLevels: ['low', 'medium', 'high'] },
+        { value: 'claude-opus-4-1', displayName: 'Opus 4.1', supportedEffortLevels: ['medium', 'high'] },
+      ])
+      const provider = new ClaudeRuntimeProvider({
+        binPath: '/fake/claude',
+        queryFactory: async () => ({ supportedModels: discovery, return: async () => undefined }) as unknown as ClaudeQueryLike,
+      })
+      const models = await provider.listModels()
+      expect(provider.isUsingFallbackCatalog()).toBe(false)
+      expect(models.map((m) => m.id)).toEqual(['claude-sonnet-5', 'claude-opus-4-1'])
+      expect(models[0]?.reasoningLevels).toEqual(['low', 'medium', 'high'])
+      // genuine discovery failure → the CLEARLY-MARKED fallback, never a crash
+      const failing = new ClaudeRuntimeProvider({
+        binPath: '/fake/claude',
+        queryFactory: async () => { throw new Error('CLI spawn failed') },
+      })
+      const fallback = await failing.listModels()
+      expect(fallback).toEqual(CLAUDE_FALLBACK_MODELS)
+      expect(failing.isUsingFallbackCatalog()).toBe(true)
+    } finally {
+      if (previous === undefined) delete process.env.ANTHROPIC_API_KEY
+      else process.env.ANTHROPIC_API_KEY = previous
+    }
+  })
+
+  it('a resumed query that returns a DIFFERENT session id fails loudly (never a silent fork)', async () => {
+    const { factory } = recordingFactory((_params, index) => {
+      if (index === 0) return fakeQuery([assistant('first'), result('success', 'first done', 'ses-1')])
+      // the "resume" silently started a brand-new conversation
+      return fakeQuery([assistant('fresh'), result('success', 'fresh done', 'ses-999')])
+    })
+    const provider = new ClaudeRuntimeProvider({ binPath: '/fake/claude', queryFactory: factory })
+    const session = await provider.createSession(BASE_CONFIG)
+    const events = collectEvents(session)
+    const turn1 = await session.startTaskTurn({ taskId: 'task-a', text: 'first' })
+    expect((await turn1.waitForCompletion()).status).toBe('completed')
+    const turn2 = await session.startTaskTurn({ taskId: 'task-b', text: 'resume' })
+    const r2 = await turn2.waitForCompletion()
+    expect(r2.status).toBe('failed')
+    expect(r2.summary).toContain('different session id')
+    expect(session.status).toBe('failed')
+    expect(events.some((e) => e.type === 'session.disconnected' && e.unrecoverable === true)).toBe(true)
+    expect(events.some((e) => e.type === 'session.failed')).toBe(true)
+    // the member does NOT silently adopt the foreign session
+    expect(session.info().providerSessionId).toBe('ses-1')
+    await session.close(50)
+  })
+})

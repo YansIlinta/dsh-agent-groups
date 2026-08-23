@@ -71,3 +71,24 @@ shell.overlay  ── AgentGroupsPage (groups list → group detail tabs)
   full-frame page; every color/spacing value derives from `--dsw-alias-*`
   tokens and DSH primitives (`Button`, icon set) are used for interactive
   chrome. No DSH source code was copied into this repository.
+
+## V0.6 — slot catalog re-verification + runtime surface additions
+
+- The installed rc.6 slot catalog was re-inspected (`CLIENT_SLOT_API`, 42
+  entries): `sidebar.footer.action` (list/root, additive) and `shell.overlay`
+  (list/root, additive) remain valid, non-destructive seats — the bundle keeps
+  them. The catalog also exposes more additive slots
+  (`conversation.session.header.actions`, `conversation.chat.assistant-actions`,
+  `conversation.composer.dock`, `settings.section`, `tool.view.cordis`, …);
+  none replaces the full-frame Agent Groups surface non-destructively, so no
+  slot change was made (verified against the installed bundle, not a
+  historical RC).
+- Team tab additions: member rows now show a **queued** chip (future task
+  turns + queued corrections, from the Host's authoritative
+  `runtimeQueuedTurns`), the member inspector lists each queued turn
+  (task/correction, preview, task id), and member actions distinguish **Send
+  correction** (steering into current work / queued next turn) from
+  **Interrupt turn**. The Tasks tab gained a **New Task** form that assigns to
+  a member (busy members queue the task as a future turn). Runtime state chips
+  include `Reconnecting`.
+- Thread/session ids remain in the "Advanced (debug)" line only.

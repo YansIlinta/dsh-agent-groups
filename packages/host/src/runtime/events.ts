@@ -39,6 +39,12 @@ export type RuntimeSessionEvent =
       /** Set when the provider will NOT be able to resume the session. */
       readonly unrecoverable?: boolean
     }
+  | {
+      readonly type: 'session.reconnecting'
+      readonly memberId: string
+      readonly timestamp: number
+      readonly reason?: string
+    }
   | { readonly type: 'session.failed'; readonly memberId: string; readonly timestamp: number; readonly reason?: string; readonly turnId?: string }
   | { readonly type: 'session.closed'; readonly memberId: string; readonly timestamp: number; readonly reason?: string }
 
@@ -59,6 +65,14 @@ export interface RuntimePendingRequest {
   readonly defaultAction?: string
   /** Allowed answer actions, when the provider declares them. */
   readonly allowedActions?: readonly string[]
+  /**
+   * V0.6: absolute deadline (ms epoch) after which the provider executes the
+   * safe default (`timeoutAction` or `defaultAction`; `cancel` when neither)
+   * and emits `request.timeout`. No provider request may hang invisibly.
+   */
+  readonly deadline?: number
+  /** V0.6: the safe action executed when `deadline` passes unanswered. */
+  readonly timeoutAction?: string
 }
 
 /** Turn-scoped lifecycle events. */
@@ -121,6 +135,50 @@ export type RuntimeTurnEvent =
   | { readonly type: 'turn.completed'; readonly turnId: string; readonly taskId?: string; readonly memberId: string; readonly timestamp: number; readonly result: RuntimeTurnResult }
   | { readonly type: 'turn.failed'; readonly turnId: string; readonly taskId?: string; readonly memberId: string; readonly timestamp: number; readonly reason?: string }
   | { readonly type: 'turn.cancelled'; readonly turnId: string; readonly taskId?: string; readonly memberId: string; readonly timestamp: number; readonly reason?: string }
+  /**
+   * V0.6: a turn was QUEUED as a future turn on the same session (the provider
+   * cannot or must not run it while the current turn is active). The Host
+   * records this in its authoritative per-member queue and drains it after the
+   * active turn reaches a terminal state. `kind` distinguishes a queued task
+   * turn from a queued next-turn correction.
+   */
+  | {
+      readonly type: 'turn.queued'
+      readonly memberId: string
+      readonly timestamp: number
+      readonly kind: 'task' | 'followup'
+      /** The text/instruction queued for the future turn. */
+      readonly text: string
+      /** The queued task, when this queued turn IS a task execution. */
+      readonly taskId?: string
+      /** The turn id this was queued behind (the then-active turn), when known. */
+      readonly behindTurnId?: string
+    }
+  /** V0.6: steering was accepted for the ACTIVE turn (not queued). */
+  | {
+      readonly type: 'turn.steered'
+      readonly turnId: string
+      readonly taskId?: string
+      readonly memberId: string
+      readonly timestamp: number
+    }
+  /**
+   * V0.6: a pending provider request (approval/input/permission) reached its
+   * deadline unanswered; the provider executed the safe default action.
+   */
+  | {
+      readonly type: 'request.timeout'
+      readonly memberId: string
+      readonly timestamp: number
+      readonly requestId: string
+      readonly requestKind: 'approval' | 'input' | 'permission'
+      readonly turnId?: string
+      readonly taskId?: string
+      /** The safe action executed by the timeout policy. */
+      readonly action: string
+      /** Set when the timeout action could not be delivered (transport down). */
+      readonly delivered?: boolean
+    }
 
 /** Any normalized runtime event. */
 export type RuntimeEvent =
@@ -153,6 +211,10 @@ export const RUNTIME_ACTIVITY_TYPES = [
   'runtime_input_required',
   'runtime_approval_answered',
   'runtime_request_answered',
+  'runtime_turn_queued',
+  'runtime_turn_steered',
+  'runtime_steer_failed',
+  'runtime_request_timed_out',
 ] as const
 
 export type RuntimeActivityType = (typeof RUNTIME_ACTIVITY_TYPES)[number]
