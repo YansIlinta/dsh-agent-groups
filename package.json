@@ -4,6 +4,9 @@
   "private": true,
   "type": "module",
   "description": "DSH Agent Groups — a multi-agent group product layer on top of DeepSeek Harness (independent plugin, zero DSH source modification)",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "build": "npm --prefix packages/host run build && node scripts/build-native-client.mjs",
     "build:native": "node scripts/build-native-client.mjs",
