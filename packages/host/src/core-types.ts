@@ -11,6 +11,7 @@
 export type GroupId = string
 export type SessionScopedId = string
 export type TaskId = string
+export type TaskAttemptId = string
 export type WorkstreamId = string
 export type AgentProfileId = string
 export type ChannelMessageId = string
@@ -74,6 +75,29 @@ export type TaskKind =
 
 export type TaskPriority = 'low' | 'normal' | 'high' | 'critical' | 'urgent'
 
+export type TaskAttemptStatus = 'running' | 'completed' | 'failed' | 'cancelled' | 'lost'
+
+/**
+ * One execution attempt of a product Task. Attempts are durable entities even
+ * though they are physically nested under their owning task for backwards-
+ * compatible storage-domain evolution.
+ */
+export interface TaskAttemptRecord {
+  readonly attemptId: TaskAttemptId
+  readonly groupId: GroupId
+  readonly taskId: TaskId
+  readonly sequence: number
+  readonly memberId: string
+  readonly runtime?: string
+  readonly providerSessionId?: string
+  readonly turnId: string
+  readonly status: TaskAttemptStatus
+  readonly startedAt: number
+  readonly endedAt?: number
+  readonly summary?: string
+  readonly failure?: string
+}
+
 // ── Agent Profile (第 2 节) ─────────────────────────────────────────────────
 
 /** One consumable agent role description. */
@@ -122,6 +146,8 @@ export interface GroupRecord {
   readonly completedAt?: number
   /** Working directory members spawned under (snapshotted at creation). */
   readonly cwd?: string
+  /** Workspace isolation policy. Missing on legacy records means `shared`. */
+  readonly workspaceMode?: 'shared' | 'worktree'
   /** V0.2: pause gate — set while the group must not dispatch new work. */
   readonly pausedAt?: number
   /** V0.2: durable hiding marker; archived groups stay readable. */
@@ -182,6 +208,10 @@ export interface RuntimeSessionDurable {
   readonly workspace?: string
   readonly model?: string
   readonly reasoningLevel?: string
+  /** Negotiated runtime capabilities used by the UI and restart reconciliation. */
+  readonly providerCapabilities?: Readonly<Record<string, unknown>>
+  /** Authoritative future-turn FIFO. Full text is durable; API views truncate it. */
+  readonly queuedTurns?: readonly RuntimeQueuedTurn[]
   readonly state?: string
   readonly lastTurnId?: string
   readonly lastTaskId?: string
@@ -239,6 +269,8 @@ export interface GroupTask extends GroupTaskMetadata {
   /** Monotonic revision for optimistic concurrency control. */
   readonly revision: number
   readonly attempt: number
+  /** Durable execution history; absent on records created before V0.7. */
+  readonly attempts?: readonly TaskAttemptRecord[]
   readonly createdAt: number
   readonly updatedAt: number
   readonly result?: AgentTaskResult
@@ -360,6 +392,11 @@ export type ActivityType =
   | 'runtime_turn_steered'
   | 'runtime_steer_failed'
   | 'runtime_request_timed_out'
+  | 'task_attempt_started'
+  | 'task_attempt_completed'
+  | 'task_attempt_failed'
+  | 'task_attempt_cancelled'
+  | 'task_attempt_lost'
 
 export interface ActivityEvent {
   readonly id: ActivityId

@@ -104,7 +104,7 @@ export class GroupService {
     leaderName: string,
     name: string,
     missionInput: MissionInput,
-    options?: { templateId?: string; maxMembers?: number; cwd?: string; teamConfig?: TeamConfig },
+    options?: { templateId?: string; maxMembers?: number; cwd?: string; workspaceMode?: 'shared' | 'worktree'; teamConfig?: TeamConfig },
   ): Promise<GroupRecord> {
     const existingActive = this.activeGroupForActor(leaderSessionId)
     if (existingActive !== undefined) {
@@ -134,6 +134,7 @@ export class GroupService {
       ...(options?.templateId !== undefined ? { templateId: options.templateId } : {}),
       ...(options?.maxMembers !== undefined ? { maxMembers: options.maxMembers } : {}),
       ...(options?.cwd !== undefined ? { cwd: options.cwd } : {}),
+      ...(options?.workspaceMode !== undefined ? { workspaceMode: options.workspaceMode } : {}),
       ...(options?.teamConfig !== undefined ? { teamConfig: options.teamConfig } : {}),
     }
     const leader: GroupMember = {
@@ -291,6 +292,7 @@ export class GroupService {
         templateId: source.templateId,
         maxMembers: source.maxMembers,
         cwd: source.cwd,
+        workspaceMode: source.workspaceMode,
         teamConfig: source.teamConfig,
       },
     )

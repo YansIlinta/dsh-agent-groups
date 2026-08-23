@@ -49,6 +49,12 @@ export class RuntimeRegistry {
     if (!available) {
       throw new RuntimeError('UNAVAILABLE', `the ${provider.name} runtime is not available on this host (not configured / not installed)`)
     }
+    if (provider.validate !== undefined) {
+      const readiness = await provider.validate()
+      if (!readiness.launchable || readiness.initialized === false) {
+        throw new RuntimeError('UNAVAILABLE', readiness.error ?? `the ${provider.name} runtime failed validation`)
+      }
+    }
     return provider
   }
 }

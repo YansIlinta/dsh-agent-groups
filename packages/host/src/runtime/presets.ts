@@ -73,9 +73,16 @@ export const RUNTIME_PRESETS: readonly RuntimePreset[] = [
   {
     id: 'claude-balanced',
     name: 'Claude Balanced',
-    description: 'Claude Code with a balanced model.',
-    runtime: 'claude-code',
+    description: 'Claude through the official ACP adapter.',
+    runtime: 'claude',
     model: 'claude-sonnet-4-5',
+    reasoningLevel: 'medium',
+  },
+  {
+    id: 'gemini-balanced',
+    name: 'Gemini ACP',
+    description: 'Gemini CLI native ACP mode.',
+    runtime: 'gemini',
     reasoningLevel: 'medium',
   },
 ]

@@ -24,6 +24,7 @@ export const LEADER_TOOLS: readonly GroupToolDef[] = [
       deliverables: { type: string, description: 'Comma-separated expected deliverables.' },
       acceptanceCriteria: { type: string, description: 'Comma-separated acceptance criteria.' },
       risks: { type: string, description: 'Comma-separated known risks.' },
+      workspaceMode: { type: string, description: 'Member workspace policy: "shared" (default) or isolated Git "worktree".' },
     },
     run: (host, actor, args) =>
       host.initGroup(actor, {
@@ -33,6 +34,7 @@ export const LEADER_TOOLS: readonly GroupToolDef[] = [
         deliverables: listOptArg(args, 'deliverables'),
         acceptanceCriteria: listOptArg(args, 'acceptanceCriteria'),
         risks: listOptArg(args, 'risks'),
+        workspaceMode: strOptArg(args, 'workspaceMode') === 'worktree' ? 'worktree' : 'shared',
       }),
   },
   {

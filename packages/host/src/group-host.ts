@@ -52,6 +52,7 @@ import type { RuntimeEvent, RuntimePendingRequest } from './runtime/events.js'
 import type { MemberRuntimeState, RuntimeQueuedTurn, RuntimeRequestView } from './core-types.js'
 import { teamConfigFor } from './runtime/team-config.js'
 import { createRuntimeMessage, runtimeMessageText } from './runtime/message.js'
+import { GitWorktreeWorkspaceManager, type WorkspaceManager } from './runtime/workspace.js'
 
 export function textContent(text: string): ContentBlock[] {
   return [{ type: 'text', text }]
@@ -79,6 +80,11 @@ export class GroupHost {
   private readonly adapter: AgentRuntimeAdapter
   /** V0.5: per-member live runtime sessions (session ⊃ turns ⊃ tasks). */
   private readonly memberRuntimes = new Map<string, MemberRuntime>()
+  /** Per-member restart reconciliation backoff; avoids retry/event storms. */
+  private readonly runtimeResumeBackoff = new Map<string, { failures: number; nextAt: number }>()
+  /** Ensures a terminal event cannot settle before its durable Attempt exists. */
+  private readonly attemptStarts = new Map<string, Promise<unknown>>()
+  private readonly workspaces: WorkspaceManager
 
   constructor(options: {
     groups: GroupService
@@ -91,6 +97,7 @@ export class GroupHost {
     adapter: AgentRuntimeAdapter
     leaders: LeaderRegistry
     runtimes?: RuntimeRegistry
+    workspaces?: WorkspaceManager
   }) {
     this.groups = options.groups
     this.tasks = options.tasks
@@ -102,6 +109,7 @@ export class GroupHost {
     this.adapter = options.adapter
     this.leaders = options.leaders
     this.runtimes = options.runtimes ?? new RuntimeRegistry()
+    this.workspaces = options.workspaces ?? new GitWorktreeWorkspaceManager()
   }
 
   // ── actor resolution ──────────────────────────────────────────────────────
@@ -227,6 +235,24 @@ export class GroupHost {
       payload: { role: roleId, runtime: role.runtime, model, reasoningLevel },
     })
     const agentId = randomUUID()
+    let workspace: string | undefined
+    try {
+      workspace = await this.workspaces.prepare({
+        groupId,
+        memberId: agentId,
+        cwd: group.cwd,
+        mode: group.workspaceMode ?? 'shared',
+      })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      await this.activity.append({
+        groupId,
+        type: 'member_runtime_failed',
+        actorId: requestedBy,
+        payload: { role: roleId, runtime: role.runtime, error: message },
+      })
+      throw new GroupError('SPAWN_FAILED', `failed to prepare ${role.name} workspace: ${message}`)
+    }
     const roleConfig: RuntimeAgentConfig = {
       groupId,
       agentId,
@@ -235,16 +261,19 @@ export class GroupHost {
       model,
       reasoningLevel,
       systemPrompt: role.systemPrompt,
-      workspace: group.cwd,
+      workspace,
       parentMemberId: group.leaderSessionId,
       metadata: role.metadata,
     }
     try {
       if (isSessionProvider(provider)) {
-        // V0.5: sessions are created in a lazy 'starting' state — the provider
-        // conversation (Codex thread / Claude session / DSH agent) attaches on
-        // the first turn or on resume after a restart.
+        // Materialization is the runtime-readiness boundary: initialize the
+        // provider, create the durable conversation, and apply advertised
+        // config before a member can appear usable or receive a task. This
+        // removes the spawn→first-dispatch race and surfaces auth/config/new
+        // session failures synchronously.
         const session = await provider.createSession(roleConfig)
+        await session.start()
         this.attachMemberRuntime(groupId, agentId, roleConfig, session)
       } else {
         // Legacy provider: process handle, no session semantics.
@@ -312,7 +341,7 @@ export class GroupHost {
    * Attach a live provider session to a member and start forwarding normalized
    * runtime events into the Activity Timeline + member state machine.
    */
-  private attachMemberRuntime(groupId: GroupId, memberId: string, config: RuntimeAgentConfig, session: RuntimeSession): void {
+  private attachMemberRuntime(groupId: GroupId, memberId: string, config: RuntimeAgentConfig, session: RuntimeSession, queuedTurns: readonly RuntimeQueuedTurn[] = []): void {
     const entry: MemberRuntime = {
       kind: 'session',
       groupId,
@@ -322,8 +351,8 @@ export class GroupHost {
       state: 'starting',
       pendingRequests: new Map(),
       activeTurn: undefined,
-      queuedTurns: [],
-      turnSeq: 0,
+      queuedTurns: [...queuedTurns],
+      turnSeq: queuedTurns.reduce((max, turn) => Math.max(max, turn.seq), 0),
     }
     this.memberRuntimes.set(memberId, entry)
     session.subscribe((event) => this.onRuntimeEvent(memberId, event))
@@ -341,7 +370,7 @@ export class GroupHost {
       role: member.roleId ?? 'generalist',
       model: member.model,
       reasoningLevel: member.reasoningLevel,
-      workspace: group.cwd,
+      workspace: member.runtimeSession.workspace ?? group.cwd,
       parentMemberId: group.leaderSessionId,
       metadata: { provider: member.runtimeSession.provider },
     }, member.runtimeSession as RuntimeSessionInfo)
@@ -351,9 +380,9 @@ export class GroupHost {
       role: member.roleId ?? 'generalist',
       model: member.model,
       reasoningLevel: member.reasoningLevel,
-      workspace: group.cwd,
+      workspace: member.runtimeSession.workspace ?? group.cwd,
       parentMemberId: group.leaderSessionId,
-    }, resumed)
+    }, resumed, member.runtimeSession.queuedTurns)
     this.setRuntimeState(member.sessionId, 'starting')
   }
 
@@ -370,6 +399,8 @@ export class GroupHost {
       workspace: info.workspace,
       model: info.model,
       reasoningLevel: info.reasoningLevel,
+      providerCapabilities: info.providerCapabilities,
+      queuedTurns: [...entry.queuedTurns],
       state: info.state,
       lastTurnId: info.lastTurnId,
       lastTaskId: info.lastTaskId,
@@ -403,7 +434,9 @@ export class GroupHost {
   /** V0.6: authoritative view of the member's queued future turns (UI). */
   private queuedTurnsOf(memberId: string): RuntimeQueuedTurn[] | undefined {
     const queued = this.memberRuntimes.get(memberId)?.queuedTurns
-    return queued !== undefined && queued.length > 0 ? [...queued] : undefined
+    return queued !== undefined && queued.length > 0
+      ? queued.map((turn) => ({ ...turn, text: turn.text.slice(0, 200) }))
+      : undefined
   }
 
   private requestsForGroup(groupId: GroupId): RuntimeRequestView[] {
@@ -470,6 +503,10 @@ export class GroupHost {
           void this.groups.patchMember(groupId, memberId, { error: event.reason ?? 'runtime session disconnected' }).catch(() => undefined)
         }
         this.persistRuntimeMetadata(groupId, memberId)
+        const disconnectedTask = entry.activeTurn?.taskId
+        if (event.turnId !== undefined && disconnectedTask !== undefined) {
+          void this.settleRuntimeAttempt(groupId, disconnectedTask, event.turnId, 'lost', event.reason)
+        }
         return
       }
       case 'session.reconnecting': {
@@ -498,6 +535,16 @@ export class GroupHost {
           entry.activeTurn = { turnId: event.turnId, taskId: event.taskId }
         }
         void this.activity.append({ groupId, type: 'runtime_turn_started', actorName, refMemberId: memberId, refTaskId: event.taskId, payload: { turnId: event.turnId } })
+        if (event.taskId !== undefined) {
+          const info = entry.session.info()
+          const started = this.tasks.startAttempt(groupId, event.taskId, {
+            memberId,
+            turnId: event.turnId,
+            runtime: info.runtime,
+            providerSessionId: info.providerSessionId,
+          }).catch(() => undefined)
+          this.attemptStarts.set(event.turnId, started)
+        }
         this.persistRuntimeMetadata(groupId, memberId)
         return
       }
@@ -509,10 +556,11 @@ export class GroupHost {
           seq: ++entry.turnSeq,
           kind: event.kind,
           taskId: event.taskId,
-          text: event.text.slice(0, 200),
+          text: event.text,
           queuedAt: event.timestamp,
           behindTurnId: event.behindTurnId,
         })
+        this.persistRuntimeMetadata(groupId, memberId)
         void this.activity.append({
           groupId,
           type: 'runtime_turn_queued',
@@ -567,11 +615,14 @@ export class GroupHost {
         this.setRuntimeState(memberId, 'idle')
         void this.activity.append({ groupId, type: 'runtime_turn_completed', actorName, refMemberId: memberId, refTaskId: completedTask, payload: { turnId: event.turnId, status: event.result.status } })
         // A COMPLETED TURN, not a process exit, is the completion claim:
-        void this.onTurnCompleted(memberId, event.turnId, completedTask, event.result)
+        void this.settleRuntimeAttempt(groupId, completedTask, event.turnId, 'completed', event.result.summary)
+          .then(() => this.onTurnCompleted(memberId, event.turnId, completedTask, event.result))
+          .then(() => this.drainQueuedTurns(memberId))
         this.persistRuntimeMetadata(groupId, memberId)
         // V0.6: the next queued future turn starts deterministically after the
-        // terminal state (same session, same member).
-        void this.drainQueuedTurns(memberId)
+        // Attempt and bound Task both reach terminal state (same session,
+        // same member). This ordering prevents a newer turn from masking the
+        // older task's completion claim.
         return
       }
       case 'turn.failed': {
@@ -580,9 +631,10 @@ export class GroupHost {
         entry.activeTurn = undefined
         this.setRuntimeState(memberId, 'idle')
         void this.activity.append({ groupId, type: 'runtime_turn_failed', actorName, refMemberId: memberId, refTaskId: failedTask, payload: { turnId: event.turnId, reason: event.reason } })
-        void this.onTurnFailed(memberId, failedTask, event.reason)
+        void this.settleRuntimeAttempt(groupId, failedTask, event.turnId, 'failed', event.reason)
+          .then(() => this.onTurnFailed(memberId, failedTask, event.reason))
+          .then(() => this.drainQueuedTurns(memberId))
         this.persistRuntimeMetadata(groupId, memberId)
-        void this.drainQueuedTurns(memberId)
         return
       }
       case 'turn.cancelled': {
@@ -595,9 +647,10 @@ export class GroupHost {
         // failure — its task returns to a defined retryable state (pending),
         // the member stops carrying it, and the transition is persisted in the
         // Activity Timeline. A queued future task may then start.
-        void this.onTurnCancelled(groupId, memberId, cancelledTask, event.reason)
+        void this.settleRuntimeAttempt(groupId, cancelledTask, event.turnId, 'cancelled', event.reason)
+          .then(() => this.onTurnCancelled(groupId, memberId, cancelledTask, event.reason))
+          .then(() => this.drainQueuedTurns(memberId))
         this.persistRuntimeMetadata(groupId, memberId)
-        void this.drainQueuedTurns(memberId)
         return
       }
       case 'request.timeout': {
@@ -628,6 +681,19 @@ export class GroupHost {
         return
       }
     }
+  }
+
+  private async settleRuntimeAttempt(
+    groupId: GroupId,
+    taskId: string | undefined,
+    turnId: string,
+    status: 'completed' | 'failed' | 'cancelled' | 'lost',
+    detail?: string,
+  ): Promise<void> {
+    if (taskId === undefined) return
+    await this.attemptStarts.get(turnId)
+    this.attemptStarts.delete(turnId)
+    await this.tasks.settleAttempt(groupId, taskId, turnId, status, detail).catch(() => undefined)
   }
 
   /** Did this member enter the process with durable session metadata? */
@@ -744,12 +810,14 @@ export class GroupHost {
     if (typeof entry.session.startTaskTurn !== 'function') {
       // Provider cannot start turns — keep the item queued (never dropped).
       entry.queuedTurns.unshift(next)
+      this.persistRuntimeMetadata(entry.groupId, memberId)
       return
     }
     try {
       const handle = await entry.session.startTaskTurn({ text: next.text, taskId: next.taskId, turnKind: next.kind })
       if (handle !== undefined) {
         entry.activeTurn = { turnId: handle.turnId, taskId: handle.taskId }
+        this.persistRuntimeMetadata(entry.groupId, memberId)
         // V0.6: the started queued task becomes the member's current task
         // (re-applied here so a concurrent cancellation policy cannot leave
         // the cursor stale).
@@ -761,6 +829,7 @@ export class GroupHost {
       // The queued turn could not start — keep it queued (re-queue) and fail
       // LOUDLY so the Leader/UI can act; the member session stays intact.
       entry.queuedTurns.unshift(next)
+      this.persistRuntimeMetadata(entry.groupId, memberId)
       void this.activity.append({
         groupId: entry.groupId,
         type: 'member_runtime_failed',
@@ -893,19 +962,24 @@ export class GroupHost {
     name: string
     description?: string
     available: boolean
+    readiness?: import('./runtime/base.js').RuntimeReadiness
     capabilities: import('./runtime/base.js').RuntimeCapabilities
     models: readonly import('./runtime/base.js').ModelDescriptor[]
     reasoningLevels: readonly import('./runtime/base.js').ReasoningOption[]
   }>> {
-    return Promise.all(this.runtimes.list().map(async (provider) => ({
-      id: provider.id,
-      name: provider.name,
-      description: provider.description,
-      available: await provider.isAvailable(),
-      capabilities: await provider.getCapabilities(),
-      models: await provider.listModels(),
-      reasoningLevels: await provider.listReasoningLevels?.() ?? [],
-    })))
+    return Promise.all(this.runtimes.list().map(async (provider) => {
+      const available = await provider.isAvailable()
+      return {
+        id: provider.id,
+        name: provider.name,
+        description: provider.description,
+        available,
+        readiness: provider.getReadiness === undefined ? undefined : await provider.getReadiness(),
+        capabilities: await provider.getCapabilities(),
+        models: await provider.listModels(),
+        reasoningLevels: await provider.listReasoningLevels?.() ?? [],
+      }
+    }))
   }
 
   /** Leader view of the Team Configuration + live instance counts. */
@@ -932,12 +1006,13 @@ export class GroupHost {
 
   async initGroup(
     actor: string,
-    input: { name: string; objective: string; constraints?: string[]; deliverables?: string[]; acceptanceCriteria?: string[]; risks?: string[] },
+    input: { name: string; objective: string; constraints?: string[]; deliverables?: string[]; acceptanceCriteria?: string[]; risks?: string[]; workspaceMode?: 'shared' | 'worktree' },
   ): Promise<GroupRecord> {
     void this.leaders.register(actor)
     const cwd = this.adapter.liveAgent(actor)?.agent.session.header.cwd
     const group = await this.groups.initGroup(actor, this.actorDisplayName(actor), input.name, input, {
       cwd,
+      workspaceMode: input.workspaceMode ?? 'shared',
       teamConfig: teamConfigFor(undefined, undefined),
     })
     await this.channel.post(group.groupId, {
@@ -1487,6 +1562,7 @@ export class GroupHost {
     risks?: string[]
     templateId?: string
     maxMembers?: number
+    workspaceMode?: 'shared' | 'worktree'
     members?: Array<{ role?: string; profile: string; name?: string }>
   }): Promise<GroupRecord> {
     const { leaderSessionId } = input
@@ -1501,6 +1577,7 @@ export class GroupHost {
       templateId: input.templateId,
       maxMembers: input.maxMembers,
       cwd,
+      workspaceMode: input.workspaceMode ?? 'shared',
       teamConfig: teamConfigFor(input.templateId, undefined),
     })
     await this.channel.post(group.groupId, {
@@ -1886,9 +1963,27 @@ export class GroupHost {
       const members = this.groups.listMembers(group.groupId, () => undefined)
       for (const member of members) {
         if (member.role !== 'member' || member.status === 'left') continue
+        const backoff = this.runtimeResumeBackoff.get(member.sessionId)
+        if (backoff !== undefined && Date.now() < backoff.nextAt) continue
         try {
           await this.resumeMemberRuntime(group, member)
+          const entry = this.memberRuntimes.get(member.sessionId)
+          if (entry?.kind === 'session') {
+            if (entry.session.status === 'starting' || entry.session.status === 'disconnected' || entry.session.status === 'reconnecting' || entry.session.status === 'failed') {
+              await entry.session.start()
+              this.persistRuntimeMetadata(group.groupId, member.sessionId)
+            }
+            if (group.status === 'active' && group.pausedAt === undefined) {
+              await this.drainQueuedTurns(member.sessionId)
+            }
+          }
+          this.runtimeResumeBackoff.delete(member.sessionId)
         } catch (error) {
+          const failures = (backoff?.failures ?? 0) + 1
+          this.runtimeResumeBackoff.set(member.sessionId, {
+            failures,
+            nextAt: Date.now() + Math.min(60_000, 1_000 * (2 ** Math.min(failures - 1, 6))),
+          })
           // A member whose provider session cannot resume stays in the roster
           // with its durable metadata; the failure is recorded LOUDLY and the
           // next dispatch fails with SESSION_RESUME_FAILED instead of silently
@@ -1903,6 +1998,39 @@ export class GroupHost {
           await this.groups.patchMember(group.groupId, member.sessionId, {
             error: `runtime session resume failed: ${error instanceof Error ? error.message : String(error)}`,
           }).catch(() => undefined)
+        }
+      }
+    }
+    await this.reconcileOrphanedAttempts()
+  }
+
+  /**
+   * Reconcile durable work that was running before this Host process existed
+   * but has no matching live turn after provider reattachment. The outcome is
+   * deliberately `lost` + task failure, never an automatic redispatch: ACP v1
+   * cannot universally prove that a remote provider did not finish the old
+   * prompt, so replaying it could duplicate filesystem changes.
+   */
+  private async reconcileOrphanedAttempts(): Promise<void> {
+    for (const group of this.groups.listGroups()) {
+      for (const task of this.tasks.listTasks(group.groupId)) {
+        const running = task.attempts?.filter((attempt) => attempt.status === 'running') ?? []
+        for (const attempt of running) {
+          const runtime = this.memberRuntimes.get(attempt.memberId)
+          if (runtime?.kind === 'session' && runtime.activeTurn?.turnId === attempt.turnId) continue
+          const reason = 'Host restart found no live provider turn for this durable attempt'
+          await this.tasks.settleAttempt(group.groupId, task.taskId, attempt.turnId, 'lost', reason)
+          const latest = this.tasks.requireTask(group.groupId, task.taskId)
+          if (latest.status !== 'completed' && latest.status !== 'review' && latest.status !== 'failed') {
+            await this.tasks.markFailed(group.groupId, task.taskId, 'runtime-reconciler', reason)
+          }
+          const member = this.groups.getMembership(group.groupId, attempt.memberId)
+          if (member?.currentTaskId === task.taskId) {
+            await this.groups.patchMember(group.groupId, attempt.memberId, {
+              currentTaskId: undefined,
+              error: reason,
+            }).catch(() => undefined)
+          }
         }
       }
     }

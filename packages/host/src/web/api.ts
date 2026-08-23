@@ -123,6 +123,7 @@ export async function handleApi(
       risks: listOf(body.risks),
       templateId: optionalString(body.templateId),
       maxMembers: optionalNumber(body.maxMembers),
+      workspaceMode: body.workspaceMode === 'worktree' ? 'worktree' : 'shared',
       members: Array.isArray(body.members)
         ? (body.members as Array<Record<string, unknown>>).map((slot) => ({
             role: optionalString(slot.role),

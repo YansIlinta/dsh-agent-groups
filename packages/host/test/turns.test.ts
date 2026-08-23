@@ -394,6 +394,21 @@ async function assign(host: GroupHost, groupId: string, memberId: string, subjec
 }
 
 describe('V0.5: persistent sessions & turn-based task completion', () => {
+  it('materializes and persists a ready provider session before first dispatch', async () => {
+    const stores = makeStores()
+    const provider = new FakeThreadProvider()
+    const host = makeTurnHost(stores, provider)
+    const { groupId, memberId } = await seedTeam(host)
+    const member = host.groups.requireMember(groupId, memberId)
+
+    expect(provider.sessionOf(memberId)?.status).toBe('idle')
+    expect(member.runtimeSession).toMatchObject({
+      providerSessionId: `ses-${memberId}`,
+      state: 'idle',
+    })
+    expect(provider.startedTurns).toHaveLength(0)
+  })
+
   it('Task A → turn 1 → claim → idle; Task B on the SAME session/thread', async () => {
     const stores = makeStores()
     const provider = new FakeThreadProvider()
@@ -602,6 +617,27 @@ describe('V0.5: persistent sessions & turn-based task completion', () => {
     expect(member.runtimeSession?.providerThreadId).toBe(threadBefore)
   })
 
+  it('host restart marks an unobservable running attempt lost without replaying it', async () => {
+    const stores = makeStores()
+    const provider1 = new FakeThreadProvider()
+    const host1 = makeTurnHost(stores, provider1)
+    const { groupId, memberId } = await seedTeam(host1)
+    const task = await assign(host1, groupId, memberId, 'interrupted by host restart')
+    await sleep(10)
+    expect(host1.tasks.requireTask(groupId, task.taskId).attempts?.[0]?.status).toBe('running')
+
+    const provider2 = new FakeThreadProvider()
+    const host2 = makeTurnHost(stores, provider2)
+    await host2.resumeAllMemberRuntimes()
+
+    const reconciled = host2.tasks.requireTask(groupId, task.taskId)
+    expect(reconciled.status).toBe('failed')
+    expect(reconciled.attempts?.[0]).toMatchObject({ status: 'lost', failure: expect.stringContaining('no live provider turn') })
+    expect(provider2.startedTurns).toHaveLength(0)
+    expect(host2.groups.requireMember(groupId, memberId).currentTaskId).toBeUndefined()
+    expect(host2.activity.list(groupId).some((event) => event.type === 'task_attempt_lost')).toBe(true)
+  })
+
   it('resume failure fails LOUDLY — no silent second conversation', async () => {
     const stores = makeStores()
     const provider1 = new FakeThreadProvider()
@@ -763,12 +799,13 @@ describe('V0.5: persistent sessions & turn-based task completion', () => {
     await host.interruptMember('lead-1', { memberSessionId: memberId, reason: 'stop now' })
     await sleep(15)
     // cancellation policy: the interrupted task is retryable (pending), NOT
-    // success and NOT failure; the member stops carrying it
+    // success and NOT failure; the member stops carrying A and then carries
+    // queued task B once deterministic draining starts it
     const taskAAfter = host.tasks.listTasks(groupId).find((t) => t.taskId === taskA.taskId)!
     expect(taskAAfter.status).toBe('pending')
     expect(taskAAfter.result).toBeUndefined()
     const memberAfter = host.groups.listMembers(groupId, () => undefined).find((m) => m.sessionId === memberId)!
-    expect(memberAfter.currentTaskId).toBeUndefined()
+    expect(memberAfter.currentTaskId).toBe(taskB.taskId)
     expect(host.activity.list(groupId).some((a) => a.type === 'runtime_turn_cancelled')).toBe(true)
     expect(host.activity.list(groupId).some((a) => a.type === 'task_reopened')).toBe(true)
     // the queued task B starts after the interrupt (deterministic continuation)

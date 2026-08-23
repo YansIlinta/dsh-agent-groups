@@ -29,10 +29,16 @@ import { createGroupWebApi } from './web/api.js'
 import { LeaderRegistry } from './leader-registry.js'
 import { RuntimeRegistry } from './runtime/registry.js'
 import { DeepSeekHarnessRuntimeProvider } from './runtime/deepseek-harness.js'
-import { CodexRuntimeProvider } from './runtime/codex.js'
 import { ExternalAgentBridge } from './runtime/bridge.js'
 import { ClaudeCodeRuntimeProvider } from './runtime/claude-code.js'
-import { ClaudeRuntimeProvider } from './runtime/claude.js'
+import { ACPAgentRuntimeProvider, BUILTIN_ACP_AGENTS, loadCustomACPAgentDefinitions } from './runtime/acp.js'
+import { RuntimeReconciler } from './runtime/reconciler.js'
+import { loadConfiguredACPRegistryDefinitions } from './runtime/acp-registry.js'
+export { loadACPRegistryDefinitions, loadConfiguredACPRegistryDefinitions } from './runtime/acp-registry.js'
+export { GitWorktreeWorkspaceManager } from './runtime/workspace.js'
+export type { MemberWorkspaceRequest, WorkspaceManager, WorkspaceMode } from './runtime/workspace.js'
+export { LocalRuntimeExecutor } from './runtime/executor.js'
+export type { RuntimeExecutor, RuntimeProcessSpec } from './runtime/executor.js'
 
 export { GroupHost } from './group-host.js'
 export { GroupError, type GroupErrorCode } from './group-service.js'
@@ -52,6 +58,10 @@ export { CodexAppServerConnection, CodexProtocolError, CodexBinaryProcessHost } 
 export type { CodexProcessHost, CodexChildLike, CodexInboundMessage, RequestId } from './runtime/codex-protocol.js'
 export { ClaudeCodeRuntimeProvider } from './runtime/claude-code.js'
 export { ClaudeRuntimeProvider, CLAUDE_FALLBACK_MODELS } from './runtime/claude.js'
+export { ACPAgentRuntimeProvider, ACPRuntimeSession, BUILTIN_ACP_AGENTS, loadCustomACPAgentDefinitions } from './runtime/acp.js'
+export type { ACPAgentDefinition, ACPAgentRuntimeOptions, ACPNormalizedCapabilities } from './runtime/acp.js'
+export { RuntimeReconciler } from './runtime/reconciler.js'
+export type { RuntimeReconcilerOptions } from './runtime/reconciler.js'
 export type { ClaudeQueryFactory, ClaudeQueryLike, ClaudeQueryParams } from './runtime/claude.js'
 export type { RuntimeSession, RuntimeTurnHandle, RuntimeTurnResult, RuntimeTurnInput, RuntimeSessionInfo, RuntimeSessionStatus, SessionRuntimeProvider } from './runtime/base.js'
 export { isSessionProvider, DEFAULT_REASONING_LEVELS } from './runtime/base.js'
@@ -132,10 +142,12 @@ export async function apply(ctx: Context): Promise<void> {
     { currentSelection: () => (agentDefaultModel?.currentSelection() ?? {}) },
   ))
   let codexBridge: ExternalAgentBridge | undefined
-  // V0.5: the persistent Codex App Server provider (one thread per member).
-  runtimes.register(new CodexRuntimeProvider())
-  // V0.5: the persistent Claude Agent SDK provider (resume-by-session-id).
-  runtimes.register(new ClaudeRuntimeProvider())
+  // ACP-native external coding agents. Codex and Claude use the official ACP
+  // adapters; Gemini speaks ACP natively. Adding another compliant agent is a
+  // definition, not another provider implementation.
+  const acpDefinitions = [...BUILTIN_ACP_AGENTS, ...loadCustomACPAgentDefinitions(), ...loadConfiguredACPRegistryDefinitions()]
+  const acpProviders = acpDefinitions.map((definition) => new ACPAgentRuntimeProvider(definition))
+  for (const provider of acpProviders) runtimes.register(provider)
   // Legacy bridge-based Claude Code CLI provider (kept for stored roles).
   runtimes.register(new ClaudeCodeRuntimeProvider({ getBridge: () => codexBridge }))
 
@@ -143,8 +155,12 @@ export async function apply(ctx: Context): Promise<void> {
   codexBridge = new ExternalAgentBridge(host)
   ctx.provide('groupHost', host)
 
-  // V0.5: re-attach durable member sessions after a host restart.
-  void host.resumeAllMemberRuntimes()
+  // Deterministic, non-overlapping reconciliation: re-attach durable ACP/DSH
+  // sessions, then drain persisted future turns without duplicating work.
+  const reconciler = new RuntimeReconciler(() => host.resumeAllMemberRuntimes(), {
+    onError: (error) => console.error('[agent-groups] runtime reconciliation failed', error),
+  })
+  reconciler.start()
 
   // Policy: no raw peer messaging for group members (defense-in-depth).
   installMemberPeerContactPolicy(ctx, groups)
@@ -157,7 +173,9 @@ export async function apply(ctx: Context): Promise<void> {
 
   ctx.effect(() => () =>
     Promise.allSettled([
+      Promise.resolve(reconciler.stop()),
       adapter.drain(),
+      ...acpProviders.map((provider) => provider.dispose()),
       domain.close(),
     ]).then(() => undefined),
   )

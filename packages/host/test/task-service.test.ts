@@ -80,6 +80,49 @@ describe('task lifecycle', () => {
     expect(reopened.attempt).toBe(2)
   })
 
+  it('persists independently identified attempts and settles each turn once', async () => {
+    const h = makeHarness()
+    const group = await seedGroup(h)
+    const task = await h.tasks.createTask(group.groupId, { createdBy: 'lead', subject: 'attempts', description: '…', kind: 'implementation', acceptanceCriteria: ['ok'] })
+
+    const first = await h.tasks.startAttempt(group.groupId, task.taskId, {
+      memberId: 'm1',
+      turnId: 'turn-1',
+      runtime: 'codex',
+      providerSessionId: 'session-1',
+    })
+    const duplicate = await h.tasks.startAttempt(group.groupId, task.taskId, {
+      memberId: 'm1',
+      turnId: 'turn-1',
+      runtime: 'codex',
+      providerSessionId: 'session-1',
+    })
+    expect(duplicate.attemptId).toBe(first.attemptId)
+    expect(first).toMatchObject({ sequence: 1, status: 'running', turnId: 'turn-1' })
+
+    const settled = await h.tasks.settleAttempt(group.groupId, task.taskId, 'turn-1', 'completed', 'implemented')
+    expect(settled).toMatchObject({ attemptId: first.attemptId, status: 'completed', summary: 'implemented' })
+    const lateFailure = await h.tasks.settleAttempt(group.groupId, task.taskId, 'turn-1', 'failed', 'late provider exit')
+    expect(lateFailure).toMatchObject({ status: 'completed', summary: 'implemented' })
+    expect(h.tasks.requireTask(group.groupId, task.taskId).attempts).toHaveLength(1)
+  })
+
+  it('records a new attempt sequence after a task is reopened', async () => {
+    const h = makeHarness()
+    const group = await seedGroup(h)
+    const task = await h.tasks.createTask(group.groupId, { createdBy: 'lead', subject: 'retry', description: '…', kind: 'implementation', acceptanceCriteria: ['ok'] })
+    await h.tasks.startAttempt(group.groupId, task.taskId, { memberId: 'm1', turnId: 'turn-1' })
+    await h.tasks.settleAttempt(group.groupId, task.taskId, 'turn-1', 'failed', 'crashed')
+    await h.tasks.assign(group.groupId, task.taskId, 'm1', 'lead')
+    await h.tasks.claim(group.groupId, task.taskId, 'm1')
+    await h.tasks.markFailed(group.groupId, task.taskId, 'm1', 'crashed')
+    await h.tasks.reopen(group.groupId, task.taskId, 'lead', 'retry')
+    const second = await h.tasks.startAttempt(group.groupId, task.taskId, { memberId: 'm1', turnId: 'turn-2' })
+
+    expect(second.sequence).toBe(2)
+    expect(h.tasks.requireTask(group.groupId, task.taskId).attempts?.map((attempt) => attempt.status)).toEqual(['failed', 'running'])
+  })
+
   it('CAS rejects stale revisions with CONFLICT and keeps a single winner', async () => {
     const h = makeHarness()
     const group = await seedGroup(h)

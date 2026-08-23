@@ -76,6 +76,15 @@ export interface RuntimeCapabilities {
   readonly dynamicModels?: boolean
 }
 
+export interface RuntimeReadiness {
+  /** The configured executable/transport can be launched by this executor. */
+  readonly launchable: boolean
+  /** Protocol initialization has succeeded in this provider process. */
+  readonly initialized?: boolean
+  readonly executor?: string
+  readonly error?: string
+}
+
 /** Role config compiles into this before reaching the provider. */
 export interface RuntimeAgentConfig {
   readonly groupId: string
@@ -162,6 +171,8 @@ export interface RuntimeSessionInfo {
   readonly workspace?: string
   readonly model?: string
   readonly reasoningLevel?: string
+  /** Negotiated, normalized provider capabilities. Never contains auth data. */
+  readonly providerCapabilities?: Readonly<Record<string, unknown>>
   readonly state: RuntimeSessionStatus
   readonly lastTurnId?: string
   readonly lastTaskId?: string
@@ -269,6 +280,10 @@ export interface AgentRuntimeProvider {
   readonly description?: string
   /** Whether the runtime can be used right now (binaries + credentials). */
   isAvailable(): boolean | Promise<boolean>
+  /** Side-effect-free view; omitted providers use `isAvailable` only. */
+  getReadiness?(): RuntimeReadiness | Promise<RuntimeReadiness>
+  /** Explicit pre-spawn validation. Must fail loudly; never persists secrets. */
+  validate?(): Promise<RuntimeReadiness>
   getCapabilities(): RuntimeCapabilities | Promise<RuntimeCapabilities>
   listModels(): readonly ModelDescriptor[] | Promise<readonly ModelDescriptor[]>
   /** Reasonable levels; a provider without listReasoningLevels still receives the abstract level string. */

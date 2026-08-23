@@ -191,6 +191,17 @@ function shortId(id) {
   return typeof id === 'string' ? id.slice(0, 8) : String(id)
 }
 
+function capabilitySummary(capabilities) {
+  if (capabilities === undefined || capabilities === null) return '—'
+  const labels = {
+    resumeSession: 'resume', loadSession: 'load', listSessions: 'list', closeSession: 'close',
+    steering: 'steering', images: 'images', embeddedContext: 'embedded context',
+    mcpHttp: 'MCP HTTP', mcpSse: 'MCP SSE', mcpAcp: 'MCP ACP', goal: 'goal',
+  }
+  const enabled = Object.entries(labels).filter(([key]) => capabilities[key] === true).map(([, label]) => label)
+  return enabled.length > 0 ? enabled.join(', ') : 'baseline ACP'
+}
+
 function kv(label, value) {
   return React.createElement('div', { className: 'ag-kv' },
     React.createElement('span', { className: 'ag-note' }, label),
@@ -322,6 +333,7 @@ function CreateGroupDialog({ onClose, onCreated }) {
   const [leaders, setLeaders] = React.useState([])
   const [templateId, setTemplateId] = React.useState('')
   const [customCount, setCustomCount] = React.useState(2)
+  const [workspaceMode, setWorkspaceMode] = React.useState('shared')
   const [busy, setBusy] = React.useState(false)
   const [error, setError] = React.useState(null)
   const [templates, setTemplates] = React.useState([])
@@ -362,7 +374,7 @@ function CreateGroupDialog({ onClose, onCreated }) {
       }
       const group = await api('/groups/api/groups', {
         method: 'POST',
-        body: JSON.stringify({ leaderSessionId: leader, name: name.trim(), objective: mission.trim(), templateId: templateId || undefined, members: members.length > 0 ? members : undefined }),
+        body: JSON.stringify({ leaderSessionId: leader, name: name.trim(), objective: mission.trim(), workspaceMode, templateId: templateId || undefined, members: members.length > 0 ? members : undefined }),
       })
       onCreated(group.groupId)
     } catch (cause) {
@@ -400,6 +412,12 @@ function CreateGroupDialog({ onClose, onCreated }) {
         React.createElement('select', { value: templateId, onChange: (e) => setTemplateId(e.target.value), style: { background: 'var(--dsw-alias-bg-layer-2)', color: 'var(--dsw-alias-label-primary)', border: '1px solid var(--dsw-alias-border-l1)', borderRadius: 6, padding: '6px 8px' } },
           React.createElement('option', { value: '' }, 'Custom team'),
           templates.map((t) => React.createElement('option', { key: t.id, value: t.id }, t.name)),
+        ),
+      ),
+      React.createElement('label', null, 'Member workspace',
+        React.createElement('select', { value: workspaceMode, onChange: (e) => setWorkspaceMode(e.target.value), style: { background: 'var(--dsw-alias-bg-layer-2)', color: 'var(--dsw-alias-label-primary)', border: '1px solid var(--dsw-alias-border-l1)', borderRadius: 6, padding: '6px 8px' } },
+          React.createElement('option', { value: 'shared' }, 'Shared group directory'),
+          React.createElement('option', { value: 'worktree' }, 'Isolated Git worktree per member'),
         ),
       ),
       templateId === '' && React.createElement('label', null, 'Custom member count',
@@ -597,7 +615,12 @@ function TasksTab({ snap, onRefresh }) {
               React.createElement('div', null, task.subject),
               React.createElement('div', { className: 'ag-note' }, task.description.slice(0, 90)),
             ),
-            React.createElement('td', null, statusBadge(task.status)),
+            React.createElement('td', null,
+              statusBadge(task.status),
+              Array.isArray(task.attempts) && task.attempts.length > 0 && React.createElement('div', { className: 'ag-note' },
+                `attempt ${task.attempts[task.attempts.length - 1].sequence}: ${task.attempts[task.attempts.length - 1].status}`,
+              ),
+            ),
             React.createElement('td', null, task.ownerId !== undefined ? nameOf(task.ownerId) : '—'),
             React.createElement('td', null,
               task.blockedBy.length === 0 ? '—'
@@ -722,6 +745,7 @@ function TeamTab({ snap, onRefresh }) {
                     kv('Role runtime', member.runtime ?? '—'),
                     kv('Model', member.model ?? '—'),
                     kv('Reasoning', member.reasoningLevel ?? '—'),
+                    member.runtimeSession?.providerCapabilities !== undefined && kv('Capabilities', capabilitySummary(member.runtimeSession.providerCapabilities)),
                     member.runtimeSession !== undefined && kv('Last activity', fmtTime(member.runtimeSession.updatedAt)),
                   ),
                   (member.runtimeQueuedTurns ?? []).length > 0 && React.createElement('div', { className: 'ag-col', style: { marginTop: 8, gap: 4 } },
@@ -745,6 +769,8 @@ function TeamTab({ snap, onRefresh }) {
                         member.runtimeSession.providerSessionId !== undefined ? `providerSession=${member.runtimeSession.providerSessionId}` : null,
                         member.runtimeSession.providerThreadId !== undefined ? `thread=${member.runtimeSession.providerThreadId}` : null,
                         member.runtimeSession.lastTurnId !== undefined ? `lastTurn=${member.runtimeSession.lastTurnId}` : null,
+                        member.runtimeSession.providerCapabilities?.protocolVersion !== undefined ? `ACP v${member.runtimeSession.providerCapabilities.protocolVersion}` : null,
+                        member.runtimeSession.providerCapabilities?.agentName !== undefined ? `agent=${member.runtimeSession.providerCapabilities.agentName}${member.runtimeSession.providerCapabilities.agentVersion ? `@${member.runtimeSession.providerCapabilities.agentVersion}` : ''}` : null,
                       ].filter(Boolean).join(' · ') || '—',
                     ),
                   ),
@@ -1179,7 +1205,9 @@ function RoleCard({ role, leader, runtimes, onPatch, onRemove, onDuplicate }) {
       leader && React.createElement('span', { className: 'ag-badge' }, 'leader'),
       runtime === undefined && React.createElement('span', { className: 'ag-badge err' }, `runtime "${role.runtime}" not registered`),
       unavailable && React.createElement('span', { className: 'ag-badge warn' }, 'Not configured'),
-      runtime !== undefined && runtime.available && React.createElement('span', { className: 'ag-badge ok' }, 'Available'),
+      runtime !== undefined && runtime.available && runtime.readiness?.initialized === true && React.createElement('span', { className: 'ag-badge ok' }, 'ACP initialized'),
+      runtime !== undefined && runtime.available && runtime.readiness?.initialized === false && React.createElement('span', { className: 'ag-badge' }, `Launchable · ${runtime.readiness.executor ?? 'executor'}`),
+      runtime !== undefined && runtime.available && runtime.readiness === undefined && React.createElement('span', { className: 'ag-badge ok' }, 'Available'),
       !leader && React.createElement(Button, { variant: 'ghost', size: 'sm', onClick: () => onDuplicate(role), style: { marginLeft: 'auto' } }, 'Duplicate'),
       !leader && React.createElement(Button, { variant: 'ghost', size: 'sm', onClick: onRemove }, 'Remove'),
     ),

@@ -20,7 +20,7 @@
 
 **DSH Agent Groups** 是一个运行在 [DeepSeek Harness](https://github.com/deepseek-ai/DeepSeek-Harness) 内部的多 Agent 协作工作区。
 
-它关注的是让 Coding Agent 复现在同一个 Group 中拥有持续存在的身份、运行时会话、任务历史和共享工作上下文。Leader 可以把工作派发给 DSH Agent、OpenAI Codex 或 Anthropic Claude，并在后续继续追问、纠正、复用同一个会话，而不是每个任务都重新开始。
+它关注的是让 Coding Agent 在同一个 Group 中拥有持续存在的身份、运行时会话、任务历史和共享工作上下文。Leader 可以把工作派发给 DSH Agent 或任意已配置的 ACP Coding Agent，并在后续继续追问、纠正、复用同一个会话，而不是每个任务都重新开始。
 
 项目通过 DSH / Cordis 的扩展能力接入，不修改或复制 DeepSeek Harness 源码；Agent Groups 直接出现在原生 DSH shell 中，而不是额外打开一套独立 dashboard。
 
@@ -31,8 +31,9 @@ User
 Leader ───────── mission / planning / assignment / verification
   │
   ├── DSH Member    ── persistent DSH session
-  ├── Codex Member  ── persistent Codex thread
-  └── Claude Member ── persistent Claude session
+  ├── Codex Member  ── codex-acp session
+  ├── Claude Member ── claude-agent-acp session
+  └── Gemini Member ── native ACP session
           │
           ▼
  tasks · channel · workspace · notes · artifacts · activity
@@ -64,12 +65,12 @@ Group
 | 能力 | 说明 |
 | --- | --- |
 | **长期队友** | 一个 Group Member 持有自己的 runtime session，可跨多个任务继续同一段 provider conversation。 |
-| **多运行时团队** | 同一团队可以混合 DeepSeek Harness、OpenAI Codex 与 Anthropic Claude。 |
+| **多运行时团队** | 同一团队可以混合 DeepSeek Harness 与 ACP-compatible Codex、Claude、Gemini 或自定义 Agent。 |
 | **Leader 编排** | Leader 负责拆解 mission、创建任务、分派成员、跟进结果、重新打开任务和最终验证。 |
 | **持久化工作区** | Group、mission、task、消息、runtime metadata、notes、artifacts 与 activity 等状态进入持久层。 |
 | **DSH 原生界面** | Agent Groups 入口位于 DSH sidebar，并直接在 DSH shell 中渲染，不使用 iframe 或第二套应用壳。 |
 | **明确的生命周期** | Process、session、turn 和 task 生命周期彼此区分；进程退出不会被静默等同为任务成功。 |
-| **可继续的 Coding Agent** | Codex thread 与 Claude session 可以被后续任务、Leader follow-up 和修正继续复用。 |
+| **可继续的 Coding Agent** | ACP session id 会持久化，并被后续任务、Leader follow-up、修正与 Host 重启继续复用。 |
 | **通信边界** | Leader ↔ Member 私聊允许；Member ↔ Member 私聊在 host service 层被限制，而不是仅依赖 prompt 约束。 |
 | **实时活动流** | Workspace 通过 API 与 SSE 展示任务、运行时和协作状态变化。 |
 
@@ -80,8 +81,9 @@ Group
 | Runtime | Session identity | 持续协作方式 |
 | --- | --- | --- |
 | **DeepSeek Harness** | DSH member session | 原生持久 Member；恢复时保留角色、模型与 reasoning 配置。 |
-| **Codex** | Codex App Server thread | 新任务继续复用同一个 thread；进行中的工作可使用 provider-native steering。 |
-| **Claude** | Claude Agent SDK session id | 后续 turn 使用 `options.resume` 继续同一 Claude conversation。 |
+| **Codex (ACP)** | ACP session → Codex thread | 官方 `codex-acp` adapter 负责 App Server 翻译；Host 只使用协商后的 ACP 能力。 |
+| **Claude (ACP)** | ACP session → Claude SDK session | 官方 `claude-agent-acp` adapter 负责 SDK lifecycle、permissions 与 resume。 |
+| **Gemini (ACP)** | Gemini CLI ACP session | 直接启动 `gemini --acp`，没有 Gemini-specific Host 分支。 |
 
 Runtime 层还负责归一化事件、中断、pending approval / input，以及 provider-specific resume 行为。更严格的生命周期与完成条件见 [Architecture](docs/architecture.md)。
 
@@ -139,11 +141,15 @@ npm run relaunch-web
 
 DSH 重启后，在原本的 Web UI sidebar 底部打开 **Agent Groups** 即可。
 
+可通过 `AGENT_GROUPS_ACP_AGENTS_JSON` 注册自定义 ACP 命令；值为 definition 数组，例如 `[{"id":"opencode","name":"OpenCode","command":"opencode","args":["acp"]}]`。命令使用无 shell 的参数数组启动，`env` 只传给子进程，不进入持久记录或 UI。
+
+也可把 ACP Registry 的 `registry.json` 放入 `AGENT_GROUPS_ACP_REGISTRY_JSON`，并用逗号分隔的 `AGENT_GROUPS_ACP_REGISTRY_AGENTS` 明确允许需要的 agent id。只有 allowlist 中、带固定版本 `npx` distribution 的条目会成为 `acp-registry:<id>` runtime；浏览 Registry 本身不会执行或安装任何 agent。
+
 ## 基本使用流程
 
 1. 启动或选择一个 **Agent Group · Team Lead** session。
 2. 打开 **Agent Groups**，创建新的 Group。
-3. 选择 team template，或手动配置角色和 runtime。
+3. 选择 team template、runtime，以及共享目录或每成员独立 Git worktree。
 4. 输入整个团队要完成的 mission。
 5. Leader 将 mission 拆成任务并分配给不同成员。
 6. 在 Tasks、Team、Channel、Leader Chat、Workspace 和 Activity 中查看执行过程。
@@ -158,9 +164,11 @@ DSH 重启后，在原本的 Web UI sidebar 底部打开 **Agent Groups** 即可
 | --- | --- |
 | [Documentation Index](docs/README.md) | 文档入口与阅读顺序。 |
 | [Architecture](docs/architecture.md) | Domain model、runtime/session lifecycle、completion rules 与 persistence invariants。 |
+| [ACP Rebuild Report](docs/acp-rebuild-report.md) | 实现证据、测试结果、许可边界与剩余限制。 |
 | [Development](docs/development.md) | 本地开发、build/test、CI 与 DSH 集成方式。 |
 | [Native UI](docs/native-ui.md) | DSH client slot、theme 与原生工作区接入。 |
 | [Codex App Server Protocol](docs/CODEX_APP_SERVER_PROTOCOL.md) | Codex persistent runtime transport 的协议记录。 |
+| [Upstream Architecture Study](docs/upstream-architecture-study.md) | ACP、官方 adapters、DSH UI、Symphony、Kandev 的实证版本与复用边界。 |
 
 从仓库根目录运行：
 

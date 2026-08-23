@@ -13,6 +13,8 @@ import type {
   GroupId,
   GroupTask,
   TaskId,
+  TaskAttemptRecord,
+  TaskAttemptStatus,
   TaskKind,
   TaskPriority,
   TaskStatus,
@@ -211,6 +213,80 @@ export class TaskService {
     }
     rows.sort((a, b) => a.createdAt - b.createdAt)
     return rows
+  }
+
+  /** Start one immutable task execution attempt, idempotently by turn id. */
+  async startAttempt(groupId: GroupId, taskId: TaskId, input: {
+    memberId: string
+    turnId: string
+    runtime?: string
+    providerSessionId?: string
+  }): Promise<TaskAttemptRecord> {
+    const current = this.requireTask(groupId, taskId)
+    const existing = current.attempts?.find((attempt) => attempt.turnId === input.turnId)
+    if (existing !== undefined) return existing
+    const started: TaskAttemptRecord = {
+      attemptId: randomUUID(),
+      groupId,
+      taskId,
+      sequence: current.attempt,
+      memberId: input.memberId,
+      runtime: input.runtime,
+      providerSessionId: input.providerSessionId,
+      turnId: input.turnId,
+      status: 'running',
+      startedAt: Date.now(),
+    }
+    const task = await this.mutate(groupId, taskId, undefined, (latest) => {
+      if (latest.attempts?.some((attempt) => attempt.turnId === input.turnId)) return latest
+      return { ...latest, attempts: [...(latest.attempts ?? []), started], updatedAt: Date.now() }
+    })
+    const attempt = task.attempts?.find((item) => item.turnId === input.turnId) ?? started
+    await this.activity.append({
+      groupId,
+      type: 'task_attempt_started',
+      actorId: input.memberId,
+      refTaskId: taskId,
+      refMemberId: input.memberId,
+      payload: { attemptId: attempt.attemptId, sequence: attempt.sequence, turnId: input.turnId, runtime: input.runtime ?? null },
+    })
+    return attempt
+  }
+
+  /** Settle an attempt once; late duplicate terminal events are idempotent. */
+  async settleAttempt(groupId: GroupId, taskId: TaskId, turnId: string, status: Exclude<TaskAttemptStatus, 'running'>, detail?: string): Promise<TaskAttemptRecord | undefined> {
+    const current = this.requireTask(groupId, taskId)
+    const found = current.attempts?.find((attempt) => attempt.turnId === turnId)
+    if (found === undefined) return undefined
+    if (found.status !== 'running') return found
+    const task = await this.mutate(groupId, taskId, undefined, (latest) => ({
+      ...latest,
+      attempts: latest.attempts?.map((attempt) => attempt.turnId === turnId && attempt.status === 'running'
+        ? {
+            ...attempt,
+            status,
+            endedAt: Date.now(),
+            ...(status === 'completed' ? { summary: detail } : { failure: detail }),
+          }
+        : attempt),
+      updatedAt: Date.now(),
+    }))
+    const settled = task.attempts?.find((attempt) => attempt.turnId === turnId)
+    if (settled !== undefined) {
+      const type = status === 'completed' ? 'task_attempt_completed'
+        : status === 'failed' ? 'task_attempt_failed'
+          : status === 'cancelled' ? 'task_attempt_cancelled'
+            : 'task_attempt_lost'
+      await this.activity.append({
+        groupId,
+        type,
+        actorId: settled.memberId,
+        refTaskId: taskId,
+        refMemberId: settled.memberId,
+        payload: { attemptId: settled.attemptId, sequence: settled.sequence, turnId, detail: detail ?? null },
+      })
+    }
+    return settled
   }
 
   // ── transitions ───────────────────────────────────────────────────────────

@@ -9,7 +9,8 @@ import { pathToFileURL } from 'node:url'
 
 const HOME = homedir()
 const ROOT = process.env.DSH_STORAGE_ROOT ?? join(HOME, '.dsh', 'storages')
-const PROFILE_MODULES = join(HOME, '.dsh', 'profiles', 'node_modules')
+const PROFILE_MODULES = process.env.DSH_PROFILE_MODULES ?? join(HOME, '.dsh', 'profiles', 'node_modules')
+const HOST_ROOT = process.env.AGENT_GROUPS_HOST_ROOT ?? join(PROFILE_MODULES, '@dsh-agent-groups', 'host')
 const require = createRequire(pathToFileURL(join(PROFILE_MODULES, 'anchor.js')).href)
 
 const [{ Context }, { default: Storage }, storageJson, storageDomain] = await Promise.all([
@@ -19,7 +20,7 @@ const [{ Context }, { default: Storage }, storageJson, storageDomain] = await Pr
   import(pathToFileURL(require.resolve('@deepseek-ai/dsh-storage-domain')).href),
 ])
 const { AGENT_GROUPS_DOMAIN } = await import(
-  pathToFileURL(join(PROFILE_MODULES, '@dsh-agent-groups', 'host', 'lib', 'persistence.js')).href,
+  pathToFileURL(join(HOST_ROOT, 'lib', 'persistence.js')).href,
 )
 
 async function boot() {
