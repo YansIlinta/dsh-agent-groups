@@ -3,7 +3,6 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "packageManager": "pnpm@11.7.0",
   "description": "DSH Agent Groups — a multi-agent group product layer on top of DeepSeek Harness (independent plugin, zero DSH source modification)",
   "scripts": {
     "build": "npm --prefix packages/host run build && node scripts/build-native-client.mjs",
