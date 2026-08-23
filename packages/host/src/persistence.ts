@@ -73,6 +73,10 @@ const ACTIVITY_TYPES = [
   'runtime_input_required',
   'runtime_approval_answered',
   'runtime_request_answered',
+  'runtime_turn_queued',
+  'runtime_turn_steered',
+  'runtime_steer_failed',
+  'runtime_request_timed_out',
 ] as const
 
 const profileSchema = z.object({
