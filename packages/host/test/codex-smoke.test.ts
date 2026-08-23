@@ -13,12 +13,16 @@ import { join } from 'node:path'
 import { CodexAppServerConnection, CodexBinaryProcessHost } from '../src/runtime/codex-protocol.js'
 
 function which(bin: string): string | null {
-  const path = (process.env.PATH ?? '').split(':')
+  const path = (process.env.PATH ?? '').split(process.platform === 'win32' ? /[;:]/ : ':')
+  const candidates = process.platform === 'win32' ? [`${bin}.exe`, `${bin}.cmd`, bin] : [bin]
   for (const dir of path) {
-    const candidate = join(dir, bin)
-    try {
-      if (existsSync(candidate)) return candidate
-    } catch { /* keep scanning */ }
+    if (dir === '') continue
+    for (const candidate of candidates) {
+      const full = join(dir, candidate)
+      try {
+        if (existsSync(full)) return full
+      } catch { /* keep scanning */ }
+    }
   }
   return null
 }

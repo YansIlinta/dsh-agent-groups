@@ -51,18 +51,27 @@ import {
   type RuntimeTurnHandle,
   type RuntimeTurnInput,
   type RuntimeTurnResult,
+  type SteerOutcome,
 } from './base.js'
 import type { RuntimeEvent, RuntimePendingRequest } from './events.js'
 import { runtimeMessageText, type RuntimeMessage } from './message.js'
 
-/** Minimal PATH lookup (no extra deps). */
+/**
+ * Minimal PATH lookup (no extra deps). Handles Windows PATH separators (';')
+ * and executable extensions so a win32 install (npm shims / WinGet exe) is
+ * found just like a POSIX one.
+ */
 function which(bin: string): string | null {
-  const path = (process.env.PATH ?? '').split(':')
+  const path = (process.env.PATH ?? '').split(process.platform === 'win32' ? /[;:]/ : ':')
+  const candidates = process.platform === 'win32' ? [`${bin}.exe`, `${bin}.cmd`, bin] : [bin]
   for (const dir of path) {
-    const candidate = join(dir, bin)
-    try {
-      if (existsSync(candidate)) return candidate
-    } catch { /* keep scanning */ }
+    if (dir === '') continue
+    for (const candidate of candidates) {
+      const full = join(dir, candidate)
+      try {
+        if (existsSync(full)) return full
+      } catch { /* keep scanning */ }
+    }
   }
   return null
 }
@@ -101,13 +110,18 @@ function strOf(value: unknown): string | undefined {
   return typeof value === 'string' ? value : undefined
 }
 
-/** Approval defaults per role metadata (never stored). */
-function approvalPolicyFor(config: RuntimeAgentConfig): { mode: 'decline' | 'hold' } {
+/**
+ * Approval policy per role metadata (never stored).
+ * - `decline` (default): every unanswered approval request is auto-declined
+ *   after the request deadline so nothing hangs invisibly; there is no
+ *   blanket auto-approve anywhere.
+ * - `hold`: hold for the human/Leader; the request still gets a deadline
+ *   after which the SAFE `cancel` action is executed (explicit event).
+ */
+function approvalPolicyFor(config: RuntimeAgentConfig): { mode: 'decline' | 'hold'; timeoutAction: 'decline' | 'cancel' } {
   const raw = config.metadata?.['approvalPolicy']
-  if (raw === 'hold') return { mode: 'hold' }
-  // Default: answer every approval request with `decline` so nothing hangs
-  // invisibly; no blanket auto-approve exists anywhere.
-  return { mode: 'decline' }
+  if (raw === 'hold') return { mode: 'hold', timeoutAction: 'cancel' }
+  return { mode: 'decline', timeoutAction: 'decline' }
 }
 
 function approvalDescription(method: string, params: Record<string, unknown>): string {
@@ -154,6 +168,26 @@ export interface CodexRuntimeOptions {
   readonly requestTimeoutMs?: number
   /** Model catalog cache TTL (dynamic discovery; default 10 minutes). */
   readonly modelCacheTtlMs?: number
+  /**
+   * V0.6: pending-request deadline. Requests unanswered by the Leader/User
+   * within this window execute their safe default (`decline` for the default
+   * policy, `cancel` for hold mode) and emit `request.timeout` — no provider
+   * request may hang invisibly forever. Default 5 minutes.
+   */
+  readonly requestDeadlineMs?: number
+}
+
+/**
+ * V0.6: typed steer failure. `turn/steer` on the active Codex turn failed and
+ * the Leader instruction was NOT injected into the running turn. GroupHost
+ * handles this by queueing the guidance as the NEXT turn on the same session
+ * (it is never silently dropped) and recording `runtime_steer_failed`.
+ */
+export class CodexSteerError extends CodexProtocolError {
+  constructor(message: string) {
+    super('TURN_STEER_FAILED', message)
+    this.name = 'CodexSteerError'
+  }
 }
 
 export class CodexRuntimeProvider implements AgentRuntimeProvider {
@@ -166,6 +200,8 @@ export class CodexRuntimeProvider implements AgentRuntimeProvider {
   // Non-private: CodexSession (same module) must reach these.
   readonly requestTimeoutMs: number
   readonly modelCacheTtlMs: number
+  /** V0.6: deadline for unanswered provider requests (default 5 minutes). */
+  readonly requestDeadlineMs: number
 
   /** Shared long-running `codex app-server` connection (process pool). */
   connection: CodexAppServerConnection | undefined
@@ -180,11 +216,13 @@ export class CodexRuntimeProvider implements AgentRuntimeProvider {
       this.processHost = undefined
       this.requestTimeoutMs = 60_000
       this.modelCacheTtlMs = 10 * 60 * 1000
+      this.requestDeadlineMs = 5 * 60 * 1000
     } else {
       this.bin = options.binPath ?? which('codex')
       this.processHost = options.processHost
       this.requestTimeoutMs = options.requestTimeoutMs ?? 60_000
       this.modelCacheTtlMs = options.modelCacheTtlMs ?? 10 * 60 * 1000
+      this.requestDeadlineMs = options.requestDeadlineMs ?? 5 * 60 * 1000
     }
   }
 
@@ -296,7 +334,7 @@ export class CodexRuntimeProvider implements AgentRuntimeProvider {
       status: 'starting',
       sendInput: async (text: string) => {
         await session.start()
-        const turn = await session.runTurn({ text })
+        const turn = await session.startTaskTurn({ text })
         lastTurn = turn.waitForCompletion()
         await lastTurn
       },
@@ -508,8 +546,7 @@ class CodexSession implements RuntimeSession {
       turnId,
       unrecoverable: false,
     })
-    this.pendingRequests.clear()
-    this.pendingWireIds.clear()
+    this.clearAllPendingRequests('app server exited')
   }
 
   private failSession(error: unknown): void {
@@ -532,7 +569,7 @@ class CodexSession implements RuntimeSession {
     active.setters.resolve({ status: 'failed', summary: reason, output: active.output.length > 0 ? active.output : undefined })
   }
 
-  async runTurn(input: RuntimeTurnInput): Promise<RuntimeTurnHandle> {
+  async startTaskTurn(input: RuntimeTurnInput): Promise<RuntimeTurnHandle> {
     await this.start()
     if (this.status === 'failed' || this.status === 'closed') {
       throw new Error(`session is not usable (${this.status}); retry the task after resume, or spawn a new member`)
@@ -556,7 +593,10 @@ class CodexSession implements RuntimeSession {
     this.activeTurn = active
     this.lastTurnId = turnId
     if (taskId !== undefined) this.lastTaskId = taskId
-    this.status = 'running'
+    // V0.6: the per-turn changed-file collection belongs to THIS turn only —
+    // cleared at turn start, read at completion, never cleared before read.
+    this.changedFiles.clear()
+    this.status = 'working'
     this.emit({ type: 'turn.started', turnId, taskId, memberId: this.memberId, timestamp: Date.now() })
 
     const completion = new Promise<RuntimeTurnResult>((resolve, reject) => {
@@ -594,14 +634,19 @@ class CodexSession implements RuntimeSession {
     return handle
   }
 
-  async sendFollowup(input: RuntimeTurnInput): Promise<void> {
+  /**
+   * V0.6: steering for the ACTIVE turn (`turn/steer`, same thread + expected
+   * turn). A failed steer THROWS a typed {@link CodexSteerError} — the host
+   * records it as a queued next-turn follow-up, so Leader input is never
+   * silently dropped. Idle sessions start a fresh follow-up turn instead.
+   */
+  async steerActiveTurn(input: RuntimeTurnInput): Promise<SteerOutcome> {
     await this.start()
     if (this.threadId === undefined) throw new Error('session has no thread id')
     const connection = await this.ensureLiveConnection()
 
     const active = this.activeTurn
     if (active !== undefined && active.wireTurnId !== undefined) {
-      // Steer the running turn: same thread, same turn, context preserved.
       try {
         await connection.request('turn/steer', {
           threadId: this.threadId,
@@ -609,14 +654,75 @@ class CodexSession implements RuntimeSession {
           clientUserMessageId: `steer-${Date.now()}`,
           input: [{ type: 'text', text: input.text, text_elements: [] }],
         }, this.provider.requestTimeoutMs ?? 60_000)
-        return
+        this.emit({ type: 'turn.steered', turnId: active.turnId, taskId: active.taskId, memberId: this.memberId, timestamp: Date.now() })
+        return { steered: true }
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error)
         this.emit({ type: 'provider.error', memberId: this.memberId, timestamp: Date.now(), code: 'TURN_STEER_FAILED', message: reason })
-        return // the turn itself stays live; the leader sees the failure event
+        // The running turn stays live; the Leader input becomes the NEXT turn
+        // on the SAME session (never dropped). The typed failure lets the host
+        // record `runtime_steer_failed` instead of believing delivery happened.
+        this.emit({
+          type: 'turn.queued',
+          memberId: this.memberId,
+          timestamp: Date.now(),
+          kind: 'followup',
+          text: input.text,
+          taskId: input.taskId,
+          behindTurnId: active.turnId,
+        })
+        throw new CodexSteerError(reason)
       }
     }
-    await this.runTurn({ ...input, turnKind: 'followup' })
+    if (active !== undefined) {
+      // Active but the provider never returned a wire turn id — cannot steer;
+      // queue as the next turn on the same session (typed failure, never drop).
+      this.emit({
+        type: 'turn.queued',
+        memberId: this.memberId,
+        timestamp: Date.now(),
+        kind: 'followup',
+        text: input.text,
+        taskId: input.taskId,
+        behindTurnId: active.turnId,
+      })
+      throw new CodexSteerError(`active turn ${active.turnId} has no provider turn id to steer`)
+    }
+    await this.startTaskTurn({ ...input, turnKind: 'followup' })
+    return { steered: true }
+  }
+
+  /**
+   * V0.6: queue a NEW TASK as a future turn. The provider records the intent
+   * (normalized `turn.queued` event); the HOST's authoritative queue holds it
+   * and starts it after the active turn reaches a terminal state. The active
+   * turn's task binding is NEVER modified.
+   */
+  async queueTaskTurn(input: RuntimeTurnInput): Promise<void> {
+    await this.start()
+    this.emit({
+      type: 'turn.queued',
+      memberId: this.memberId,
+      timestamp: Date.now(),
+      kind: 'task',
+      text: input.text,
+      taskId: input.taskId,
+      behindTurnId: this.activeTurn?.turnId,
+    })
+  }
+
+  /** V0.6: queue next-turn guidance on the same session (never a new agent). */
+  async queueFollowup(input: RuntimeTurnInput): Promise<void> {
+    await this.start()
+    this.emit({
+      type: 'turn.queued',
+      memberId: this.memberId,
+      timestamp: Date.now(),
+      kind: 'followup',
+      text: input.text,
+      taskId: input.taskId,
+      behindTurnId: this.activeTurn?.turnId,
+    })
   }
 
   async interrupt(reason?: string): Promise<void> {
@@ -653,9 +759,8 @@ class CodexSession implements RuntimeSession {
     const wireId = this.pendingWireIds.get(requestId) ?? requestId
     const ok = connection.respondToServerRequest(wireId, response)
     if (ok) {
-      this.pendingRequests.delete(requestId)
-      this.pendingWireIds.delete(requestId)
-      if (this.status === 'waiting_input') this.status = 'running'
+      this.clearPendingRequest(requestId)
+      if (this.status === 'waiting_input' || this.status === 'needs_approval') this.status = 'working'
     }
     return ok
   }
@@ -794,6 +899,11 @@ class CodexSession implements RuntimeSession {
   private async ensureLiveConnection(): Promise<CodexAppServerConnection> {
     let connection = this.provider.connection
     if (connection === undefined) {
+      // Transient transport state: the SAME durable thread is being re-attached.
+      if (this.status === 'disconnected' || this.status === 'reconnecting') {
+        this.status = 'reconnecting'
+        this.emit({ type: 'session.reconnecting', memberId: this.memberId, timestamp: Date.now(), reason: 're-attaching the same Codex thread' })
+      }
       connection = await this.provider.ensureConnection()
       this.attachTo(connection)
       if (this.threadId !== undefined) {
@@ -838,7 +948,6 @@ class CodexSession implements RuntimeSession {
     // A turn/completed for an OLD turn must never settle a newer turn.
     if (wireId !== undefined && active.wireTurnId !== undefined && wireId !== active.wireTurnId && wireId !== active.turnId) return
     const status = strOf(turn?.status)
-    this.changedFiles.clear()
 
     if (status === 'failed') {
       const error = isRecord(turn?.error) ? turn.error : undefined
@@ -858,8 +967,11 @@ class CodexSession implements RuntimeSession {
     }
     if (status !== 'completed') return // in-progress or unknown: not terminal
 
-    const summary = (this.summaryOf(turn) ?? active.output.trim().slice(-4000)) || undefined
+    // V0.6 regression fix: the per-turn changed-file collection is read HERE
+    // (it was cleared before being read, so completed turns always reported an
+    // empty list). It is reset at the NEXT turn start.
     const files = [...this.changedFiles.values()].map((f) => f.path)
+    const summary = (this.summaryOf(turn) ?? active.output.trim().slice(-4000)) || undefined
     const result: RuntimeTurnResult = {
       status: 'completed',
       summary,
@@ -901,10 +1013,15 @@ class CodexSession implements RuntimeSession {
         params: redact(params),
         timestamp,
         allowedActions: ['answer'],
+        // V0.6: user-input requests also expire — unanswered input is
+        // cancelled safely so nothing parks forever.
+        deadline: timestamp + this.provider.requestDeadlineMs,
+        timeoutAction: 'cancel',
       }
       this.pendingRequests.set(request.requestId, request)
       this.pendingWireIds.set(request.requestId, id)
       this.status = 'waiting_input'
+      this.scheduleRequestDeadline(request)
       this.emit({ type: 'turn.input.required', turnId, memberId: this.memberId, timestamp, request })
       return
     }
@@ -929,10 +1046,75 @@ class CodexSession implements RuntimeSession {
         timestamp,
         defaultAction: policy.mode === 'decline' ? 'decline' : undefined,
         allowedActions: ['accept', 'acceptForSession', 'decline', 'cancel'],
+        // V0.6: a real deadline — unanswered requests execute their safe
+        // default instead of parking forever (see scheduleRequestDeadline).
+        deadline: timestamp + this.provider.requestDeadlineMs,
+        timeoutAction: policy.timeoutAction,
       }
       this.pendingRequests.set(request.requestId, request)
       this.pendingWireIds.set(request.requestId, id)
+      this.status = 'needs_approval'
+      this.scheduleRequestDeadline(request)
       this.emit({ type: 'turn.approval.required', turnId, memberId: this.memberId, timestamp, request })
+    }
+  }
+
+  // ── V0.6: pending-request lifecycle (nothing hangs invisibly forever) ─────
+
+  private readonly requestTimers = new Map<string, NodeJS.Timeout>()
+
+  /**
+   * Every pending request gets a deadline. When it passes unanswered, the
+   * provider EXECUTES the safe policy action (`decline` for the default
+   * policy, `cancel` for hold mode — never an approval) and emits an explicit
+   * `request.timeout` event so the Host can persist and surface it.
+   */
+  private scheduleRequestDeadline(request: RuntimePendingRequest): void {
+    if (request.deadline === undefined) return
+    const remaining = Math.max(request.deadline - Date.now(), 0)
+    const timer = setTimeout(() => {
+      this.requestTimers.delete(request.requestId)
+      if (!this.pendingRequests.has(request.requestId)) return // answered already
+      const action = request.timeoutAction ?? request.defaultAction ?? 'cancel'
+      const connection = this.provider.connection
+      let delivered = false
+      if (connection !== undefined) {
+        const wireId = this.pendingWireIds.get(request.requestId) ?? request.requestId
+        delivered = connection.respondToServerRequest(wireId, { decision: action })
+      }
+      this.clearPendingRequest(request.requestId)
+      if (this.status === 'waiting_input' || this.status === 'needs_approval') this.status = 'working'
+      this.emit({
+        type: 'request.timeout',
+        memberId: this.memberId,
+        timestamp: Date.now(),
+        requestId: request.requestId,
+        requestKind: request.requestKind,
+        turnId: request.turnId,
+        taskId: request.taskId,
+        action,
+        delivered,
+      })
+    }, remaining)
+    // Unref so pending approvals never keep the host process alive.
+    timer.unref()
+    this.requestTimers.set(request.requestId, timer)
+  }
+
+  private clearPendingRequest(requestId: string): void {
+    this.pendingRequests.delete(requestId)
+    this.pendingWireIds.delete(requestId)
+    const timer = this.requestTimers.get(requestId)
+    if (timer !== undefined) {
+      clearTimeout(timer)
+      this.requestTimers.delete(requestId)
+    }
+  }
+
+  private clearAllPendingRequests(reason: string): void {
+    void reason
+    for (const requestId of [...this.pendingRequests.keys()]) {
+      this.clearPendingRequest(requestId)
     }
   }
 

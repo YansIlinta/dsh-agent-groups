@@ -18,6 +18,8 @@ import { RuntimeRegistry } from '../src/runtime/registry.js'
 import { makeStores, makeHarness, type Stores } from './helpers.js'
 import type { AgentHandle, AgentRegistry } from '@deepseek-ai/dsh-agent'
 
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
 // ── fakes for the real adapter ──────────────────────────────────────────────
 
 interface CreateCall {
@@ -36,15 +38,19 @@ interface ResumeCall {
 class FakeAgentRegistry {
   created: CreateCall[] = []
   resumed: ResumeCall[] = []
-  live = new Map<string, { status: 'idle' | 'running'; followup(): void; inject(): void; cancel(): void }>()
+  live = new Map<string, { status: 'idle' | 'running'; followup(): void; inject(): void; steer(): void; cancel(): void }>()
   /** DSH sessions are durable: resume only works for previously-created ids. */
   readonly persisted = new Set<string>()
   resumeThrows = false
+  /** V0.6: recorded agent.followup() deliveries (in order). */
+  readonly followupCalls: string[] = []
+  /** V0.6: recorded agent.steer() calls (in order). */
+  readonly steerCalls: string[] = []
 
   async create(options: CreateCall): Promise<AgentHandle> {
     this.created.push(options)
     this.persisted.add(String(options.sessionId))
-    const agent = { status: 'idle' as const, followup: () => undefined, inject: () => undefined, cancel: () => undefined }
+    const agent = this.makeAgent(String(options.sessionId))
     this.live.set(String(options.sessionId), agent)
     return { agent: agent as never, dispose: async () => { this.live.delete(String(options.sessionId)) } }
   }
@@ -54,13 +60,33 @@ class FakeAgentRegistry {
     if (this.resumeThrows || !this.persisted.has(String(options.resumeSessionId))) {
       throw new Error('no persisted session')
     }
-    const agent = { status: 'idle' as const, followup: () => undefined, inject: () => undefined, cancel: () => undefined }
+    const agent = this.makeAgent(String(options.resumeSessionId))
     this.live.set(String(options.resumeSessionId), agent)
     return { agent: agent as never, dispose: async () => { this.live.delete(String(options.resumeSessionId)) } }
   }
 
-  get(sessionId: unknown): { status: 'idle' | 'running'; followup(): void; inject(): void; cancel(): void } | undefined {
+  private makeAgent(sessionId: string): { status: 'idle' | 'running'; followup(): void; inject(): void; steer(): void; cancel(): void } {
+    return {
+      status: 'idle' as const,
+      followup: () => this.recordFollowup(sessionId),
+      inject: () => undefined,
+      steer: () => this.recordSteer(sessionId),
+      cancel: () => undefined,
+    }
+  }
+
+  get(sessionId: unknown): { status: 'idle' | 'running'; followup(): void; inject(): void; steer(): void; cancel(): void } | undefined {
     return this.live.get(String(sessionId))
+  }
+
+  /** V0.6: record a followup delivery (used by DshMemberSession.startTaskTurn). */
+  recordFollowup(sessionId: string): void {
+    this.followupCalls.push(sessionId)
+  }
+
+  /** V0.6: record a steer (used by DshMemberSession.steerActiveTurn). */
+  recordSteer(sessionId: string): void {
+    this.steerCalls.push(sessionId)
   }
 }
 
@@ -185,5 +211,73 @@ describe('V0.5: DSH member resume configuration drift (regression)', () => {
     const adapter = makeAdapter(agents)
     await adapter.createMemberAgent({ sessionId: 'm-9', parentId: 'p' })
     expect(agents.created[0]!.agentOptions).toEqual({ provider: 'provider-z', model: 'model-z' })
+  })
+})
+
+describe('V0.6: DSH native steering + queued future turns', () => {
+  it('adapter: a correction uses agent.steer() (native DSH steering, never a followup)', async () => {
+    const agents = new FakeAgentRegistry()
+    const adapter = makeAdapter(agents)
+    await adapter.createMemberAgent({ sessionId: 'm-1', parentId: 'p' })
+    const steered = adapter.steer('m-1', [{ type: 'text', text: 'fix only the race' }], { kind: 'user' })
+    expect(steered).toBe(true)
+    expect(agents.steerCalls).toEqual(['m-1'])
+    expect(agents.followupCalls).toEqual([])
+    // a non-live agent cannot be steered — the caller queues instead
+    expect(adapter.steer('ghost', [{ type: 'text', text: 'x' }], { kind: 'user' })).toBe(false)
+  })
+
+  it('product: Task B while Task A runs is QUEUED and starts only after the claim (same DSH agent)', async () => {
+    const stores = makeStores()
+    const agents = new FakeAgentRegistry()
+    const adapter = makeAdapter(agents)
+    const provider = new DeepSeekHarnessRuntimeProvider(adapter as unknown as AgentRuntimeAdapter, { currentSelection: () => GLOBAL_DEFAULT })
+    const registry = new RuntimeRegistry()
+    registry.register(provider)
+    const h = makeHarness(stores)
+    const host = new GroupHost({
+      groups: h.groups, tasks: h.tasks, channel: h.channel, privateMessages: h.privateMessages,
+      activity: h.activity, profiles: h.profiles, notifier: h.notifier,
+      adapter: adapter as unknown as AgentRuntimeAdapter, leaders: h.leaders, runtimes: registry,
+    })
+    const group = await host.initGroup('lead-1', { name: 'T', objective: 'demo', acceptanceCriteria: ['x'] })
+    await host.updateTeamConfig(group.groupId, {
+      leaderRole: { id: 'leader', name: 'Leader', runtime: 'deepseek-harness' },
+      memberRoles: [{ id: 'implementation', name: 'Implementation', runtime: 'deepseek-harness', maxInstances: 1 }],
+    }, 'User')
+    const member = await host.spawnByRole('lead-1', { role: 'implementation' })
+    const memberId = member.sessionId
+
+    // task A → delivered to the member (waking turn)
+    const taskA = await host.createTask('lead-1', { subject: 'a', description: 'a', kind: 'implementation', acceptanceCriteria: ['x'] })
+    await host.assignTask('lead-1', { taskId: taskA.taskId, ownerId: memberId })
+    await sleep(5)
+    expect(agents.followupCalls).toEqual([memberId]) // one delivery for A
+
+    // a Leader correction while busy → NATIVE STEER, not a followup
+    await host.messageMember('lead-1', { memberSessionId: memberId, text: 'fix only the race' })
+    await sleep(5)
+    expect(agents.steerCalls).toEqual([memberId])
+    expect(agents.followupCalls).toEqual([memberId])
+
+    // task B while busy → QUEUED (no delivery yet, no retarget)
+    const taskB = await host.createTask('lead-1', { subject: 'b', description: 'b', kind: 'implementation', acceptanceCriteria: ['x'] })
+    await host.assignTask('lead-1', { taskId: taskB.taskId, ownerId: memberId })
+    await sleep(5)
+    expect(agents.followupCalls).toEqual([memberId]) // B NOT delivered yet
+    const snap = host.snapshot(group.groupId, { dshVersion: 'test', checks: [], fatal: [] })
+    expect(snap.members.find((m) => m.sessionId === memberId)!.runtimeQueuedTurns).toHaveLength(1)
+    expect(snap.members.find((m) => m.sessionId === memberId)!.runtimeQueuedTurns![0]!.taskId).toBe(taskB.taskId)
+
+    // the member claims A → the queue drains onto the SAME DSH agent
+    await host.completeTask(memberId, { taskId: taskA.taskId, summary: 'a done', artifacts: [], completionClaim: true })
+    await sleep(10)
+    expect(agents.followupCalls).toEqual([memberId, memberId]) // A then B, one agent
+    expect(host.tasks.listTasks(group.groupId).find((t) => t.taskId === taskA.taskId)!.status).toBe('review')
+    // task A was settled by A's claim; B's claim settles B only
+    await host.completeTask(memberId, { taskId: taskB.taskId, summary: 'b done', artifacts: [], completionClaim: true })
+    await sleep(10)
+    expect(host.tasks.listTasks(group.groupId).find((t) => t.taskId === taskB.taskId)!.status).toBe('review')
+    expect(host.tasks.listTasks(group.groupId).find((t) => t.taskId === taskA.taskId)!.result?.summary).toBe('a done')
   })
 })

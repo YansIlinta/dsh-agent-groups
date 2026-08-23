@@ -60,6 +60,12 @@ export interface AgentRuntimeAdapter {
   ensureAgent(sessionId: string, spec: MemberCreateSpec): Promise<LiveAgent | undefined>
   /** Deliver a waking turn (used for DMs and task assignments). */
   deliver(sessionId: string, content: ContentBlock[], source: MessageSource): Promise<boolean>
+  /**
+   * V0.6: native DSH steering — `agent.steer()` submits next-step steering for
+   * the member's CURRENT work (wakes if idle). Returns false when the agent is
+   * not live (the caller then falls back to a queued next turn).
+   */
+  steer(sessionId: string, content: ContentBlock[], source: MessageSource): boolean
   /** Inject non-waking context for the next step (used for notices). */
   inject(sessionId: string, content: ContentBlock[], source: MessageSource): void
   /** Interrupt a member's current turn. */
@@ -80,6 +86,7 @@ export function createNoopAdapter(): AgentRuntimeAdapter {
     async ensureLive() { return undefined },
     async ensureAgent() { return undefined },
     async deliver() { return false },
+    steer() { return false },
     inject() {},
     interrupt() { return false },
     async disposeMember() {},
@@ -219,6 +226,14 @@ export class DshAgentRuntimeAdapter implements AgentRuntimeAdapter {
     const live = await this.ensureLive(sessionId)
     if (live === undefined) return false
     live.agent.followup(createUserMessage({ content, source }))
+    return true
+  }
+
+  /** V0.6: native DSH steering — next-step guidance into the current work. */
+  steer(sessionId: string, content: ContentBlock[], source: MessageSource): boolean {
+    const live = this.liveAgent(sessionId)
+    if (live === undefined) return false
+    live.agent.steer(createUserMessage({ content, source }))
     return true
   }
 

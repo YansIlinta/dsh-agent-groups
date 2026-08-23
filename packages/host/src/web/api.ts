@@ -261,6 +261,48 @@ export async function handleApi(
     return
   }
 
+  // ── V0.6: user console runtime actions (correction / interrupt) ───────────
+
+  if (rest.length === 5 && rest[0] === 'groups' && rest[2] === 'members' && rest[4] === 'correction' && method === 'POST') {
+    const body = (await readJsonBody(req)) ?? {}
+    const text = typeof body.text === 'string' ? body.text.trim() : ''
+    if (text === '') {
+      sendJson(res, 400, { error: 'text required' })
+      return
+    }
+    sendJson(res, 200, { ok: await host.userSendCorrection(rest[1]!, rest[3]!, text) })
+    return
+  }
+
+  if (rest.length === 5 && rest[0] === 'groups' && rest[2] === 'members' && rest[4] === 'interrupt' && method === 'POST') {
+    const body = (await readJsonBody(req)) ?? {}
+    const reason = typeof body.reason === 'string' && body.reason.trim() !== '' ? body.reason.trim() : 'interrupted from the Agent Groups page'
+    sendJson(res, 200, { ok: await host.userInterruptMember(rest[1]!, rest[3]!, reason) })
+    return
+  }
+
+  // ── V0.6: user console task creation + assignment ─────────────────────────
+
+  if (rest.length === 3 && rest[0] === 'groups' && rest[2] === 'tasks' && method === 'POST') {
+    const body = (await readJsonBody(req)) ?? {}
+    const task = await host.userCreateTask(rest[1]!, {
+      subject: stringOf(body.subject, 'subject'),
+      description: optionalString(body.description),
+      kind: optionalString(body.kind) as 'planning' | 'research' | 'implementation' | 'review' | 'verification' | 'other' | undefined,
+      acceptanceCriteria: listOf(body.acceptanceCriteria),
+      priority: optionalString(body.priority) as 'low' | 'normal' | 'high' | 'critical' | 'urgent' | undefined,
+      ownerId: optionalString(body.ownerId),
+    })
+    sendJson(res, 200, task)
+    return
+  }
+
+  if (rest.length === 5 && rest[0] === 'groups' && rest[2] === 'tasks' && rest[4] === 'assign' && method === 'POST') {
+    const body = (await readJsonBody(req)) ?? {}
+    sendJson(res, 200, await host.userAssignTask(rest[1]!, rest[3]!, stringOf(body.ownerId, 'ownerId')))
+    return
+  }
+
   // ── members ───────────────────────────────────────────────────────────────
 
   if (rest.length === 3 && rest[0] === 'groups' && rest[2] === 'members' && method === 'POST') {

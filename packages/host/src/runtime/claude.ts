@@ -34,18 +34,22 @@ import { existsSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { SDKMessage } from '@anthropic-ai/claude-agent-sdk'
-import { DEFAULT_REASONING_LEVELS, type AgentRuntimeProvider, type ModelDescriptor, type ReasoningOption, type RuntimeAgentConfig, type RuntimeAgentHandle, type RuntimeCapabilities, type RuntimeSession, type RuntimeSessionInfo, type RuntimeSessionStatus, type RuntimeTurnHandle, type RuntimeTurnInput, type RuntimeTurnResult } from './base.js'
+import { DEFAULT_REASONING_LEVELS, type AgentRuntimeProvider, type ModelDescriptor, type ReasoningOption, type RuntimeAgentConfig, type RuntimeAgentHandle, type RuntimeCapabilities, type RuntimeSession, type RuntimeSessionInfo, type RuntimeSessionStatus, type RuntimeTurnHandle, type RuntimeTurnInput, type RuntimeTurnResult, type SteerOutcome } from './base.js'
 import type { RuntimeEvent, RuntimePendingRequest } from './events.js'
 import { runtimeMessageText, type RuntimeMessage } from './message.js'
 
-/** Minimal PATH lookup (no extra deps). */
+/** Minimal PATH lookup (no extra deps). Handles Windows PATH separators. */
 function which(bin: string): string | null {
-  const path = (process.env.PATH ?? '').split(':')
+  const path = (process.env.PATH ?? '').split(process.platform === 'win32' ? /[;:]/ : ':')
+  const candidates = process.platform === 'win32' ? [`${bin}.exe`, `${bin}.cmd`, bin] : [bin]
   for (const dir of path) {
-    const candidate = join(dir, bin)
-    try {
-      if (existsSync(candidate)) return candidate
-    } catch { /* keep scanning */ }
+    if (dir === '') continue
+    for (const candidate of candidates) {
+      const full = join(dir, candidate)
+      try {
+        if (existsSync(full)) return full
+      } catch { /* keep scanning */ }
+    }
   }
   return null
 }
@@ -195,23 +199,50 @@ export class ClaudeRuntimeProvider implements AgentRuntimeProvider {
     return CAPABILITIES
   }
 
-  /** Dynamic model discovery through the SDK's supportedModels() when a
-   * session is live; otherwise the clearly-marked fallback catalog. */
+  /**
+   * Dynamic model discovery through the SDK's `query().supportedModels()` when
+   * credentials + the SDK are available; the clearly-marked fallback catalog
+   * is used ONLY when discovery genuinely fails or cannot run.
+   */
   async listModels(): Promise<readonly ModelDescriptor[]> {
     if (this.modelsCache !== undefined && Date.now() - this.modelsCache.at < (this.modelCacheTtlMs ?? 10 * 60 * 1000)) {
       return this.modelsCache.models
     }
-    // SDK model discovery requires a live CLI session; without credentials we
-    // cannot probe — fall back (clearly marked).
+    // SDK model discovery requires credentials and the installed SDK/binary.
     if (!this.hasCredentials() || this.bin === null) {
       this.discoveryFailed = true
       return CLAUDE_FALLBACK_MODELS
     }
-    // A real discovery pass would run one throwaway `query` and call
-    // query.supportedModels(); that spawns a CLI. When credentials exist but
-    // the probe fails we never block configuration: fall back loudly.
-    this.discoveryFailed = true
-    return CLAUDE_FALLBACK_MODELS
+    try {
+      const query = await this.queryFactory({ prompt: '', options: { cwd: process.cwd() } })
+      const probe = query as unknown as {
+        supportedModels?: () => Promise<Array<Record<string, unknown>>>
+        return?: () => Promise<unknown>
+      }
+      if (typeof probe.supportedModels !== 'function') {
+        throw new Error('the installed Claude Agent SDK exposes no supportedModels()')
+      }
+      const models = await probe.supportedModels()
+      void probe.return?.().catch(() => undefined) // close the probe query
+      const descriptors: ModelDescriptor[] = models
+        .filter((entry): entry is Record<string, unknown> => isRecord(entry) && typeof strOf(entry.value) === 'string')
+        .map((entry) => ({
+          id: String(entry.value),
+          name: strOf(entry.displayName) ?? strOf(entry.resolvedModel) ?? String(entry.value),
+          reasoningLevels: Array.isArray(entry.supportedEffortLevels)
+            ? (entry.supportedEffortLevels as unknown[]).map(String).filter((level): level is string => level === 'low' || level === 'medium' || level === 'high' || level === 'xhigh' || level === 'max')
+            : undefined,
+        }))
+      if (descriptors.length === 0) throw new Error('supportedModels() returned an empty catalog')
+      this.discoveryFailed = false
+      this.modelsCache = { at: Date.now(), models: descriptors }
+      return descriptors
+    } catch {
+      // Discovery failure must NEVER block configuration — clearly-marked
+      // fallback catalog (documented fallback).
+      this.discoveryFailed = true
+      return CLAUDE_FALLBACK_MODELS
+    }
   }
 
   isUsingFallbackCatalog = (): boolean => this.discoveryFailed === true
@@ -243,7 +274,7 @@ export class ClaudeRuntimeProvider implements AgentRuntimeProvider {
       status: 'starting',
       sendInput: async (text: string) => {
         await session.start()
-        const turn = await session.runTurn({ text })
+        const turn = await session.startTaskTurn({ text })
         lastTurn = turn.waitForCompletion()
         await lastTurn
       },
@@ -377,7 +408,7 @@ class ClaudeSession implements RuntimeSession {
     }
   }
 
-  async runTurn(input: RuntimeTurnInput): Promise<RuntimeTurnHandle> {
+  async startTaskTurn(input: RuntimeTurnInput): Promise<RuntimeTurnHandle> {
     await this.start()
     if (this.status === 'failed' || this.status === 'closed') {
       throw new Error(`session is not usable (${this.status}); retry the task after resume, or spawn a new member`)
@@ -387,7 +418,6 @@ class ClaudeSession implements RuntimeSession {
     }
 
     const turnId = input.metadata?.turnId !== undefined ? String(input.metadata.turnId) : `claude-turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-    // Installed SDKs below this version cannot be queried; fail loudly.
     const taskId = input.taskId
     const active: ClaudeActiveTurn = {
       turnId,
@@ -399,7 +429,7 @@ class ClaudeSession implements RuntimeSession {
     this.activeTurn = active
     this.lastTurnId = turnId
     if (taskId !== undefined) this.lastTaskId = taskId
-    this.status = 'running'
+    this.status = 'working'
     this.emit({ type: 'turn.started', turnId, taskId, memberId: this.memberId, timestamp: Date.now() })
 
     const completion = new Promise<RuntimeTurnResult>((resolve, reject) => {
@@ -436,7 +466,14 @@ class ClaudeSession implements RuntimeSession {
           }
           if (message.type === 'result') {
             const sid = messageSessionId(message)
-            if (sid !== undefined && sid !== this.sessionId) {
+            if (sid !== undefined && this.sessionId !== undefined && sid !== this.sessionId) {
+              // V0.6: a resumed query that returns a DIFFERENT session id means
+              // the provider silently forked into a fresh conversation. Never
+              // present a new conversation as the same member — fail LOUDLY.
+              this.sessionForked(active, sid, output)
+              return
+            }
+            if (sid !== undefined) {
               this.sessionId = sid // durable — the SAME session continues on resume
             }
             const m = message as Record<string, unknown>
@@ -469,18 +506,79 @@ class ClaudeSession implements RuntimeSession {
     return handle
   }
 
-  async sendFollowup(input: RuntimeTurnInput): Promise<void> {
-    // Claude sessions are single-query-at-a-time; a follow-up while a turn is
-    // active is queued BESIDE the session and delivered as the NEXT turn on
-    // the same session (never a brand-new agent).
+  /**
+   * V0.6: steering for the active turn. The Claude Agent SDK cannot steer an
+   * already-running query in real time — that provider limitation is
+   * represented TRUTHFULLY: the guidance is queued as the NEXT turn on the
+   * SAME session (normalized `turn.queued` event; the Host records it and
+   * drains it after the active turn reaches a terminal state). It is never
+   * pretended to be injected into the running query.
+   */
+  async steerActiveTurn(input: RuntimeTurnInput): Promise<SteerOutcome> {
     if (this.activeTurn !== undefined) {
-      this.queuedFollowups.push(input)
-      return
+      this.emit({
+        type: 'turn.queued',
+        memberId: this.memberId,
+        timestamp: Date.now(),
+        kind: 'followup',
+        text: input.text,
+        taskId: input.taskId,
+        behindTurnId: this.activeTurn.turnId,
+      })
+      return { queued: true }
     }
-    await this.runTurn({ ...input, turnKind: 'followup' })
+    await this.startTaskTurn({ ...input, turnKind: 'followup' })
+    return { steered: true }
   }
 
-  private readonly queuedFollowups: RuntimeTurnInput[] = []
+  /**
+   * V0.6: queue a NEW TASK as a future turn on the same session. The Host's
+   * authoritative queue holds it and starts it after the active turn reaches a
+   * terminal state (never a second concurrent query — the SDK is
+   * single-query-at-a-time).
+   */
+  async queueTaskTurn(input: RuntimeTurnInput): Promise<void> {
+    await this.start()
+    this.emit({
+      type: 'turn.queued',
+      memberId: this.memberId,
+      timestamp: Date.now(),
+      kind: 'task',
+      text: input.text,
+      taskId: input.taskId,
+      behindTurnId: this.activeTurn?.turnId,
+    })
+  }
+
+  /** V0.6: queue next-turn guidance on the same session (never a new agent). */
+  async queueFollowup(input: RuntimeTurnInput): Promise<void> {
+    await this.start()
+    this.emit({
+      type: 'turn.queued',
+      memberId: this.memberId,
+      timestamp: Date.now(),
+      kind: 'followup',
+      text: input.text,
+      taskId: input.taskId,
+      behindTurnId: this.activeTurn?.turnId,
+    })
+  }
+
+  /**
+   * V0.6: a resumed query silently forked into a different conversation —
+   * fail the turn AND the session explicitly; never present the new
+   * conversation as the same member.
+   */
+  private sessionForked(active: ClaudeActiveTurn, foreignSessionId: string, output: string): void {
+    if (this.activeTurn !== active) return
+    const reason = `Claude resumed session ${this.sessionId} but the query returned a different session id (${foreignSessionId}) — conversation continuity was lost; refusing to silently fork into a fresh conversation`
+    this.activeTurn = undefined
+    this.status = 'failed'
+    this.emit({ type: 'turn.failed', turnId: active.turnId, taskId: active.taskId, memberId: this.memberId, timestamp: Date.now(), reason })
+    active.setters.resolve({ status: 'failed', summary: reason, output: output.length > 0 ? output : undefined })
+    this.emit({ type: 'session.disconnected', memberId: this.memberId, timestamp: Date.now(), reason, unrecoverable: true })
+    this.emit({ type: 'session.failed', memberId: this.memberId, timestamp: Date.now(), reason })
+  }
 
   private finishTurn(active: ClaudeActiveTurn, result: RuntimeTurnResult): void {
     if (this.activeTurn !== active) return // late settle from an old turn
@@ -496,7 +594,6 @@ class ClaudeSession implements RuntimeSession {
       reason: result.status === 'failed' ? result.summary : undefined,
     })
     active.setters.resolve(result)
-    this.drainQueue()
   }
 
   private failTurn(active: ClaudeActiveTurn, reason: string): void {
@@ -505,14 +602,6 @@ class ClaudeSession implements RuntimeSession {
     this.status = 'idle'
     this.emit({ type: 'turn.failed', turnId: active.turnId, taskId: active.taskId, memberId: this.memberId, timestamp: Date.now(), reason })
     active.setters.resolve({ status: 'failed', summary: reason })
-    this.drainQueue()
-  }
-
-  private drainQueue(): void {
-    const next = this.queuedFollowups.shift()
-    if (next !== undefined) {
-      void this.runTurn({ ...next, turnKind: 'followup' }).catch(() => undefined)
-    }
   }
 
   async interrupt(reason?: string): Promise<void> {

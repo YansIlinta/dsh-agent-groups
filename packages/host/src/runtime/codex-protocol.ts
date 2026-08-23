@@ -72,19 +72,27 @@ export class CodexBinaryProcessHost implements CodexProcessHost {
   }
 
   spawn(): CodexChildLike {
-    const child = spawn(this.bin, [...this.args], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: process.env,
-      // Do not let a crashed app-server take the Agent Groups host down.
-      detached: false,
-    }) as ChildProcessWithoutNullStreams
+    // On win32 the resolved bin is usually an npm `.cmd` shim that forwards to
+    // the real binary — Node cannot exec those directly, so run them through
+    // cmd.exe explicitly (our args are fixed protocol constants).
+    const isCmdShim = process.platform === 'win32' && !/\.exe$/i.test(this.bin)
+    const child = spawn(
+      isCmdShim ? 'cmd.exe' : this.bin,
+      isCmdShim ? ['/d', '/s', '/c', [this.bin, ...this.args].join(' ')] : [...this.args],
+      {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        env: process.env,
+        // Do not let a crashed app-server take the Agent Groups host down.
+        detached: false,
+      },
+    ) as ChildProcessWithoutNullStreams
     return child
   }
 }
 
 /** Request timeout / disconnect / protocol errors. */
 export class CodexProtocolError extends Error {
-  readonly code: 'REQUEST_TIMEOUT' | 'RPC_DISCONNECTED' | 'NOT_INITIALIZED' | 'MALFORMED_RESPONSE' | 'RPC_ERROR' | 'WRITE_FAILED' | 'SPAWN_FAILED'
+  readonly code: 'REQUEST_TIMEOUT' | 'RPC_DISCONNECTED' | 'NOT_INITIALIZED' | 'MALFORMED_RESPONSE' | 'RPC_ERROR' | 'WRITE_FAILED' | 'SPAWN_FAILED' | 'TURN_STEER_FAILED'
   readonly rpcCode?: number
   readonly rpcData?: unknown
   constructor(code: CodexProtocolError['code'], message: string, options?: { rpcCode?: number; rpcData?: unknown; cause?: unknown }) {

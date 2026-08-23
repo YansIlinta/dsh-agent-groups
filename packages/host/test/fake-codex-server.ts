@@ -83,9 +83,15 @@ export class FakeCodexServer {
         this.received.push({ id, method: method as string, params })
         const handler = this.handlers.get(method as string)
         if (handler !== undefined && this.autoRespond) {
-          const result = handler(params, id, this)
-          if (result !== undefined) {
-            void Promise.resolve(result).then((resolved) => this.respond(id, resolved))
+          try {
+            const result = handler(params, id, this)
+            if (result !== undefined) {
+              void Promise.resolve(result).then((resolved) => this.respond(id, resolved))
+            }
+          } catch (error) {
+            // Like the real app-server: a failed handler answers with a
+            // JSON-RPC error instead of hanging the client request.
+            this.respondError(id, -32000, error instanceof Error ? error.message : String(error))
           }
         }
       }

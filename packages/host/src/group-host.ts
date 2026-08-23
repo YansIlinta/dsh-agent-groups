@@ -29,6 +29,7 @@ import type {
   Mission,
   PrivateMessage,
   TaskKind,
+  TaskPriority,
   TaskStatus,
   TeamConfig,
   TeamTemplate,
@@ -48,7 +49,7 @@ import { listTemplates, requireTemplate, templateMemberSlots } from './template-
 import { RuntimeRegistry, RuntimeError } from './runtime/registry.js'
 import { isSessionProvider, type AgentRuntimeProvider, type RuntimeAgentConfig, type RuntimeAgentHandle, type RuntimeSession, type RuntimeSessionInfo, type RuntimeTurnHandle, type RuntimeTurnResult } from './runtime/base.js'
 import type { RuntimeEvent, RuntimePendingRequest } from './runtime/events.js'
-import type { MemberRuntimeState, RuntimeRequestView } from './core-types.js'
+import type { MemberRuntimeState, RuntimeQueuedTurn, RuntimeRequestView } from './core-types.js'
 import { teamConfigFor } from './runtime/team-config.js'
 import { createRuntimeMessage, runtimeMessageText } from './runtime/message.js'
 
@@ -257,6 +258,7 @@ export class GroupHost {
           state: 'starting',
           pendingRequests: new Map(),
           activeTurn: undefined,
+          queuedTurns: [],
           turnSeq: 0,
         })
         // NEVER treat exit as success: exit only records a stopped/failed
@@ -320,6 +322,7 @@ export class GroupHost {
       state: 'starting',
       pendingRequests: new Map(),
       activeTurn: undefined,
+      queuedTurns: [],
       turnSeq: 0,
     }
     this.memberRuntimes.set(memberId, entry)
@@ -397,6 +400,12 @@ export class GroupHost {
     return this.memberRuntimes.get(memberId)?.activeTurn
   }
 
+  /** V0.6: authoritative view of the member's queued future turns (UI). */
+  private queuedTurnsOf(memberId: string): RuntimeQueuedTurn[] | undefined {
+    const queued = this.memberRuntimes.get(memberId)?.queuedTurns
+    return queued !== undefined && queued.length > 0 ? [...queued] : undefined
+  }
+
   private requestsForGroup(groupId: GroupId): RuntimeRequestView[] {
     const views: RuntimeRequestView[] = []
     for (const entry of this.memberRuntimes.values()) {
@@ -448,10 +457,23 @@ export class GroupHost {
         return
       }
       case 'session.disconnected': {
+        // V0.6: a provider transport crash is NOT a member lifecycle failure.
+        // The member keeps its durable identity; the session is marked
+        // disconnected and re-attaches the SAME provider conversation on the
+        // next dispatch. Only unrecoverable session failures destroy the
+        // member status.
         this.setRuntimeState(memberId, 'disconnected')
         void this.activity.append({ groupId, type: 'runtime_session_disconnected', actorName, refMemberId: memberId, payload: { reason: event.reason } })
-        void this.groups.patchMember(groupId, memberId, { error: event.reason ?? 'runtime session disconnected', status: 'failed' }).catch(() => undefined)
+        if (event.unrecoverable === true) {
+          void this.groups.patchMember(groupId, memberId, { error: event.reason ?? 'runtime session disconnected', status: 'failed' }).catch(() => undefined)
+        } else {
+          void this.groups.patchMember(groupId, memberId, { error: event.reason ?? 'runtime session disconnected' }).catch(() => undefined)
+        }
         this.persistRuntimeMetadata(groupId, memberId)
+        return
+      }
+      case 'session.reconnecting': {
+        this.setRuntimeState(memberId, 'reconnecting')
         return
       }
       case 'session.failed': {
@@ -469,8 +491,49 @@ export class GroupHost {
       }
       case 'turn.started': {
         this.setRuntimeState(memberId, 'working')
+        // V0.6: provider-initiated turns must be visible to the Host. If the
+        // Host did not start this turn, adopt it as the authoritative active
+        // turn so the runtime never runs a turn the Host cannot see.
+        if (entry.activeTurn === undefined) {
+          entry.activeTurn = { turnId: event.turnId, taskId: event.taskId }
+        }
         void this.activity.append({ groupId, type: 'runtime_turn_started', actorName, refMemberId: memberId, refTaskId: event.taskId, payload: { turnId: event.turnId } })
         this.persistRuntimeMetadata(groupId, memberId)
+        return
+      }
+      case 'turn.queued': {
+        // V0.6: single authoritative queue — the Host records every queued
+        // future turn (task OR correction) and drains it after the active
+        // turn reaches a terminal state.
+        entry.queuedTurns.push({
+          seq: ++entry.turnSeq,
+          kind: event.kind,
+          taskId: event.taskId,
+          text: event.text.slice(0, 200),
+          queuedAt: event.timestamp,
+          behindTurnId: event.behindTurnId,
+        })
+        void this.activity.append({
+          groupId,
+          type: 'runtime_turn_queued',
+          actorName,
+          refMemberId: memberId,
+          refTaskId: event.taskId,
+          payload: { kind: event.kind, behindTurnId: event.behindTurnId ?? null, seq: entry.turnSeq },
+        })
+        this.notifier.emit(groupId, 'member', undefined)
+        return
+      }
+      case 'turn.steered': {
+        void this.activity.append({
+          groupId,
+          type: 'runtime_turn_steered',
+          actorName,
+          refMemberId: memberId,
+          refTaskId: event.taskId,
+          payload: { turnId: event.turnId },
+        })
+        this.notifier.emit(groupId, 'member', undefined)
         return
       }
       case 'turn.output.delta':
@@ -504,8 +567,11 @@ export class GroupHost {
         this.setRuntimeState(memberId, 'idle')
         void this.activity.append({ groupId, type: 'runtime_turn_completed', actorName, refMemberId: memberId, refTaskId: completedTask, payload: { turnId: event.turnId, status: event.result.status } })
         // A COMPLETED TURN, not a process exit, is the completion claim:
-        this.onTurnCompleted(memberId, event.turnId, completedTask, event.result)
+        void this.onTurnCompleted(memberId, event.turnId, completedTask, event.result)
         this.persistRuntimeMetadata(groupId, memberId)
+        // V0.6: the next queued future turn starts deterministically after the
+        // terminal state (same session, same member).
+        void this.drainQueuedTurns(memberId)
         return
       }
       case 'turn.failed': {
@@ -514,8 +580,9 @@ export class GroupHost {
         entry.activeTurn = undefined
         this.setRuntimeState(memberId, 'idle')
         void this.activity.append({ groupId, type: 'runtime_turn_failed', actorName, refMemberId: memberId, refTaskId: failedTask, payload: { turnId: event.turnId, reason: event.reason } })
-        this.onTurnFailed(memberId, failedTask, event.reason)
+        void this.onTurnFailed(memberId, failedTask, event.reason)
         this.persistRuntimeMetadata(groupId, memberId)
+        void this.drainQueuedTurns(memberId)
         return
       }
       case 'turn.cancelled': {
@@ -524,7 +591,36 @@ export class GroupHost {
         entry.activeTurn = undefined
         this.setRuntimeState(memberId, 'idle')
         void this.activity.append({ groupId, type: 'runtime_turn_cancelled', actorName, refMemberId: memberId, refTaskId: cancelledTask, payload: { turnId: event.turnId, reason: event.reason } })
+        // V0.6 cancellation policy: an interrupted turn is NOT success and NOT
+        // failure — its task returns to a defined retryable state (pending),
+        // the member stops carrying it, and the transition is persisted in the
+        // Activity Timeline. A queued future task may then start.
+        void this.onTurnCancelled(groupId, memberId, cancelledTask, event.reason)
         this.persistRuntimeMetadata(groupId, memberId)
+        void this.drainQueuedTurns(memberId)
+        return
+      }
+      case 'request.timeout': {
+        // V0.6: a pending request expired — the provider executed its safe
+        // default; the Host clears the request and persists the event.
+        const request = entry.pendingRequests.get(event.requestId)
+        entry.pendingRequests.delete(event.requestId)
+        this.setRuntimeState(memberId, entry.activeTurn !== undefined ? 'working' : 'idle')
+        void this.activity.append({
+          groupId,
+          type: 'runtime_request_timed_out',
+          actorName,
+          refMemberId: memberId,
+          refTaskId: event.taskId,
+          payload: {
+            requestId: event.requestId,
+            requestKind: event.requestKind,
+            action: event.action,
+            delivered: event.delivered === true,
+            description: request?.description ?? null,
+          },
+        })
+        this.notifier.emit(groupId, 'member', undefined)
         return
       }
       case 'provider.error': {
@@ -609,12 +705,85 @@ export class GroupHost {
   }
 
   /**
-   * Deliver one task assignment / leader follow-up to a member runtime:
-   * - session idle → a new turn (task) on the SAME provider conversation;
-   * - session running → a steer/follow-up on the SAME turn (Codex turn/steer,
-   *   Claude queued); the leader's correction is never a brand-new agent;
-   * - DSH members → a waking deliver (their claims come from the tools);
-   * - legacy handles → text input (no exit-based completion ever).
+   * V0.6 cancellation policy: an interrupted turn is NOT a success and NOT a
+   * failure. The task bound to the cancelled turn returns to a defined
+   * retryable state (`pending`, reopen semantics — persisted + activity), the
+   * member stops carrying it (`currentTaskId` cleared), and the member stays
+   * usable on the SAME provider session.
+   */
+  private async onTurnCancelled(groupId: GroupId, memberId: string, taskId: string | undefined, reason: string | undefined): Promise<void> {
+    const member = this.groups.getMembership(groupId, memberId)
+    if (member === undefined || member.status === 'left') return
+    const target = taskId ?? member.currentTaskId
+    if (target === undefined) return
+    try {
+      const task = this.tasks.requireTask(groupId, target)
+      if (task.status === 'in_progress' || task.status === 'pending' || task.status === 'blocked') {
+        await this.tasks.reopen(groupId, target, memberId, `interrupted: ${reason ?? 'leader interrupt'}`)
+      }
+    } catch {
+      // task already closed — the cancelled turn only settles itself
+    }
+    await this.groups.patchMember(groupId, memberId, { currentTaskId: undefined, error: undefined }).catch(() => undefined)
+  }
+
+  /**
+   * V0.6: drain the authoritative per-member queue of future turns after the
+   * active turn reached a terminal state (completed/failed/cancelled) or the
+   * member claimed completion (DSH). Starts the next queued turn on the SAME
+   * provider session — task turns and corrections run in FIFO order, and the
+   * started turn's task binding is its own.
+   */
+  private async drainQueuedTurns(memberId: string): Promise<void> {
+    const entry = this.memberRuntimes.get(memberId)
+    if (entry === undefined || entry.kind !== 'session') return
+    if (entry.activeTurn !== undefined) return // a turn is active — wait
+    if (entry.state === 'working' || entry.state === 'waiting_input' || entry.state === 'needs_approval') return
+    const next = entry.queuedTurns.shift()
+    if (next === undefined) return
+    if (typeof entry.session.startTaskTurn !== 'function') {
+      // Provider cannot start turns — keep the item queued (never dropped).
+      entry.queuedTurns.unshift(next)
+      return
+    }
+    try {
+      const handle = await entry.session.startTaskTurn({ text: next.text, taskId: next.taskId, turnKind: next.kind })
+      if (handle !== undefined) {
+        entry.activeTurn = { turnId: handle.turnId, taskId: handle.taskId }
+        // V0.6: the started queued task becomes the member's current task
+        // (re-applied here so a concurrent cancellation policy cannot leave
+        // the cursor stale).
+        if (next.kind === 'task' && next.taskId !== undefined) {
+          await this.groups.patchMember(entry.groupId, memberId, { currentTaskId: next.taskId, error: undefined }).catch(() => undefined)
+        }
+      }
+    } catch (error) {
+      // The queued turn could not start — keep it queued (re-queue) and fail
+      // LOUDLY so the Leader/UI can act; the member session stays intact.
+      entry.queuedTurns.unshift(next)
+      void this.activity.append({
+        groupId: entry.groupId,
+        type: 'member_runtime_failed',
+        actorName: memberId.slice(0, 8),
+        refMemberId: memberId,
+        refTaskId: next.taskId,
+        payload: { code: 'TURN_START_FAILED', error: error instanceof Error ? error.message : String(error), queuedTurnRequeued: true },
+      })
+    }
+  }
+
+  /**
+   * Deliver one task assignment / leader follow-up to a member runtime.
+   *
+   * V0.6 semantics (never conflated):
+   *  - session idle → `startTaskTurn` (a new turn on the SAME conversation);
+   *  - session busy + NEW task → `queueTaskTurn` — a separate queued future
+   *    turn; the ACTIVE turn is NEVER retargeted to another task;
+   *  - session busy + guidance → `steerActiveTurn` — steering into the active
+   *    turn where the provider supports it; providers that cannot steer live
+   *    report `{queued}` and the guidance becomes the next turn on the same
+   *    session. A typed steer failure is never silently dropped.
+   *  - legacy handles → text input (no exit-based completion ever).
    */
   private async deliverToMemberRuntime(groupId: GroupId, memberId: string, text: string, taskId?: string): Promise<boolean> {
     const entry = this.memberRuntimes.get(memberId)
@@ -630,25 +799,45 @@ export class GroupHost {
     }
     if (entry.kind === 'session') {
       const session = entry.session
-      if (entry.activeTurn !== undefined || entry.state === 'working') {
-        try {
-          await session.sendFollowup?.({ text, taskId, turnKind: taskId !== undefined ? 'task' : 'followup' })
-        } catch (error) {
-          // A steer failure is LOUD (provider.error already streamed); fall
-          // back to starting a new turn rather than dropping the instruction.
-          void error
-          await session.runTurn({ text, taskId, turnKind: taskId !== undefined ? 'task' : 'followup' })
-        }
-        // The running turn is now the member's delivery vehicle for the NEW
-        // task too; when it completes, the claim targets this retargeted id.
-        if (entry.activeTurn !== undefined && taskId !== undefined) {
-          entry.activeTurn = { turnId: entry.activeTurn.turnId, taskId }
+      const busy = entry.activeTurn !== undefined || entry.state === 'working' || entry.state === 'waiting_input' || entry.state === 'needs_approval'
+      if (busy) {
+        if (taskId !== undefined) {
+          // NEW TASK on a busy member → a queued future turn on the SAME
+          // session. The active turn keeps its own task binding.
+          if (session.queueTaskTurn === undefined) {
+            throw new GroupError('TURN_START_FAILED', `member runtime cannot queue a future task turn (${session.runtime}) — interrupt the current turn first`)
+          }
+          await session.queueTaskTurn({ text, taskId, turnKind: 'task' })
+        } else {
+          // Leader guidance → steering for the current work where supported.
+          let outcome
+          try {
+            outcome = await session.steerActiveTurn?.({ text, turnKind: 'followup' })
+          } catch (error) {
+            // Typed steer failure (CodexSteerError): the instruction is NOT
+            // dropped — it was already recorded as a queued next turn by the
+            // provider (turn.queued event) before throwing. Persist the
+            // failure loudly and treat the delivery as queued.
+            void this.activity.append({
+              groupId,
+              type: 'runtime_steer_failed',
+              actorName: memberId.slice(0, 8),
+              refMemberId: memberId,
+              payload: { code: error instanceof Error && 'code' in error ? String((error as { code: unknown }).code) : 'TURN_STEER_FAILED', error: error instanceof Error ? error.message : String(error), queued: true },
+            })
+            this.notifier.emit(groupId, 'member', undefined)
+            return true
+          }
+          if (outcome !== undefined && 'queued' in outcome && outcome.queued === true) {
+            // Provider cannot steer live — already recorded via turn.queued.
+            this.notifier.emit(groupId, 'member', undefined)
+          }
         }
         return true
       }
       let handle
       try {
-        handle = await session.runTurn({ text, taskId, turnKind: taskId !== undefined ? 'task' : 'followup' })
+        handle = await session.startTaskTurn({ text, taskId, turnKind: taskId !== undefined ? 'task' : 'followup' })
       } catch (error) {
         if (error instanceof GroupError) throw error
         throw new GroupError('TURN_START_FAILED', `failed to start a runtime turn for member: ${error instanceof Error ? error.message : String(error)}`)
@@ -875,49 +1064,59 @@ export class GroupHost {
   async assignTask(actor: string, input: { taskId: string; ownerId: string; expectedRevision?: number; deliver?: boolean }): Promise<GroupTask> {
     const { group } = this.leaderActor(actor)
     this.groups.assertDispatchable(group)
-    const ownerRecord = this.groups.requireMember(group.groupId, input.ownerId)
+    this.groups.requireMember(group.groupId, input.ownerId)
     const task = await this.tasks.assign(group.groupId, input.taskId, input.ownerId, actor, input.expectedRevision)
-    // record the member's current task (external runtimes cannot claim themselves)
-    await this.groups.patchMember(group.groupId, input.ownerId, { currentTaskId: task.taskId })
     if (input.deliver !== false) {
-      const message = createRuntimeMessage({
-        type: 'task_assignment',
-        groupId: group.groupId,
-        senderId: actor,
-        recipientId: input.ownerId,
-        taskId: task.taskId,
-        priority: task.priority,
-        payload: {
-          taskId: task.taskId,
-          subject: task.subject,
-          description: task.description,
-          kind: task.kind,
-          acceptanceCriteria: task.acceptanceCriteria,
-          writeScopes: task.writeScopes,
-          blockedBy: task.blockedBy,
-          taskBrief: this.taskBrief(group, task),
-        },
-      })
-      const text = runtimeMessageText(message)
-      if (this.memberRuntimes.has(input.ownerId)) {
-        // Runtime members route through their persistent SESSION: the
-        // assignment becomes a TURN (or a steer on the running turn), and the
-        // session ensures the member's OWN configuration on attach.
-        await this.deliverToMemberRuntime(group.groupId, input.ownerId, text, task.taskId)
-      } else if (ownerRecord.runtime !== undefined) {
-        // A runtime member with no live session = resume failed or was never
-        // attempted — fail LOUDLY; never start a fresh conversation silently.
-        throw new GroupError('SESSION_RESUME_FAILED', `member ${ownerRecord.name} has no live runtime session; the provider session could not be resumed — retry the task after resume, or spawn a new member`)
-      } else {
-        // Plain DSH profile members keep the waking deliver path.
-        await this.adapter.deliver(
-          input.ownerId,
-          textContent(text),
-          groupMessageSource(group.groupId, { direction: 'leader-to-member', label: 'task assignment' }),
-        )
-      }
+      await this.dispatchAssignedTask(group, task, input.ownerId, actor)
     }
     return task
+  }
+
+  /**
+   * V0.6: deliver an assigned task to its owner's runtime with the correct
+   * turn semantics — a new TURN when idle, a QUEUED future turn when the
+   * member is busy (never a retarget of the running turn).
+   */
+  private async dispatchAssignedTask(group: GroupRecord, task: GroupTask, ownerId: string, assignedBy: string): Promise<void> {
+    // record the member's current task (external runtimes cannot claim themselves)
+    await this.groups.patchMember(group.groupId, ownerId, { currentTaskId: task.taskId })
+    const message = createRuntimeMessage({
+      type: 'task_assignment',
+      groupId: group.groupId,
+      senderId: assignedBy,
+      recipientId: ownerId,
+      taskId: task.taskId,
+      priority: task.priority,
+      payload: {
+        taskId: task.taskId,
+        subject: task.subject,
+        description: task.description,
+        kind: task.kind,
+        acceptanceCriteria: task.acceptanceCriteria,
+        writeScopes: task.writeScopes,
+        blockedBy: task.blockedBy,
+        taskBrief: this.taskBrief(group, task),
+      },
+    })
+    const text = runtimeMessageText(message)
+    if (this.memberRuntimes.has(ownerId)) {
+      // Runtime members route through their persistent SESSION: the
+      // assignment becomes a TURN (or a queued future turn when busy), and
+      // the session ensures the member's OWN configuration on attach.
+      await this.deliverToMemberRuntime(group.groupId, ownerId, text, task.taskId)
+    } else if (this.groups.getMembership(group.groupId, ownerId)?.runtime !== undefined) {
+      // A runtime member with no live session = resume failed or was never
+      // attempted — fail LOUDLY; never start a fresh conversation silently.
+      const ownerRecord = this.groups.requireMember(group.groupId, ownerId)
+      throw new GroupError('SESSION_RESUME_FAILED', `member ${ownerRecord.name} has no live runtime session; the provider session could not be resumed — retry the task after resume, or spawn a new member`)
+    } else {
+      // Plain DSH profile members keep the waking deliver path.
+      await this.adapter.deliver(
+        ownerId,
+        textContent(text),
+        groupMessageSource(group.groupId, { direction: 'leader-to-member', label: 'task assignment' }),
+      )
+    }
   }
 
   async verifyTask(actor: string, input: { taskId: string; passed: boolean; notes?: string }): Promise<GroupTask> {
@@ -1000,7 +1199,11 @@ export class GroupHost {
         ok = ok // DSH interrupt already handled it
       }
     }
-    await this.groups.patchMember(group.groupId, input.memberSessionId, { error: `interrupted: ${input.reason}` })
+    // V0.6: the interruption itself is NOT a success — the runtime emits
+    // `turn.cancelled` and the Host applies the cancellation policy (task →
+    // pending/retryable, activity persisted, queued future turns may start).
+    // The member keeps its durable identity; no error is carved into the
+    // roster for a normal interrupt.
     await this.activity.append({
       groupId: group.groupId,
       type: 'member_interrupted',
@@ -1053,8 +1256,13 @@ export class GroupHost {
     // DSH members claim their own completion → the runtimes settle to idle.
     const entry = this.memberRuntimes.get(actor)
     if (entry?.kind === 'session') {
+      // V0.6: the claim is the DSH turn's terminal state — clear the active
+      // turn cursor so the next queued future task starts deterministically
+      // on the SAME DSH session.
+      if (entry.activeTurn !== undefined) entry.activeTurn = undefined
       this.setRuntimeState(actor, 'idle')
       this.persistRuntimeMetadata(group.groupId, actor)
+      void this.drainQueuedTurns(actor)
     }
     const leader = this.groups.getMembership(group.groupId, group.leaderSessionId)
     if (leader !== undefined) {
@@ -1381,6 +1589,84 @@ export class GroupHost {
     return this.groups.patchMember(group.groupId, memberSessionId, patch)
   }
 
+  // ── V0.6: user console runtime actions (same Host contract, User actor) ──
+
+  /**
+   * V0.6: the User can create a task from the Agent Groups page (the Leader
+   * keeps the full leader_create_task surface; this is the page console path).
+   */
+  async userCreateTask(groupId: GroupId, input: { subject: string; description?: string; kind?: TaskKind; acceptanceCriteria?: string[]; priority?: TaskPriority; ownerId?: string }): Promise<GroupTask> {
+    const group = this.groups.requireGroup(groupId)
+    this.groups.assertMutable(group)
+    this.groups.assertDispatchable(group)
+    const task = await this.tasks.createTask(group.groupId, {
+      subject: input.subject,
+      description: input.description ?? '',
+      kind: input.kind ?? 'implementation',
+      acceptanceCriteria: input.acceptanceCriteria ?? [],
+      priority: input.priority,
+      createdBy: 'User',
+    })
+    if (input.ownerId !== undefined) {
+      this.groups.requireMember(group.groupId, input.ownerId)
+      await this.tasks.assign(group.groupId, task.taskId, input.ownerId, 'User')
+      await this.dispatchAssignedTask(group, task, input.ownerId, 'User')
+    }
+    return task
+  }
+
+  /** V0.6: assign an existing task to a member from the page console. */
+  async userAssignTask(groupId: GroupId, taskId: string, ownerId: string): Promise<GroupTask> {
+    const group = this.groups.requireGroup(groupId)
+    this.groups.assertMutable(group)
+    this.groups.assertDispatchable(group)
+    this.groups.requireMember(group.groupId, ownerId)
+    const task = await this.tasks.assign(group.groupId, taskId, ownerId, 'User')
+    await this.dispatchAssignedTask(group, task, ownerId, 'User')
+    return task
+  }
+
+  /**
+   * V0.6: the User can send a CORRECTION about a member's current work — it
+   * routes through the same runtime steering/queue semantics as the Leader's
+   * guidance (never spawns a replacement member, never retargets a turn).
+   */
+  async userSendCorrection(groupId: GroupId, memberId: string, text: string): Promise<boolean> {
+    const group = this.groups.requireGroup(groupId)
+    this.groups.assertMutable(group)
+    this.groups.requireMember(group.groupId, memberId)
+    const message = `[User correction]\n${text}`
+    if (this.memberRuntimes.has(memberId)) {
+      return this.deliverToMemberRuntime(group.groupId, memberId, message)
+    }
+    return this.adapter.deliver(memberId, textContent(message), groupMessageSource(group.groupId, { label: 'user correction' }))
+  }
+
+  /** V0.6: the User can interrupt a member's current turn (User actor). */
+  async userInterruptMember(groupId: GroupId, memberId: string, reason: string): Promise<boolean> {
+    const group = this.groups.requireGroup(groupId)
+    this.groups.assertMutable(group)
+    this.groups.requireMember(group.groupId, memberId)
+    let ok = this.adapter.interrupt(memberId, reason)
+    const entry = this.memberRuntimes.get(memberId)
+    if (entry?.kind === 'session' && entry.session.interrupt !== undefined) {
+      try {
+        await entry.session.interrupt(reason)
+        ok = true
+      } catch {
+        ok = ok // DSH interrupt already handled it
+      }
+    }
+    await this.activity.append({
+      groupId,
+      type: 'member_interrupted',
+      actorId: 'User',
+      refMemberId: memberId,
+      payload: { reason },
+    })
+    return ok
+  }
+
   async userPauseGroup(groupId: GroupId, paused: boolean): Promise<GroupRecord> {
     const group = this.groups.requireGroup(groupId)
     this.groups.assertMutable(group)
@@ -1534,6 +1820,7 @@ export class GroupHost {
         liveStatus: member.liveStatus,
         runtimeState: this.runtimeStateOf(member.sessionId),
         currentTurnId: this.activeTurnOf(member.sessionId)?.turnId,
+        runtimeQueuedTurns: this.queuedTurnsOf(member.sessionId),
       })),
       tasks: this.tasks.listTasks(groupId),
       channel: this.channel.list(groupId),
@@ -1593,7 +1880,7 @@ export class GroupHost {
     return out
   }
 
-  /** V0.5: re-attach every durable member session after a host restart. */
+  /** V0.5/V0.6: re-attach every durable member session after a host restart. */
   async resumeAllMemberRuntimes(): Promise<void> {
     for (const group of this.groups.listGroups()) {
       const members = this.groups.listMembers(group.groupId, () => undefined)
@@ -1601,10 +1888,21 @@ export class GroupHost {
         if (member.role !== 'member' || member.status === 'left') continue
         try {
           await this.resumeMemberRuntime(group, member)
-        } catch {
+        } catch (error) {
           // A member whose provider session cannot resume stays in the roster
-          // with its durable metadata; the next dispatch fails loudly with
-          // SESSION_RESUME_FAILED instead of silently creating a fresh one.
+          // with its durable metadata; the failure is recorded LOUDLY and the
+          // next dispatch fails with SESSION_RESUME_FAILED instead of silently
+          // creating a fresh conversation.
+          await this.activity.append({
+            groupId: group.groupId,
+            type: 'runtime_session_failed',
+            actorName: member.name,
+            refMemberId: member.sessionId,
+            payload: { reason: `resume failed: ${error instanceof Error ? error.message : String(error)}` },
+          }).catch(() => undefined)
+          await this.groups.patchMember(group.groupId, member.sessionId, {
+            error: `runtime session resume failed: ${error instanceof Error ? error.message : String(error)}`,
+          }).catch(() => undefined)
         }
       }
     }
@@ -1644,10 +1942,12 @@ function resolveLiveStatus(durable: AgentMemberStatus, live: 'running' | 'idle' 
 }
 
 /**
- * V0.5: one member's live runtime — a persistent provider session with an
- * active-turn cursor and pending provider requests. The session is created
- * once per member and survives across tasks; turn ids correlate events so a
- * late event from an old turn can never complete a newer turn.
+ * V0.6: one member's live runtime — a persistent provider session with an
+ * active-turn cursor, the AUTHORITATIVE queue of future turns, and pending
+ * provider requests. The session is created once per member and survives
+ * across tasks; turn ids correlate events so a late event from an old turn
+ * can never complete a newer turn. A turn's task binding is recorded at turn
+ * creation and NEVER rebinds.
  */
 type MemberRuntime = SessionMemberRuntime | LegacyMemberRuntime
 
@@ -1660,6 +1960,13 @@ interface SessionMemberRuntime {
   state: MemberRuntimeState
   readonly pendingRequests: Map<string, RuntimePendingRequest>
   activeTurn: { turnId: string; taskId?: string } | undefined
+  /**
+   * V0.6: authoritative FIFO queue of future turns (new tasks AND queued
+   * corrections). Fed by the normalized `turn.queued` event; drained by
+   * GroupHost after the active turn reaches a terminal state. The UI reads
+   * this, never the provider.
+   */
+  readonly queuedTurns: RuntimeQueuedTurn[]
   turnSeq: number
 }
 
@@ -1672,6 +1979,7 @@ interface LegacyMemberRuntime {
   state: MemberRuntimeState
   readonly pendingRequests: Map<string, RuntimePendingRequest>
   activeTurn: { turnId: string; taskId?: string } | undefined
+  readonly queuedTurns: RuntimeQueuedTurn[]
   turnSeq: number
 }
 

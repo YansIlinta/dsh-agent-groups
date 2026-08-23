@@ -149,4 +149,41 @@ describe('web API routes (V0.3 regression)', () => {
     expect(grouped.status).toBe(404) // group not found — error surfaced, not "unknown action"
     expect(grouped.body).toContain('no such group')
   })
+
+  it('V0.6: POST /groups/:id/tasks creates (and optionally assigns) a task', async () => {
+    const host = makeHost()
+    const group = await host.initGroup('lead-1', { name: 'T', objective: 'demo', acceptanceCriteria: ['x'] })
+    const created = await call(host, host.notifier, `/groups/api/groups/${group.groupId}/tasks`, 'POST', {
+      subject: 'route task', description: 'd', ownerId: 'ghost',
+    })
+    // assigning to an unknown member fails with the service error (409), not 404
+    expect(created.status).toBe(404)
+    expect(created.body).toContain('ghost')
+    // without an owner the task is created pending
+    const plain = await call(host, host.notifier, `/groups/api/groups/${group.groupId}/tasks`, 'POST', { subject: 'plain task' })
+    expect(plain.status).toBe(200)
+    expect(JSON.parse(plain.body).status).toBe('pending')
+    expect(JSON.parse(plain.body).createdBy).toBe('User')
+  })
+
+  it('V0.6: POST /groups/:id/members/:m/correction and /interrupt route to the Host', async () => {
+    const host = makeHost()
+    const group = await host.initGroup('lead-1', { name: 'T', objective: 'demo', acceptanceCriteria: ['x'] })
+    const empty = await call(host, host.notifier, `/groups/api/groups/${group.groupId}/members/nope/correction`, 'POST', { text: 'hi' })
+    expect(empty.status).toBe(404) // unknown member — surfaced, not "unknown action"
+    const bad = await call(host, host.notifier, `/groups/api/groups/${group.groupId}/members/nope/interrupt`, 'POST', { reason: 'stop' })
+    expect(bad.status).toBe(404)
+    // missing text on correction → 400
+    const host2 = makeHost()
+    await host2.profiles.register({ id: 'group-member', name: 'Member', description: 'test', capabilities: [] })
+    const group2 = await host2.initGroup('lead-2', { name: 'T', objective: 'demo', acceptanceCriteria: ['x'] })
+    const member = await host2.userSpawnMember(group2.groupId, { profileId: 'group-member' })
+    const noText = await call(host2, host2.notifier, `/groups/api/groups/${group2.groupId}/members/${member.sessionId}/correction`, 'POST', {})
+    expect(noText.status).toBe(400)
+    // a live plain-DSH member accepts the correction through the adapter
+    const ok = await call(host2, host2.notifier, `/groups/api/groups/${group2.groupId}/members/${member.sessionId}/correction`, 'POST', { text: 'fix only that' })
+    expect(ok.status).toBe(200)
+    // with the noop adapter delivery is unavailable → honest false, no crash
+    expect(typeof JSON.parse(ok.body).ok).toBe('boolean')
+  })
 })

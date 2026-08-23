@@ -69,7 +69,7 @@ describe('codex runtime provider (app server)', () => {
     const events = collectEvents(session)
 
     // task A → turn 1
-    const turn1 = await session.runTurn({ taskId: 'task-a', text: 'implement auth' })
+    const turn1 = await session.startTaskTurn({ taskId: 'task-a', text: 'implement auth' })
     expect(events.some((e) => e.type === 'turn.started' && e.taskId === 'task-a')).toBe(true)
     server.child.stdout.write(`${JSON.stringify({ method: 'item/agentMessage/delta', params: { threadId: 'thr-1', turnId: 'wire-1', itemId: 'i1', delta: 'implemented' } })}\n`)
     server.finishTurn('wire-1', 'completed')
@@ -80,7 +80,7 @@ describe('codex runtime provider (app server)', () => {
     expect(session.info().providerThreadId).toBe('thr-1')
 
     // task B → turn 2 on the SAME thread
-    const turn2 = await session.runTurn({ taskId: 'task-b', text: 'now the reviewer pass' })
+    const turn2 = await session.startTaskTurn({ taskId: 'task-b', text: 'now the reviewer pass' })
     server.finishTurn('wire-2', 'completed')
     const result2 = await turn2.waitForCompletion()
     expect(result2.status).toBe('completed')
@@ -108,8 +108,8 @@ describe('codex runtime provider (app server)', () => {
     installFlow(server)
     const provider = makeProvider(server)
     const session = await provider.createSession({ groupId: 'g-1', agentId: 'm-1', role: 'implementation', workspace: '/ws' })
-    const turn = await session.runTurn({ taskId: 'task-a', text: 'build it' })
-    await session.sendFollowup!({ text: 'the verifier found a race — fix only that' })
+    const turn = await session.startTaskTurn({ taskId: 'task-a', text: 'build it' })
+    await session.steerActiveTurn!({ text: 'the verifier found a race — fix only that' })
     await vi.waitFor(() => {
       const steer = server.received.find((r) => r.method === 'turn/steer')
       expect(steer).toBeDefined()
@@ -129,7 +129,7 @@ describe('codex runtime provider (app server)', () => {
     installFlow(server)
     const provider = makeProvider(server)
     const session = await provider.createSession({ groupId: 'g-1', agentId: 'm-1', role: 'implementation', workspace: '/ws' })
-    const turn = await session.runTurn({ taskId: 'task-a', text: 'long task' })
+    const turn = await session.startTaskTurn({ taskId: 'task-a', text: 'long task' })
     await session.interrupt('leader says stop')
     await vi.waitFor(() => {
       const interrupt = server.received.find((r) => r.method === 'turn/interrupt')
@@ -141,7 +141,7 @@ describe('codex runtime provider (app server)', () => {
     expect(result.status).toBe('cancelled')
     expect(session.status).toBe('idle')
     // the same session can take the next task
-    const again = await session.runTurn({ taskId: 'task-b', text: 'retry' })
+    const again = await session.startTaskTurn({ taskId: 'task-b', text: 'retry' })
     server.finishTurn('wire-2', 'completed')
     expect((await again.waitForCompletion()).status).toBe('completed')
     await session.close(50).catch(() => undefined)
@@ -153,7 +153,7 @@ describe('codex runtime provider (app server)', () => {
     const provider = makeProvider(server)
     const session = await provider.createSession({ groupId: 'g-1', agentId: 'm-1', role: 'implementation', workspace: '/ws' })
     const events = collectEvents(session)
-    const turn = await session.runTurn({ taskId: 'task-a', text: 'do it' })
+    const turn = await session.startTaskTurn({ taskId: 'task-a', text: 'do it' })
     server.requestFromServer('item/commandExecution/requestApproval', 61, { threadId: 'thr-1', turnId: 'wire-1', itemId: 'it-1', command: 'rm -rf /tmp/x', reason: 'cleanup' })
     await vi.waitFor(() => expect(events.some((e) => e.type === 'turn.approval.required')).toBe(true))
     const approval = events.find((e) => e.type === 'turn.approval.required')!
@@ -178,7 +178,7 @@ describe('codex runtime provider (app server)', () => {
     const provider = makeProvider(server)
     const session = await provider.createSession({ groupId: 'g-1', agentId: 'm-1', role: 'implementation', workspace: '/ws' })
     const events = collectEvents(session)
-    const turn = await session.runTurn({ taskId: 'task-a', text: 'do it' })
+    const turn = await session.startTaskTurn({ taskId: 'task-a', text: 'do it' })
     server.requestFromServer('item/tool/requestUserInput', 62, {
       threadId: 'thr-1', turnId: 'wire-1', itemId: 'it-2',
       questions: [{ id: 'q1', header: 'dir', question: 'which directory?', isOther: false, isSecret: false, options: null }],
@@ -194,7 +194,7 @@ describe('codex runtime provider (app server)', () => {
       const answers = ((response!.params as { answers: Record<string, unknown> }).answers ?? {}) as Record<string, { answers: string[] }>
       expect(answers.q1?.answers).toEqual(['src/'])
     })
-    expect(session.status).toBe('running')
+    expect(session.status).toBe('working')
     server.finishTurn('wire-1', 'completed')
     expect((await turn.waitForCompletion()).status).toBe('completed')
     await session.close(50).catch(() => undefined)
@@ -206,7 +206,7 @@ describe('codex runtime provider (app server)', () => {
     const provider = makeProvider(server)
     const session = await provider.createSession({ groupId: 'g-1', agentId: 'm-1', role: 'implementation', workspace: '/ws' })
     const events = collectEvents(session)
-    const turn = await session.runTurn({ taskId: 'task-a', text: 'work' })
+    const turn = await session.startTaskTurn({ taskId: 'task-a', text: 'work' })
     server.exit(9)
     const result = await turn.waitForCompletion()
     expect(result.status).toBe('failed')
@@ -228,7 +228,7 @@ describe('codex runtime provider (app server)', () => {
     expect(resumed.info().providerThreadId).toBe('thr-1')
     expect(server2.received.some((r) => r.method === 'thread/resume')).toBe(true)
     expect(server2.received.some((r) => r.method === 'thread/start')).toBe(false)
-    const turn2 = await resumed.runTurn({ taskId: 'task-b', text: 'continue after restart' })
+    const turn2 = await resumed.startTaskTurn({ taskId: 'task-b', text: 'continue after restart' })
     server2.finishTurn('wire-1', 'completed')
     expect((await turn2.waitForCompletion()).status).toBe('completed')
     expect(resumedEvents.some((e) => e.type === 'session.ready')).toBe(true)
@@ -241,11 +241,11 @@ describe('codex runtime provider (app server)', () => {
     const provider = makeProvider(server)
     const session = await provider.createSession({ groupId: 'g-1', agentId: 'm-1', role: 'implementation', workspace: '/ws' })
     const events = collectEvents(session)
-    const turn1 = await session.runTurn({ taskId: 'task-a', text: 'a' })
+    const turn1 = await session.startTaskTurn({ taskId: 'task-a', text: 'a' })
     server.finishTurn('wire-1', 'completed')
     await turn1.waitForCompletion()
 
-    const turn2 = await session.runTurn({ taskId: 'task-b', text: 'b' })
+    const turn2 = await session.startTaskTurn({ taskId: 'task-b', text: 'b' })
     const completed = turn2.waitForCompletion()
     let settled = false
     void completed.then(() => { settled = true })
@@ -276,7 +276,7 @@ describe('codex runtime provider (app server)', () => {
     const events: RuntimeEvent[] = []
     const session = await provider.createSession({ groupId: 'g-1', agentId: 'm-1', role: 'implementation', workspace: '/ws' })
     session.subscribe((event) => events.push(event))
-    const turn1 = await session.runTurn({ taskId: 'task-1', text: 'first' })
+    const turn1 = await session.startTaskTurn({ taskId: 'task-1', text: 'first' })
     server1.finishTurn('wire-1', 'completed')
     await turn1.waitForCompletion()
 
@@ -285,7 +285,7 @@ describe('codex runtime provider (app server)', () => {
     server1.exit(3)
     await vi.waitFor(() => expect(events.some((e) => e.type === 'session.disconnected')).toBe(true))
 
-    const turn2 = await session.runTurn({ taskId: 'task-2', text: 'after the crash' })
+    const turn2 = await session.startTaskTurn({ taskId: 'task-2', text: 'after the crash' })
     // reconnected + resumed the SAME thread (no fresh thread/start)
     await vi.waitFor(() => {
       expect(server2.received.some((r) => r.method === 'thread/resume')).toBe(true)
@@ -328,5 +328,82 @@ describe('codex runtime provider (app server)', () => {
     const result = await handle.waitExit()
     expect(result.code).toBe(0)
     expect(server.received.some((r) => r.method === 'thread/start')).toBe(true)
+  })
+
+  it('V0.6 regression: item/completed(fileChange) reaches RuntimeTurnResult.changedFiles', async () => {
+    const server = new FakeCodexServer('fake-codex')
+    installFlow(server)
+    const provider = makeProvider(server)
+    const session = await provider.createSession({ groupId: 'g-1', agentId: 'm-1', role: 'implementation', workspace: '/ws' })
+    const turn = await session.startTaskTurn({ taskId: 'task-a', text: 'implement' })
+    // the server reports two file changes BEFORE completing the turn
+    server.emitNotification('item/completed', {
+      threadId: 'thr-1', turnId: 'wire-1', itemId: 'it-c1',
+      item: { type: 'fileChange', path: 'src/auth.ts', changes: [{ path: 'src/auth.ts' }] },
+    })
+    server.emitNotification('item/completed', {
+      threadId: 'thr-1', turnId: 'wire-1', itemId: 'it-c2',
+      item: { type: 'fileChange', path: 'src/api.ts', changes: [{ path: 'src/api.ts' }] },
+    })
+    server.finishTurn('wire-1', 'completed')
+    const result = await turn.waitForCompletion()
+    expect(result.status).toBe('completed')
+    expect(result.changedFiles).toEqual(['src/auth.ts', 'src/api.ts'])
+    // the NEXT turn starts with an empty collection (per-turn isolation)
+    const turn2 = await session.startTaskTurn({ taskId: 'task-b', text: 'more' })
+    server.finishTurn('wire-2', 'completed')
+    const result2 = await turn2.waitForCompletion()
+    expect(result2.changedFiles).toBeUndefined()
+    await session.close(50).catch(() => undefined)
+  })
+
+  it('V0.6: a failed turn/steer throws a TYPED error and queues the correction (never dropped)', async () => {
+    const server = new FakeCodexServer('fake-codex')
+    installFlow(server)
+    server.setHandler('turn/steer', () => { throw new Error('steer rejected by the app-server') })
+    const provider = makeProvider(server)
+    const session = await provider.createSession({ groupId: 'g-1', agentId: 'm-1', role: 'implementation', workspace: '/ws' })
+    const events: RuntimeEvent[] = []
+    session.subscribe((event) => events.push(event))
+    const turn = await session.startTaskTurn({ taskId: 'task-a', text: 'build it' })
+    await expect(session.steerActiveTurn!({ text: 'fix the race only' })).rejects.toMatchObject({ name: 'CodexSteerError', code: 'TURN_STEER_FAILED' })
+    // the failure is explicit AND the correction is queued for the next turn
+    expect(events.some((e) => e.type === 'provider.error' && e.code === 'TURN_STEER_FAILED')).toBe(true)
+    expect(events.some((e) => e.type === 'turn.queued' && e.kind === 'followup' && e.text.includes('fix the race'))).toBe(true)
+    // the running turn itself survives the failed steer
+    server.finishTurn('wire-1', 'completed')
+    expect((await turn.waitForCompletion()).status).toBe('completed')
+    await session.close(50).catch(() => undefined)
+  })
+
+  it('V0.6: unanswered approval requests expire with an explicit event + safe action', async () => {
+    const server = new FakeCodexServer('fake-codex')
+    installFlow(server)
+    const provider = new CodexRuntimeProvider({
+      processHost: { label: 'fake-codex app-server (fake)', spawn: () => server.child },
+      binPath: 'fake-codex',
+      requestDeadlineMs: 30,
+    })
+    const session = await provider.createSession({ groupId: 'g-1', agentId: 'm-1', role: 'implementation', workspace: '/ws' })
+    const events = collectEvents(session)
+    const turnHandle = await session.startTaskTurn({ taskId: 'task-a', text: 'do it' })
+    server.requestFromServer('item/commandExecution/requestApproval', 77, { threadId: 'thr-1', turnId: 'wire-1', itemId: 'it-1', command: 'rm -rf /tmp/x', reason: 'cleanup' })
+    await vi.waitFor(() => expect(events.some((e) => e.type === 'turn.approval.required')).toBe(true))
+    expect(session.status).toBe('needs_approval')
+    // nobody answers → the deadline fires and the SAFE default executes
+    await vi.waitFor(() => expect(events.some((e) => e.type === 'request.timeout')).toBe(true))
+    const timeout = events.find((e) => e.type === 'request.timeout')!
+    if (timeout.type !== 'request.timeout') throw new Error('unreachable')
+    expect(timeout.requestId).toBe('77')
+    expect(timeout.action).toBe('decline') // the default policy — never an approval
+    expect(timeout.delivered).toBe(true)
+    await vi.waitFor(() => {
+      expect(server.received.some((r) => r.method === 'client-response' && r.id === 77 && (r.params as { decision: string }).decision === 'decline')).toBe(true)
+    })
+    expect(session.listPendingRequests()).toHaveLength(0)
+    expect(session.status).toBe('working')
+    server.finishTurn('wire-1', 'completed')
+    await turnHandle.waitForCompletion()
+    await session.close(50).catch(() => undefined)
   })
 })
