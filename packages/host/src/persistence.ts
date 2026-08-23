@@ -82,6 +82,10 @@ const ACTIVITY_TYPES = [
   'task_attempt_failed',
   'task_attempt_cancelled',
   'task_attempt_lost',
+  'task_dispatch_requested',
+  'task_dispatch_started',
+  'task_dispatch_delivered',
+  'task_dispatch_ambiguous',
 ] as const
 
 const profileSchema = z.object({
@@ -258,6 +262,17 @@ const taskSchema = z.object({
     summary: str.optional(),
     failure: str.optional(),
   })).optional(),
+  dispatch: z.object({
+    sequence: z.number(),
+    ownerId: str,
+    requestedBy: str,
+    requestedAt: z.number(),
+    state: z.enum(['pending', 'dispatching', 'delivered', 'ambiguous']),
+    leaseId: str.optional(),
+    leaseAt: z.number().optional(),
+    deliveredAt: z.number().optional(),
+    failure: str.optional(),
+  }).optional(),
   createdAt: z.number(),
   updatedAt: z.number(),
   result: taskResultSchema.optional(),

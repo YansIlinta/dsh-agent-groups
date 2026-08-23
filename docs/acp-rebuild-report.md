@@ -34,6 +34,7 @@ ACP provider → shared process/connection → member ACP sessions
 ## Attempts, reconciliation, and workspaces
 
 - Every task-bound turn gets an independently identified durable Attempt.
+- Task assignment uses a durable dispatch intent and lease: pending delivery is recovered, while ambiguous in-flight delivery is failed without automatic replay.
 - Terminal Attempt outcomes are one-way and idempotent: completed, failed, cancelled, or lost.
 - Terminal ordering is Attempt → bound Task → queued next turn, preventing late-event task corruption.
 - A non-overlapping reconciler resumes durable sessions and drains durable FIFO turns with exponential backoff.
@@ -62,7 +63,7 @@ At completion:
 - TypeScript typecheck passes.
 - Native client syntax check passes.
 - Production build passes.
-- 170 tests pass; one real-Codex credential smoke test is skipped by default.
+- 173 tests pass; one real-Codex credential smoke test is skipped by default.
 - Real storage write/close/reopen/read durability verification passes.
 
 ## UI changes
