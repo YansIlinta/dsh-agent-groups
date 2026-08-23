@@ -271,10 +271,24 @@ export interface GroupTask extends GroupTaskMetadata {
   readonly attempt: number
   /** Durable execution history; absent on records created before V0.7. */
   readonly attempts?: readonly TaskAttemptRecord[]
+  /** Durable outbox state for Host-to-runtime task delivery. */
+  readonly dispatch?: TaskDispatchRecord
   readonly createdAt: number
   readonly updatedAt: number
   readonly result?: AgentTaskResult
   readonly verification?: TaskVerification
+}
+
+export interface TaskDispatchRecord {
+  readonly sequence: number
+  readonly ownerId: string
+  readonly requestedBy: string
+  readonly requestedAt: number
+  readonly state: 'pending' | 'dispatching' | 'delivered' | 'ambiguous'
+  readonly leaseId?: string
+  readonly leaseAt?: number
+  readonly deliveredAt?: number
+  readonly failure?: string
 }
 
 export interface TaskVerification {
@@ -397,6 +411,10 @@ export type ActivityType =
   | 'task_attempt_failed'
   | 'task_attempt_cancelled'
   | 'task_attempt_lost'
+  | 'task_dispatch_requested'
+  | 'task_dispatch_started'
+  | 'task_dispatch_delivered'
+  | 'task_dispatch_ambiguous'
 
 export interface ActivityEvent {
   readonly id: ActivityId

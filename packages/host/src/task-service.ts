@@ -291,11 +291,21 @@ export class TaskService {
 
   // ── transitions ───────────────────────────────────────────────────────────
 
-  async assign(groupId: GroupId, taskId: TaskId, ownerId: string, assignedBy: string, expectedRevision?: number): Promise<GroupTask> {
+  async assign(groupId: GroupId, taskId: TaskId, ownerId: string, assignedBy: string, expectedRevision?: number, requestDispatch = false): Promise<GroupTask> {
+    const requestedAt = Date.now()
     const task = await this.mutate(groupId, taskId, expectedRevision, (current) => ({
       ...current,
       ownerId,
       assignedBy,
+      ...(requestDispatch ? {
+        dispatch: {
+          sequence: current.attempt,
+          ownerId,
+          requestedBy: assignedBy,
+          requestedAt,
+          state: 'pending' as const,
+        },
+      } : { dispatch: undefined }),
       updatedAt: Date.now(),
     }))
     await this.activity.append({
@@ -305,6 +315,90 @@ export class TaskService {
       refTaskId: taskId,
       refMemberId: ownerId,
       payload: { subject: task.subject, ownerId },
+    })
+    if (requestDispatch) {
+      await this.activity.append({
+        groupId,
+        type: 'task_dispatch_requested',
+        actorId: assignedBy,
+        refTaskId: taskId,
+        refMemberId: ownerId,
+        payload: { sequence: task.attempt },
+      })
+    }
+    return task
+  }
+
+  /** Acquire the durable delivery lease before crossing the runtime boundary. */
+  async beginDispatch(groupId: GroupId, taskId: TaskId, ownerId: string): Promise<string> {
+    const leaseId = randomUUID()
+    const task = await this.mutate(groupId, taskId, undefined, (current) => {
+      const dispatch = current.dispatch
+      if (dispatch === undefined || dispatch.sequence !== current.attempt || dispatch.ownerId !== ownerId) {
+        throw new GroupError('CONFLICT', `task ${taskId} has no current dispatch request for ${ownerId}`)
+      }
+      if (dispatch.state !== 'pending') {
+        throw new GroupError('CONFLICT', `task ${taskId} dispatch is already ${dispatch.state}`)
+      }
+      return {
+        ...current,
+        dispatch: { ...dispatch, state: 'dispatching' as const, leaseId, leaseAt: Date.now() },
+        updatedAt: Date.now(),
+      }
+    })
+    await this.activity.append({
+      groupId,
+      type: 'task_dispatch_started',
+      actorId: task.dispatch?.requestedBy,
+      refTaskId: taskId,
+      refMemberId: ownerId,
+      payload: { sequence: task.attempt, leaseId },
+    })
+    return leaseId
+  }
+
+  async markDispatchDelivered(groupId: GroupId, taskId: TaskId, leaseId: string): Promise<GroupTask> {
+    const task = await this.mutate(groupId, taskId, undefined, (current) => {
+      if (current.dispatch?.state === 'delivered') return current
+      if (current.dispatch?.state !== 'dispatching' || current.dispatch.leaseId !== leaseId) {
+        throw new GroupError('CONFLICT', `task ${taskId} dispatch lease is stale`)
+      }
+      return {
+        ...current,
+        dispatch: { ...current.dispatch, state: 'delivered' as const, deliveredAt: Date.now(), failure: undefined },
+        updatedAt: Date.now(),
+      }
+    })
+    await this.activity.append({
+      groupId,
+      type: 'task_dispatch_delivered',
+      actorId: task.dispatch?.requestedBy,
+      refTaskId: taskId,
+      refMemberId: task.dispatch?.ownerId,
+      payload: { sequence: task.dispatch?.sequence ?? task.attempt, leaseId },
+    })
+    return task
+  }
+
+  async markDispatchAmbiguous(groupId: GroupId, taskId: TaskId, leaseId: string, reason: string): Promise<GroupTask> {
+    const task = await this.mutate(groupId, taskId, undefined, (current) => {
+      if (current.dispatch?.state === 'ambiguous') return current
+      if (current.dispatch?.state !== 'dispatching' || current.dispatch.leaseId !== leaseId) {
+        throw new GroupError('CONFLICT', `task ${taskId} dispatch lease is stale`)
+      }
+      return {
+        ...current,
+        dispatch: { ...current.dispatch, state: 'ambiguous' as const, failure: reason },
+        updatedAt: Date.now(),
+      }
+    })
+    await this.activity.append({
+      groupId,
+      type: 'task_dispatch_ambiguous',
+      actorId: task.dispatch?.requestedBy,
+      refTaskId: taskId,
+      refMemberId: task.dispatch?.ownerId,
+      payload: { sequence: task.dispatch?.sequence ?? task.attempt, leaseId, reason },
     })
     return task
   }
@@ -388,6 +482,7 @@ export class TaskService {
       ...current,
       status: 'pending' as TaskStatus,
       attempt: current.attempt + 1,
+      dispatch: undefined,
       updatedAt: Date.now(),
     }))
     await this.activity.append({

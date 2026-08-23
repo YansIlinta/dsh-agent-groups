@@ -1140,7 +1140,7 @@ export class GroupHost {
     const { group } = this.leaderActor(actor)
     this.groups.assertDispatchable(group)
     this.groups.requireMember(group.groupId, input.ownerId)
-    const task = await this.tasks.assign(group.groupId, input.taskId, input.ownerId, actor, input.expectedRevision)
+    const task = await this.tasks.assign(group.groupId, input.taskId, input.ownerId, actor, input.expectedRevision, input.deliver !== false)
     if (input.deliver !== false) {
       await this.dispatchAssignedTask(group, task, input.ownerId, actor)
     }
@@ -1153,44 +1153,57 @@ export class GroupHost {
    * member is busy (never a retarget of the running turn).
    */
   private async dispatchAssignedTask(group: GroupRecord, task: GroupTask, ownerId: string, assignedBy: string): Promise<void> {
-    // record the member's current task (external runtimes cannot claim themselves)
-    await this.groups.patchMember(group.groupId, ownerId, { currentTaskId: task.taskId })
-    const message = createRuntimeMessage({
-      type: 'task_assignment',
-      groupId: group.groupId,
-      senderId: assignedBy,
-      recipientId: ownerId,
-      taskId: task.taskId,
-      priority: task.priority,
-      payload: {
+    const leaseId = await this.tasks.beginDispatch(group.groupId, task.taskId, ownerId)
+    try {
+      // record the member's current task (external runtimes cannot claim themselves)
+      await this.groups.patchMember(group.groupId, ownerId, { currentTaskId: task.taskId })
+      const message = createRuntimeMessage({
+        type: 'task_assignment',
+        groupId: group.groupId,
+        senderId: assignedBy,
+        recipientId: ownerId,
         taskId: task.taskId,
-        subject: task.subject,
-        description: task.description,
-        kind: task.kind,
-        acceptanceCriteria: task.acceptanceCriteria,
-        writeScopes: task.writeScopes,
-        blockedBy: task.blockedBy,
-        taskBrief: this.taskBrief(group, task),
-      },
-    })
-    const text = runtimeMessageText(message)
-    if (this.memberRuntimes.has(ownerId)) {
-      // Runtime members route through their persistent SESSION: the
-      // assignment becomes a TURN (or a queued future turn when busy), and
-      // the session ensures the member's OWN configuration on attach.
-      await this.deliverToMemberRuntime(group.groupId, ownerId, text, task.taskId)
-    } else if (this.groups.getMembership(group.groupId, ownerId)?.runtime !== undefined) {
-      // A runtime member with no live session = resume failed or was never
-      // attempted — fail LOUDLY; never start a fresh conversation silently.
-      const ownerRecord = this.groups.requireMember(group.groupId, ownerId)
-      throw new GroupError('SESSION_RESUME_FAILED', `member ${ownerRecord.name} has no live runtime session; the provider session could not be resumed — retry the task after resume, or spawn a new member`)
-    } else {
-      // Plain DSH profile members keep the waking deliver path.
-      await this.adapter.deliver(
-        ownerId,
-        textContent(text),
-        groupMessageSource(group.groupId, { direction: 'leader-to-member', label: 'task assignment' }),
-      )
+        priority: task.priority,
+        payload: {
+          taskId: task.taskId,
+          subject: task.subject,
+          description: task.description,
+          kind: task.kind,
+          acceptanceCriteria: task.acceptanceCriteria,
+          writeScopes: task.writeScopes,
+          blockedBy: task.blockedBy,
+          taskBrief: this.taskBrief(group, task),
+        },
+      })
+      const text = runtimeMessageText(message)
+      if (this.memberRuntimes.has(ownerId)) {
+        // Runtime members route through their persistent SESSION: the
+        // assignment becomes a TURN (or a queued future turn when busy), and
+        // the session ensures the member's OWN configuration on attach.
+        await this.deliverToMemberRuntime(group.groupId, ownerId, text, task.taskId)
+      } else if (this.groups.getMembership(group.groupId, ownerId)?.runtime !== undefined) {
+        // A runtime member with no live session = resume failed or was never
+        // attempted — fail LOUDLY; never start a fresh conversation silently.
+        const ownerRecord = this.groups.requireMember(group.groupId, ownerId)
+        throw new GroupError('SESSION_RESUME_FAILED', `member ${ownerRecord.name} has no live runtime session; the provider session could not be resumed — retry the task after resume, or spawn a new member`)
+      } else {
+        // Plain DSH profile members keep the waking deliver path.
+        await this.adapter.deliver(
+          ownerId,
+          textContent(text),
+          groupMessageSource(group.groupId, { direction: 'leader-to-member', label: 'task assignment' }),
+        )
+      }
+      await this.tasks.markDispatchDelivered(group.groupId, task.taskId, leaseId)
+    } catch (error) {
+      const reason = `task delivery outcome is uncertain: ${error instanceof Error ? error.message : String(error)}`
+      await this.tasks.markDispatchAmbiguous(group.groupId, task.taskId, leaseId, reason).catch(() => undefined)
+      const latest = this.tasks.requireTask(group.groupId, task.taskId)
+      if (latest.status !== 'completed' && latest.status !== 'review' && latest.status !== 'failed') {
+        await this.tasks.markFailed(group.groupId, task.taskId, 'runtime-dispatcher', reason).catch(() => undefined)
+      }
+      await this.groups.patchMember(group.groupId, ownerId, { currentTaskId: undefined, error: reason }).catch(() => undefined)
+      throw error
     }
   }
 
@@ -2001,7 +2014,45 @@ export class GroupHost {
         }
       }
     }
+    await this.reconcileTaskDispatches()
     await this.reconcileOrphanedAttempts()
+  }
+
+  /** Reconcile the durable task-delivery outbox without unsafe replay. */
+  private async reconcileTaskDispatches(): Promise<void> {
+    for (const group of this.groups.listGroups()) {
+      if (group.status !== 'active' || group.pausedAt !== undefined) continue
+      for (const task of this.tasks.listTasks(group.groupId)) {
+        const dispatch = task.dispatch
+        if (dispatch === undefined || dispatch.sequence !== task.attempt) continue
+        if (dispatch.state === 'delivered' || dispatch.state === 'ambiguous') continue
+        const runtime = this.memberRuntimes.get(dispatch.ownerId)
+        const liveBinding = runtime?.activeTurn?.taskId === task.taskId
+          || runtime?.queuedTurns.some((turn) => turn.kind === 'task' && turn.taskId === task.taskId) === true
+        if (dispatch.state === 'dispatching') {
+          if (liveBinding && dispatch.leaseId !== undefined) {
+            await this.tasks.markDispatchDelivered(group.groupId, task.taskId, dispatch.leaseId).catch(() => undefined)
+            continue
+          }
+          const reason = 'Host restart found an in-flight dispatch lease without a matching live or queued turn; refusing automatic replay'
+          if (dispatch.leaseId !== undefined) {
+            await this.tasks.markDispatchAmbiguous(group.groupId, task.taskId, dispatch.leaseId, reason).catch(() => undefined)
+          }
+          const latest = this.tasks.requireTask(group.groupId, task.taskId)
+          if (latest.status !== 'completed' && latest.status !== 'review' && latest.status !== 'failed') {
+            await this.tasks.markFailed(group.groupId, task.taskId, 'runtime-reconciler', reason).catch(() => undefined)
+          }
+          if (this.groups.getMembership(group.groupId, dispatch.ownerId)?.currentTaskId === task.taskId) {
+            await this.groups.patchMember(group.groupId, dispatch.ownerId, { currentTaskId: undefined, error: reason }).catch(() => undefined)
+          }
+          continue
+        }
+        // `pending` means no external boundary was crossed, so replay is safe.
+        if (task.status === 'pending') {
+          await this.dispatchAssignedTask(group, task, dispatch.ownerId, dispatch.requestedBy).catch(() => undefined)
+        }
+      }
+    }
   }
 
   /**

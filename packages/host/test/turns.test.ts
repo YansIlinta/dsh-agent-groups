@@ -418,6 +418,7 @@ describe('V0.5: persistent sessions & turn-based task completion', () => {
     const taskA = await assign(host, groupId, memberId, 'implement auth')
     await sleep(5)
     expect(provider.startedTurns[0]?.taskId).toBe(taskA.taskId)
+    expect(host.tasks.requireTask(groupId, taskA.taskId).dispatch?.state).toBe('delivered')
     provider.sessionOf(memberId)!.completeActiveTurn('auth implemented')
     await sleep(10)
     const doneA = host.tasks.listTasks(groupId).find((t) => t.taskId === taskA.taskId)!
@@ -636,6 +637,44 @@ describe('V0.5: persistent sessions & turn-based task completion', () => {
     expect(provider2.startedTurns).toHaveLength(0)
     expect(host2.groups.requireMember(groupId, memberId).currentTaskId).toBeUndefined()
     expect(host2.activity.list(groupId).some((event) => event.type === 'task_attempt_lost')).toBe(true)
+  })
+
+  it('reconciliation safely delivers a pending dispatch intent exactly once', async () => {
+    const stores = makeStores()
+    const provider1 = new FakeThreadProvider()
+    const host1 = makeTurnHost(stores, provider1)
+    const { groupId, memberId } = await seedTeam(host1)
+    const task = await host1.createTask('lead-1', { subject: 'durable outbox', description: '…', kind: 'implementation', acceptanceCriteria: ['works'] })
+    await host1.tasks.assign(groupId, task.taskId, memberId, 'lead-1', undefined, true)
+    expect(host1.tasks.requireTask(groupId, task.taskId).dispatch?.state).toBe('pending')
+
+    const provider2 = new FakeThreadProvider()
+    const host2 = makeTurnHost(stores, provider2)
+    await host2.resumeAllMemberRuntimes()
+    await sleep(10)
+    expect(provider2.startedTurns).toHaveLength(1)
+    expect(provider2.startedTurns[0]?.taskId).toBe(task.taskId)
+    expect(host2.tasks.requireTask(groupId, task.taskId).dispatch?.state).toBe('delivered')
+    await host2.resumeAllMemberRuntimes()
+    expect(provider2.startedTurns).toHaveLength(1)
+  })
+
+  it('reconciliation makes an orphaned in-flight dispatch ambiguous without replay', async () => {
+    const stores = makeStores()
+    const provider1 = new FakeThreadProvider()
+    const host1 = makeTurnHost(stores, provider1)
+    const { groupId, memberId } = await seedTeam(host1)
+    const task = await host1.createTask('lead-1', { subject: 'ambiguous outbox', description: '…', kind: 'implementation', acceptanceCriteria: ['works'] })
+    await host1.tasks.assign(groupId, task.taskId, memberId, 'lead-1', undefined, true)
+    await host1.tasks.beginDispatch(groupId, task.taskId, memberId)
+
+    const provider2 = new FakeThreadProvider()
+    const host2 = makeTurnHost(stores, provider2)
+    await host2.resumeAllMemberRuntimes()
+    const reconciled = host2.tasks.requireTask(groupId, task.taskId)
+    expect(reconciled.dispatch).toMatchObject({ state: 'ambiguous', failure: expect.stringContaining('refusing automatic replay') })
+    expect(reconciled.status).toBe('failed')
+    expect(provider2.startedTurns).toHaveLength(0)
   })
 
   it('resume failure fails LOUDLY — no silent second conversation', async () => {

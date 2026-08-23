@@ -75,6 +75,8 @@ A Group Task is a domain object. A completed provider turn may create a completi
 
 Each task turn creates one durable Attempt, idempotently keyed by the provider turn id. Reopening a task advances the attempt sequence. Attempt terminal states are `completed`, `failed`, `cancelled`, or `lost`; a process/session disconnect settles active work as `lost`, never as success, and late duplicate events cannot overwrite a terminal outcome.
 
+Task assignment uses a durable dispatch outbox. `pending` means the Host has not crossed the runtime boundary; `dispatching` carries a lease while delivery is in progress. On recovery, a matching active or queued turn proves delivery and advances the record to `delivered`. A lease without a matching runtime binding becomes `ambiguous`: the task fails and requires an explicit retry, so the Host never risks replaying work that may already have reached the provider. Dispatch state is authoritative and is not reconstructed from the activity log.
+
 ### Workspace execution
 
 Groups choose a workspace policy at creation. `shared` gives every member the snapshotted group directory. `worktree` validates that directory as a Git repository and creates a persistent detached worktree per member outside the repository. The member's resolved path is stored in its runtime-session metadata and reused across host restarts and task retries. Automatic removal is intentionally excluded: cleanup must be an explicit administrative operation so the host never destroys unreviewed work.
