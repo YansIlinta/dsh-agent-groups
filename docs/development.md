@@ -28,6 +28,7 @@ npm run build          # host + native DSH client bundle
 npm run typecheck      # source + test typecheck
 npm test               # Vitest suite
 npm run build:native   # native client bundle only
+npm run verify         # complete pre-PR verification chain
 ```
 
 Useful integration helpers:
@@ -96,10 +97,7 @@ See [Native UI](native-ui.md).
 ## Before opening a pull request
 
 ```bash
-npm run typecheck
-npm test
-npm run build
-node --check packages/host/lib/client.js
+npm run verify
 ```
 
 Also run the smallest relevant integration/demo path for the behavior you changed.
