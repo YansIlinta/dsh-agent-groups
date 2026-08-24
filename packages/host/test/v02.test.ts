@@ -65,6 +65,37 @@ describe('V0.2: task editing', () => {
   })
 })
 
+describe('V0.6: user-console task assignment (dispatch request regression)', () => {
+  it('userAssignTask and userCreateTask(ownerId) create the dispatch request row and deliver', async () => {
+    const host = makeHost()
+    const group = await host.initGroup('lead-1', { name: 'T', objective: 'demo', acceptanceCriteria: ['x'] })
+    const member = await host.spawnMember('lead-1', { profileId: 'frontend-engineer' })
+
+    // page console: create WITHOUT owner, then assign → must dispatch
+    // (regression: beginDispatch used to 409 'no current dispatch request').
+    const task = await host.userCreateTask(group.groupId, { subject: 'do x', kind: 'implementation', acceptanceCriteria: ['done'] })
+    expect(task.ownerId).toBeUndefined()
+    const assigned = await host.userAssignTask(group.groupId, task.taskId, member.sessionId)
+    expect(assigned.ownerId).toBe(member.sessionId)
+    // the return is the pre-dispatch snapshot; the DISPATCH row must exist
+    // and reach the delivered state in the durable record
+    expect(assigned.dispatch?.state).toBe('pending')
+    const afterAssign = host.tasks.requireTask(group.groupId, task.taskId)
+    expect(afterAssign.dispatch?.state).toBe('delivered')
+    expect(afterAssign.dispatch?.ownerId).toBe(member.sessionId)
+
+    // page console: create WITH owner → dispatches in the same call (the
+    // return is the pre-assign snapshot; the durable record carries the result)
+    const direct = await host.userCreateTask(group.groupId, { subject: 'do y', kind: 'implementation', ownerId: member.sessionId, acceptanceCriteria: ['done'] })
+    const afterDirect = host.tasks.requireTask(group.groupId, direct.taskId)
+    expect(afterDirect.ownerId).toBe(member.sessionId)
+    expect(afterDirect.dispatch?.state).toBe('delivered')
+
+    const delivered = host.activity.list(group.groupId).filter((a) => a.type === 'task_dispatch_delivered')
+    expect(delivered).toHaveLength(2)
+  })
+})
+
 describe('V0.2: channel reply & pin', () => {
   it('stores reply relationships and validates the parent exists', async () => {
     const h = makeHarness()

@@ -1974,7 +1974,10 @@ export class GroupHost {
     })
     if (input.ownerId !== undefined) {
       this.groups.requireMember(group.groupId, input.ownerId)
-      await this.tasks.assign(group.groupId, task.taskId, input.ownerId, 'User')
+      // V0.6 regression: the dispatch REQUEST row is a beginDispatch
+      // precondition — the Leader path passes `deliver !== false`; the user
+      // console must request dispatch explicitly too (see assignTask).
+      await this.tasks.assign(group.groupId, task.taskId, input.ownerId, 'User', undefined, true)
       await this.dispatchAssignedTask(group, task, input.ownerId, 'User')
     }
     return task
@@ -1986,7 +1989,10 @@ export class GroupHost {
     this.groups.assertMutable(group)
     this.groups.assertDispatchable(group)
     this.groups.requireMember(group.groupId, ownerId)
-    const task = await this.tasks.assign(group.groupId, taskId, ownerId, 'User')
+    // V0.6 regression: explicit dispatch request (mirrors assignTask's
+    // `deliver !== false`); without it beginDispatch 409s on every page-console
+    // assignment.
+    const task = await this.tasks.assign(group.groupId, taskId, ownerId, 'User', undefined, true)
     await this.dispatchAssignedTask(group, task, ownerId, 'User')
     return task
   }
