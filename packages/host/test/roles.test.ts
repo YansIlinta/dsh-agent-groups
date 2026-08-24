@@ -433,6 +433,50 @@ describe('V0.4.1: optional role provider/reasoningEffort (backward compatible)',
     expect(legacy.teamConfig?.memberRoles[0]?.reasoningEffort).toBe('whatever')
   })
 
+  it('rejects an abstract reasoningLevel not offered by the route (DeepSeek medium incident, Q3 warning)', async () => {
+    const discovery: HostDiscoverySource = {
+      listProviderIds: async () => ['deepseek-official', 'opencode-go'],
+      listReasoningEfforts: async (provider) => (provider === 'deepseek-official' ? ['high', 'max'] : undefined),
+      listProviders: () => [
+        { id: 'deepseek-official', name: 'DeepSeek' },
+        { id: 'opencode-go', name: 'OpenCode Go' },
+      ],
+      listModels: async () => [],
+      resolveReasoning: async () => undefined,
+      listConfigurableProviders: () => [],
+      credentialStatus: async (provider) => ({ provider }),
+    }
+    const { groupHost } = makeRoleHost({ discovery })
+    const group = await groupHost.initGroup('lead-1', { name: 'T', objective: 'demo', acceptanceCriteria: ['x'] })
+    // legacy level 'medium' only (no reasoningEffort) on a resolvable route:
+    // the request path would reject it (UNSUPPORTED_REASONING_EFFORT) — the
+    // save must fail loudly instead, listing the offered effort ids.
+    const rejection = groupHost.updateTeamConfig(group.groupId, {
+      leaderRole: LEADER_ROLE,
+      memberRoles: [{ id: 'a', name: 'A', runtime: 'deepseek-harness', provider: 'deepseek-official', reasoningLevel: 'medium' }],
+    }, 'User')
+    await expect(rejection).rejects.toMatchObject({ code: 'REASONING_UNAVAILABLE' })
+    await expect(rejection).rejects.toThrow(/offered: high, max/)
+    // 'high' IS an offered effort id → the legacy level passes as-is
+    const ok = await groupHost.updateTeamConfig(group.groupId, {
+      leaderRole: LEADER_ROLE,
+      memberRoles: [{ id: 'b', name: 'B', runtime: 'deepseek-harness', provider: 'deepseek-official', reasoningLevel: 'high' }],
+    }, 'User')
+    expect(ok.teamConfig?.memberRoles[0]?.reasoningLevel).toBe('high')
+    // route with unresolvable efforts → accept, the runtime gates at request time
+    const unresolvable = await groupHost.updateTeamConfig(group.groupId, {
+      leaderRole: LEADER_ROLE,
+      memberRoles: [{ id: 'c', name: 'C', runtime: 'deepseek-harness', provider: 'opencode-go', reasoningLevel: 'low' }],
+    }, 'User')
+    expect(unresolvable.teamConfig?.memberRoles[0]?.reasoningLevel).toBe('low')
+    // a pinned reasoningEffort takes precedence: the legacy level is ignored
+    const explicit = await groupHost.updateTeamConfig(group.groupId, {
+      leaderRole: LEADER_ROLE,
+      memberRoles: [{ id: 'd', name: 'D', runtime: 'deepseek-harness', provider: 'deepseek-official', reasoningLevel: 'medium', reasoningEffort: 'max' }],
+    }, 'User')
+    expect(explicit.teamConfig?.memberRoles[0]?.reasoningEffort).toBe('max')
+  })
+
   it('role provider/reasoningEffort flow into the spawn config and the member record', async () => {
     const { groupHost, provider } = makeRoleHost()
     const group = await groupHost.initGroup('lead-1', { name: 'T', objective: 'demo', acceptanceCriteria: ['x'] })

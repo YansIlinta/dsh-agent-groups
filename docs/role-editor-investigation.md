@@ -585,3 +585,32 @@ Codex/Claude providers.
 - Map the abstract `low|medium|high` reasoning level to each adapter's real
   effort ids; the DeepSeek adapter accepts only `off|high|max` and rejects
   unknown ids at request time.
+
+---
+
+## Implementation status (V0.4.1) — applied as shipped
+
+Implemented per the Q6 minimal change list; each item shipped with tests:
+
+| Q6 item | Status |
+|---|---|
+| (a) Role schema + normalization | `AgentRoleDefinition.provider` / `reasoningEffort` (both optional), `roleDefinitionSchema`, `normalizeTeamConfig` passthrough, `updateTeamConfig` validation — commit `8808e69`, `packages/host/src/group-host.ts:235-296` |
+| (b) Host discovery service | new `packages/host/src/harness-discovery.ts` (`HarnessDiscovery` over optional `ctx.get('llm'|'credentials'|'settings')` + `agentDefaultModel` default route); unit suite `test/harness-discovery.test.ts` |
+| (c) Spawn wiring | first-class `provider` (+ `reasoningEffort`) in `RuntimeAgentConfig` → `MemberCreateSpec`; `metadata.provider` read kept for legacy roles; `reasoningEffort` takes precedence over legacy `reasoningLevel` in `memberSetup`; resume re-applies the original config via the existing durable `runtimeSession` (regression `test/dsh-resume.test.ts`) |
+| (d) Web API endpoints | `GET /groups/api/config/providers` (+ `/:id/models`, `/:id/credential`), degraded-mode note; route coverage in `test/api-routes.test.ts` |
+| (e) Native client UI | Create Role wizard (Name→Runtime→Provider→Authentication→Model→Reasoning→Instructions→Create; Reasoning step gated by the selected model's live efforts) + RoleCard provider/effort selects + credential status; smoke suite `test/native-client-smoke.test.ts` |
+| (f) Tests | see per-item suites above; persistence back-compat and secret-field rejection in `test/roles.test.ts` |
+
+**Rejected at save time, never at request time (Q3 ⚠ incident fix):** on DSH
+runtimes with a resolvable route, a legacy abstract `reasoningLevel` that is
+NOT an offered effort id (e.g. `medium` on the DeepSeek adapter's
+`off|high|max`) is rejected by `updateTeamConfig` (`REASONING_UNAVAILABLE`,
+listing the offered ids) instead of spawning members that die on their first
+turn with `UNSUPPORTED_REASONING_EFFORT`. No silent remapping — the user picks
+an offered effort or leaves both fields unset for the adapter default. Guard +
+regression test: `packages/host/src/group-host.ts` / `test/roles.test.ts`.
+
+Credentials never enter any of this surface: `updateTeamConfig` rejects
+secret-named payload fields (defense in depth, `hasSecretField`), discovery
+returns status facts + reference names only, and every response is asserted
+secret-free in the test suites.

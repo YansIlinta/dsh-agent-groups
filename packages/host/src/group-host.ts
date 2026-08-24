@@ -271,6 +271,21 @@ export class GroupHost {
           throw new GroupError('REASONING_UNAVAILABLE', `role "${definition.id}": reasoningEffort "${effort}" is not available for${provider !== undefined ? ` provider "${provider}"` : ' the default provider'}${definition.model !== undefined ? ` / model "${definition.model}"` : ''}`)
         }
       }
+      // V0.4.1: legacy abstract level guard (investigation Q3 ⚠ — live
+      // incident). On the DSH runtime the abstract low/medium/high level is
+      // passed DIRECTLY as the adapter effort id and the request path rejects
+      // ids the model does not offer (UNSUPPORTED_REASONING_EFFORT), so a
+      // level like 'medium' spawns members that die on their first turn. When
+      // the route's real effort set is resolvable and the abstract level id is
+      // not among it, reject at save time with the offered ids instead of
+      // letting the request path kill the member. No silent remapping — the
+      // user picks an offered effort or leaves it unset for the adapter default.
+      if (definition.reasoningLevel !== undefined && effort === undefined) {
+        const efforts = await this.discovery.listReasoningEfforts(provider, definition.model)
+        if (efforts !== undefined && efforts.length > 0 && !efforts.includes(definition.reasoningLevel)) {
+          throw new GroupError('REASONING_UNAVAILABLE', `role "${definition.id}": abstract reasoningLevel "${definition.reasoningLevel}" is not an offered effort id for${provider !== undefined ? ` provider "${provider}"` : ' the default provider'}${definition.model !== undefined ? ` / model "${definition.model}"` : ''} (offered: ${efforts.join(', ')}); set reasoningEffort to one of these, or unset both to keep the provider default`)
+        }
+      }
     }
     await check(next.leaderRole)
     for (const definition of next.memberRoles) await check(definition)
