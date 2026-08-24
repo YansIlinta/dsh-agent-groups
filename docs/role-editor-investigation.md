@@ -614,3 +614,35 @@ Credentials never enter any of this surface: `updateTeamConfig` rejects
 secret-named payload fields (defense in depth, `hasSecretField`), discovery
 returns status facts + reference names only, and every response is asserted
 secret-free in the test suites.
+
+### Live verification (real harness, after reinstall + relaunch)
+
+All checks below ran against the running web server (`127.0.0.1:8080`) with the
+real `ctx.llm` / `ctx.credentials` / `ctx.settings` services:
+
+- `/groups/api/config/providers` → 5 live routes; per-route settings entry point
+  + `credentialRef` + `configured`/`source`/`writable`, zero secret values.
+- Per-model efforts resolve live and vary per route: `deepseek-official`
+  (`deepseek-v4-flash`/`pro`) → `off|high|max` (default `high`); pi-ai
+  `opencode-go` → `minimax-m3`/`qwen3.7-*` offer `off|minimal|low|medium|high`,
+  but `deepseek-v4-flash` on that route offers only `off|high|max` — the exact
+  topology of the Q3 ⚠ incident (medium rejected at request time).
+- Save-time gates confirmed live on a duplicated test group:
+  - `reasoningEffort: 'medium'` on opencode-go/deepseek-v4-flash → 409
+    `REASONING_UNAVAILABLE`;
+  - legacy `reasoningLevel: 'medium'` only → 409 with `offered: off, high, max`;
+  - secret-named field inside `metadata` (the only opaque passthrough) → 409
+    `CONFLICT` (top-level unknown fields are stripped by the web normalizer).
+- Happy path: role `e2e-writer` (`opencode-go` / `deepseek-v4-flash` /
+  `reasoningEffort: 'high'`) saved, member spawned with all three fields in the
+  durable record and `runtimeSession`; a real task turn completed — member
+  replied exactly "OK", submitted a completion claim, and the live Leader
+  session verified it (`passed=true`).
+- **Live bug found + fixed in the same session (V0.6):** page-console task
+  assignment 409'd with `task ... has no current dispatch request` because
+  `userAssignTask` / `userCreateTask(ownerId)` never passed `requestDispatch`
+  (the Leader path did). Fixed and covered by a regression test
+  (`test/v02.test.ts`); the post-fix assignment dispatched a real turn.
+- Also observed live (recorded by the Leader agent, not investigated):
+  a group-tool call failed once with `value is not lossless JSON` and
+  succeeded on retry — a harness/tool serialization quirk.
