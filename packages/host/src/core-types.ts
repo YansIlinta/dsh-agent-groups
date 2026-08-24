@@ -186,10 +186,14 @@ export interface GroupMember {
   readonly roleId?: string
   /** V0.4: runtime this instance runs on (tenant of the role config). */
   readonly runtime?: string
+  /** V0.4: effective model-provider this instance was spawned with. */
+  readonly provider?: string
   /** V0.4: effective model this instance was spawned with. */
   readonly model?: string
   /** V0.4: effective reasoning level this instance was spawned with. */
   readonly reasoningLevel?: string
+  /** V0.4.1: effective adapter-owned reasoning-effort id this instance was spawned with. */
+  readonly reasoningEffort?: string
   /**
    * V0.5: durable runtime-session metadata — enough to RE-ATTACH the same
    * provider conversation after a DSH/plugin restart. Never contains
@@ -208,6 +212,8 @@ export interface RuntimeSessionDurable {
   readonly workspace?: string
   readonly model?: string
   readonly reasoningLevel?: string
+  /** V0.4.1: adapter-owned effort id the session was created with (durable). */
+  readonly reasoningEffort?: string
   /** Negotiated runtime capabilities used by the UI and restart reconciliation. */
   readonly providerCapabilities?: Readonly<Record<string, unknown>>
   /** Authoritative future-turn FIFO. Full text is durable; API views truncate it. */
@@ -541,10 +547,29 @@ export interface AgentRoleDefinition {
   readonly runtime: string
   /** Agent preset / profile used when the runtime supports profiles. */
   readonly profile?: string
+  /**
+   * DSH model-provider id this role pins (adapter-owned, e.g.
+   * 'deepseek-official'). Optional: when unset the runtime/harness default
+   * applies. Meaningful for DSH runtimes (`deepseek-harness`); non-DSH
+   * runtimes treat it as opaque and keep their current behavior.
+   */
+  readonly provider?: string
   /** Model id interpreted by the runtime's provider. */
   readonly model?: string
-  /** Abstract reasoning strength: low | medium | high (runtime translates). */
+  /**
+   * Abstract reasoning strength: low | medium | high. Legacy vocabulary —
+   * kept exactly as-is for backward compatibility; runtimes translate it.
+   */
   readonly reasoningLevel?: string
+  /**
+   * Adapter-owned reasoning-EFFORT id (e.g. 'high' / 'max' on the DeepSeek
+   * adapter). Optional: when set it names the exact effort id the adapter
+   * accepts and takes precedence over the abstract `reasoningLevel` at spawn
+   * time; when unset, `reasoningLevel` (or the runtime default) applies. The
+   * runtime still gates the effort against the provider/model capabilities at
+   * request time, so unknown ids fail loudly rather than silently falling back.
+   */
+  readonly reasoningEffort?: string
   /** Role-specific system prompt, layered BELOW the member protocol. */
   readonly systemPrompt?: string
   /** Hard cap on concurrent instances of this role. */

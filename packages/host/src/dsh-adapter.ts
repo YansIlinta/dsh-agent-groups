@@ -33,6 +33,8 @@ export interface MemberCreateSpec {
   readonly model?: string
   /** V0.4: abstract reasoning level (low/medium/high) mapped onto the DSH model-selection reasoning effort. */
   readonly reasoningLevel?: string
+  /** V0.4.1: exact adapter-owned reasoning-effort id; takes precedence over `reasoningLevel`. */
+  readonly reasoningEffort?: string
 }
 
 /**
@@ -137,19 +139,27 @@ export class DshAgentRuntimeAdapter implements AgentRuntimeAdapter {
    * configuration (provider/model/reasoningLevel) is installed on every
    * attach, so a role-configured member NEVER drifts to the global default.
    */
-  private memberSetup(spec: { cwd?: string; provider?: string; model?: string; reasoningLevel?: string }): (agentCtx: Context) => Promise<void> {
+  private memberSetup(spec: { cwd?: string; provider?: string; model?: string; reasoningLevel?: string; reasoningEffort?: string }): (agentCtx: Context) => Promise<void> {
     return async (agentCtx: Context) => {
       // The member world: work tools + group member tools + member section,
       // taken from the shipped `group-member` agent preset.
       await this.agentPresets.mount(agentCtx, MEMBER_PRESET_ID)
       const provider = spec.provider ?? this.selection().provider
       const model = spec.model ?? this.selection().model
-      // Role-configured reasoning effort rides the agent-scoped model
-      // selection (the DSH entry point for reasoning strength per agent).
-      if (provider !== undefined && model !== undefined && spec.reasoningLevel !== undefined) {
-        const effort = ReasoningEffortId(spec.reasoningLevel)
+      // Role-configured reasoning rides the agent-scoped model selection (the
+      // DSH entry point for reasoning strength per agent). V0.4.1: the exact
+      // adapter-owned reasoningEffort (when the role pins one) takes precedence
+      // over the abstract legacy reasoningLevel; roles with neither keep the
+      // provider's own default (no selection installed — unchanged behavior).
+      const reasoningLevel = spec.reasoningLevel
+      const effort = spec.reasoningEffort !== undefined && spec.reasoningEffort !== ''
+        ? spec.reasoningEffort
+        : reasoningLevel !== undefined
+          ? ReasoningEffortId(reasoningLevel)
+          : undefined
+      if (provider !== undefined && model !== undefined && effort !== undefined) {
         agentCtx.effect(() => installModelSelection(agentCtx, {
-          current: { provider, model, reasoningEffort: effort },
+          current: { provider, model, reasoningEffort: ReasoningEffortId(effort) },
           assembled: undefined,
         }))
       }

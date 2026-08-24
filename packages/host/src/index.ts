@@ -22,6 +22,7 @@ import { ActivityService } from './activity-service.js'
 import { ProfileRegistry } from './profile-registry.js'
 import { GroupNotifier } from './notifier.js'
 import { GroupHost } from './group-host.js'
+import { mountHarnessDiscovery } from './harness-discovery.js'
 import { DshAgentRuntimeAdapter, type DefaultModelSelection } from './dsh-adapter.js'
 import { installMemberPeerContactPolicy } from './policy.js'
 import { buildCompatibilityReport, detectSurfaces, printCompatibility } from './compatibility.js'
@@ -76,6 +77,8 @@ export { AgentContextService, createEmptyCursor } from './runtime/context.js'
 export { RuntimeRecovery } from './runtime/recovery.js'
 export type { RecoveryOptions } from './runtime/recovery.js'
 export { RUNTIME_PRESETS, ROLE_PRESETS, TEAM_PRESETS, getRuntimePreset, getRolePreset, getTeamPreset, resolveRolePreset, resolveTeamPreset } from './runtime/presets.js'
+export { HarnessDiscovery, mountHarnessDiscovery } from './harness-discovery.js'
+export type { HostDiscoverySource, RoleProviderDiscovery, ProviderCredentialStatus, ReasoningInfo } from './harness-discovery.js'
 export type { RuntimePreset, RolePreset, TeamPreset, TeamPresetRoleRef } from './runtime/presets.js'
 export type { AgentContextCursor, AgentContextDelta } from './runtime/context.js'
 export { BRIDGE_MARKER, parseBridgeAction, codexBridgeInstructions, executeBridgeAction } from './runtime/codex-bridge.js'
@@ -151,7 +154,7 @@ export async function apply(ctx: Context): Promise<void> {
   // Legacy bridge-based Claude Code CLI provider (kept for stored roles).
   runtimes.register(new ClaudeCodeRuntimeProvider({ getBridge: () => codexBridge }))
 
-  const host = new GroupHost({ groups, tasks, channel, privateMessages, activity, profiles, notifier, adapter, leaders, runtimes })
+  const host = new GroupHost({ groups, tasks, channel, privateMessages, activity, profiles, notifier, adapter, leaders, runtimes, discovery: mountHarnessDiscovery(ctx) })
   codexBridge = new ExternalAgentBridge(host)
   ctx.provide('groupHost', host)
 

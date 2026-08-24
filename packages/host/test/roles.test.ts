@@ -7,8 +7,9 @@ import type { AgentRoleDefinition, TeamConfig } from '../src/core-types.js'
 import { RuntimeRegistry } from '../src/runtime/registry.js'
 import { teamConfigFor, templateTeamConfig, ROLE_TEMPLATES, LEADER_ROLE } from '../src/runtime/team-config.js'
 import { DEFAULT_REASONING_LEVELS, type AgentRuntimeProvider, type ModelDescriptor, type ReasoningOption, type RuntimeAgentConfig, type RuntimeAgentHandle, type RuntimeCapabilities } from '../src/runtime/base.js'
-import { GroupHost } from '../src/group-host.js'
+import { GroupHost, type HostDiscoverySource } from '../src/group-host.js'
 import { createNoopAdapter } from '../src/dsh-adapter.js'
+import { parseRecord } from '../src/persistence.js'
 import { makeStores, makeHarness } from './helpers.js'
 
 /** Deterministic fake provider recording every spawn config. */
@@ -65,7 +66,7 @@ const TEN_MEMBER_TEAM: TeamConfig = {
   ],
 }
 
-function makeRoleHost() {
+function makeRoleHost(opts: { discovery?: HostDiscoverySource } = {}) {
   const stores = makeStores()
   const h = makeHarness(stores)
   const registry = new RuntimeRegistry()
@@ -82,6 +83,7 @@ function makeRoleHost() {
     adapter: createNoopAdapter(),
     leaders: h.leaders,
     runtimes: registry,
+    discovery: opts.discovery,
   })
   return { groupHost, provider, registry }
 }
@@ -293,5 +295,165 @@ describe('V0.4: runtime registry', () => {
     expect(registry.get('probe')).toBe(provider)
     expect(registry.list().map((p) => p.id)).toEqual(['probe'])
     expect(() => registry.register(provider)).toThrow(/already registered/)
+  })
+})
+
+describe('V0.4.1: optional role provider/reasoningEffort (backward compatible)', () => {
+  it('role definitions accept optional provider/reasoningEffort and persist (roundtrip)', async () => {
+    const { groupHost } = makeRoleHost()
+    const group = await groupHost.initGroup('lead-1', { name: 'T', objective: 'demo', acceptanceCriteria: ['x'] })
+    const config: TeamConfig = {
+      leaderRole: LEADER_ROLE,
+      memberRoles: [{
+        id: 'impl', name: 'Impl', runtime: 'fake-runtime',
+        provider: 'deepseek-official', model: 'deepseek-v4-flash',
+        reasoningLevel: 'high', reasoningEffort: 'max', maxInstances: 1,
+      }],
+    }
+    const updated = await groupHost.updateTeamConfig(group.groupId, config, 'User')
+    expect(groupHost.teamConfig(updated).memberRoles[0]?.provider).toBe('deepseek-official')
+    expect(groupHost.teamConfig(updated).memberRoles[0]?.reasoningEffort).toBe('max')
+    // the DURABLE record validates at the read boundary WITH the new fields.
+    const parsed = parseRecord<any>('groups', updated)
+    expect(parsed.teamConfig.memberRoles[0].provider).toBe('deepseek-official')
+    expect(parsed.teamConfig.memberRoles[0].reasoningEffort).toBe('max')
+  })
+
+  it('legacy records without the new fields still load (no migration break)', async () => {
+    const { groupHost } = makeRoleHost()
+    const group = await groupHost.initGroup('lead-1', { name: 'T', objective: 'demo', acceptanceCriteria: ['x'] })
+    // a pre-V0.4.1 team config: roles without provider / reasoningEffort
+    const legacy = await groupHost.updateTeamConfig(group.groupId, {
+      leaderRole: LEADER_ROLE,
+      memberRoles: [{ id: 'p', name: 'P', runtime: 'fake-runtime', model: 'model-a', reasoningLevel: 'high', maxInstances: 1 }],
+    }, 'User')
+    const parsedGroup = parseRecord<any>('groups', legacy)
+    expect(parsedGroup.teamConfig.memberRoles[0].reasoningLevel).toBe('high')
+    expect(parsedGroup.teamConfig.memberRoles[0].provider).toBeUndefined()
+    expect(parsedGroup.teamConfig.memberRoles[0].reasoningEffort).toBeUndefined()
+
+    // a legacy member + runtimeSession (no provider/reasoningEffort)
+    const legacyMember = { sessionId: 'm-1', groupId: group.groupId, profileId: 'group-member', name: 'M', status: 'idle', role: 'member', joinedAt: 1, runtime: 'deepseek-harness', model: 'm-a', reasoningLevel: 'high' }
+    const parsedMember = parseRecord<any>('members', legacyMember)
+    expect(parsedMember.reasoningLevel).toBe('high')
+    expect(parsedMember.provider).toBeUndefined()
+    expect(parsedMember.reasoningEffort).toBeUndefined()
+    const parsedWithSession = parseRecord<any>('members', {
+      ...legacyMember,
+      runtimeSession: { runtime: 'deepseek-harness', provider: 'deepseek-official', model: 'm-a', reasoningLevel: 'high', state: 'idle' },
+    })
+    expect(parsedWithSession.runtimeSession.provider).toBe('deepseek-official')
+    // a NEW member record carrying the V0.4.1 fields round-trips too
+    const parsedNew = parseRecord<any>('members', { ...legacyMember, provider: 'deepseek-official', reasoningEffort: 'max' })
+    expect(parsedNew.provider).toBe('deepseek-official')
+    expect(parsedNew.reasoningEffort).toBe('max')
+  })
+
+  it('updateTeamConfig rejects secret-named fields anywhere in a role payload', async () => {
+    const { groupHost } = makeRoleHost()
+    const group = await groupHost.initGroup('lead-1', { name: 'T', objective: 'demo', acceptanceCriteria: ['x'] })
+    const role = (id: string, extra: Record<string, unknown>): AgentRoleDefinition =>
+      ({ id, name: id, runtime: 'deepseek-harness', ...extra }) as unknown as AgentRoleDefinition
+    const cases: Array<[string, TeamConfig]> = [
+      ['apiKey at top level', { leaderRole: LEADER_ROLE, memberRoles: [role('a', { apiKey: 'sk-x' })] }],
+      ['api_key separator variant', { leaderRole: LEADER_ROLE, memberRoles: [role('b', { api_key: 'x' })] }],
+      ['secret nested in metadata', { leaderRole: LEADER_ROLE, memberRoles: [role('c', { metadata: { secret: 'x' } })] }],
+      ['credentialRef in metadata', { leaderRole: LEADER_ROLE, memberRoles: [role('d', { metadata: { credentialRef: 'DEEPSEEK_API_KEY' } })] }],
+      ['credentials on leaderRole', { leaderRole: role('leader', { credentials: ['a'] }), memberRoles: [] }],
+    ]
+    for (const [label, bad] of cases) {
+      await expect(groupHost.updateTeamConfig(group.groupId, bad, 'User'), label)
+        .rejects.toMatchObject({ code: 'CONFLICT' })
+    }
+  })
+
+  it('rejects empty/whitespace provider or reasoningEffort', async () => {
+    const { groupHost } = makeRoleHost()
+    const group = await groupHost.initGroup('lead-1', { name: 'T', objective: 'demo', acceptanceCriteria: ['x'] })
+    await expect(groupHost.updateTeamConfig(group.groupId, {
+      leaderRole: LEADER_ROLE,
+      memberRoles: [{ id: 'a', name: 'A', runtime: 'fake-runtime', provider: ' ' }],
+    }, 'User')).rejects.toMatchObject({ code: 'CONFLICT' })
+    await expect(groupHost.updateTeamConfig(group.groupId, {
+      leaderRole: LEADER_ROLE,
+      memberRoles: [{ id: 'b', name: 'B', runtime: 'fake-runtime', reasoningEffort: '' }],
+    }, 'User')).rejects.toMatchObject({ code: 'CONFLICT' })
+  })
+
+  it('without discovery wired, provider/reasoningEffort are shape-validated only (runtime gates later)', async () => {
+    const { groupHost } = makeRoleHost()
+    const group = await groupHost.initGroup('lead-1', { name: 'T', objective: 'demo', acceptanceCriteria: ['x'] })
+    const updated = await groupHost.updateTeamConfig(group.groupId, {
+      leaderRole: LEADER_ROLE,
+      memberRoles: [{ id: 'a', name: 'A', runtime: 'deepseek-harness', provider: 'mystery-provider', reasoningEffort: 'mystery-effort' }],
+    }, 'User')
+    expect(updated.teamConfig?.memberRoles[0]?.provider).toBe('mystery-provider')
+    expect(updated.teamConfig?.memberRoles[0]?.reasoningEffort).toBe('mystery-effort')
+  })
+
+  it('gates provider/effort against harness discovery when wired (DSH runtime only)', async () => {
+    const discovery: HostDiscoverySource = {
+      listProviderIds: async () => ['deepseek-official', 'opencode-go'],
+      listReasoningEfforts: async (provider) => (provider === 'deepseek-official' ? ['high', 'max'] : undefined),
+      listProviders: () => [
+        { id: 'deepseek-official', name: 'DeepSeek' },
+        { id: 'opencode-go', name: 'OpenCode Go' },
+      ],
+      listModels: async () => [{ id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash' }],
+      resolveReasoning: async (provider) => (provider === 'deepseek-official'
+        ? { efforts: [{ id: 'high', name: 'High' }, { id: 'max', name: 'Max' }], defaultEffort: 'high' }
+        : undefined),
+      listConfigurableProviders: () => [],
+      credentialStatus: async (provider) => ({ provider }),
+    }
+    const { groupHost } = makeRoleHost({ discovery })
+    const group = await groupHost.initGroup('lead-1', { name: 'T', objective: 'demo', acceptanceCriteria: ['x'] })
+    // DSH runtime + unknown provider → PROVIDER_UNAVAILABLE
+    await expect(groupHost.updateTeamConfig(group.groupId, {
+      leaderRole: LEADER_ROLE,
+      memberRoles: [{ id: 'a', name: 'A', runtime: 'deepseek-harness', provider: 'not-a-provider' }],
+    }, 'User')).rejects.toMatchObject({ code: 'PROVIDER_UNAVAILABLE' })
+    // DSH runtime + known provider + unsupported effort → REASONING_UNAVAILABLE
+    await expect(groupHost.updateTeamConfig(group.groupId, {
+      leaderRole: LEADER_ROLE,
+      memberRoles: [{ id: 'b', name: 'B', runtime: 'deepseek-harness', provider: 'deepseek-official', reasoningEffort: 'medium' }],
+    }, 'User')).rejects.toMatchObject({ code: 'REASONING_UNAVAILABLE' })
+    // DSH runtime + known provider + known effort passes
+    const ok = await groupHost.updateTeamConfig(group.groupId, {
+      leaderRole: LEADER_ROLE,
+      memberRoles: [{ id: 'c', name: 'C', runtime: 'deepseek-harness', provider: 'deepseek-official', reasoningEffort: 'max' }],
+    }, 'User')
+    expect(ok.teamConfig?.memberRoles[0]?.reasoningEffort).toBe('max')
+    // non-DSH runtime keeps current behavior: provider/effort NOT gated
+    const legacy = await groupHost.updateTeamConfig(group.groupId, {
+      leaderRole: LEADER_ROLE,
+      memberRoles: [{ id: 'd', name: 'D', runtime: 'claude', provider: 'anything', reasoningEffort: 'whatever' }],
+    }, 'User')
+    expect(legacy.teamConfig?.memberRoles[0]?.provider).toBe('anything')
+    expect(legacy.teamConfig?.memberRoles[0]?.reasoningEffort).toBe('whatever')
+  })
+
+  it('role provider/reasoningEffort flow into the spawn config and the member record', async () => {
+    const { groupHost, provider } = makeRoleHost()
+    const group = await groupHost.initGroup('lead-1', { name: 'T', objective: 'demo', acceptanceCriteria: ['x'] })
+    await groupHost.updateTeamConfig(group.groupId, {
+      leaderRole: LEADER_ROLE,
+      memberRoles: [{ id: 'impl', name: 'Impl', runtime: 'fake-runtime', provider: 'deepseek-official', model: 'model-a', reasoningLevel: 'medium', reasoningEffort: 'max', maxInstances: 1 }],
+    }, 'User')
+    const member = await groupHost.spawnByRole('lead-1', { role: 'impl' })
+    expect(provider.spawns).toHaveLength(1)
+    const spawn = provider.spawns[0]!
+    expect(spawn.config.provider).toBe('deepseek-official')
+    expect(spawn.config.reasoningEffort).toBe('max')
+    expect(spawn.config.reasoningLevel).toBe('medium') // legacy field still carried
+    expect(member.provider).toBe('deepseek-official')
+    expect(member.reasoningEffort).toBe('max')
+    expect(member.model).toBe('model-a')
+    // effective provider/effort in the activity payload, never secrets
+    const spawnEvent = groupHost.activity.list(group.groupId).find((a) => a.type === 'member_spawn_requested')
+    expect(spawnEvent?.payload).toMatchObject({ role: 'impl', provider: 'deepseek-official', reasoningEffort: 'max' })
+    for (const event of groupHost.activity.list(group.groupId)) {
+      expect(JSON.stringify(event.payload)).not.toMatch(/key|token|secret/i)
+    }
   })
 })

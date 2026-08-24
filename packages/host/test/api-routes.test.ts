@@ -7,9 +7,11 @@
 import { describe, expect, it } from 'vitest'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { createGroupWebApi } from '../src/web/api.js'
-import { makeHost } from './helpers.js'
+import { createNoopAdapter } from '../src/dsh-adapter.js'
+import { makeHarness, makeHost } from './helpers.js'
 import type { GroupNotifier } from '../src/notifier.js'
-import type { GroupHost } from '../src/group-host.js'
+import { GroupHost } from '../src/group-host.js'
+import type { HostDiscoverySource } from '../src/group-host.js'
 
 const COMPAT = { dshVersion: 'test', checks: [], fatal: [] }
 
@@ -141,6 +143,18 @@ describe('web API routes (V0.3 regression)', () => {
     expect(JSON.parse(saved.body).teamConfig.memberRoles[0].model).toBe('deepseek-reasoner')
     const after = await call(host, host.notifier, `/groups/api/groups/${group.groupId}/team-config`, 'GET')
     expect(JSON.parse(after.body).memberRoles[0].reasoningLevel).toBe('high')
+
+    // V0.4.1: provider/reasoningEffort survive the PUT→GET normalization roundtrip.
+    const withProvider = await call(host, host.notifier, `/groups/api/groups/${group.groupId}/team-config`, 'PUT', {
+      leaderRole: { id: 'leader', name: 'Leader', runtime: 'deepseek-harness' },
+      memberRoles: [
+        { id: 'planner', name: 'Planner', runtime: 'deepseek-harness', provider: 'deepseek-official', model: 'deepseek-reasoner', reasoningLevel: 'high', reasoningEffort: 'max', maxInstances: 1 },
+      ],
+    })
+    expect(withProvider.status).toBe(200)
+    const roundtrip = JSON.parse((await call(host, host.notifier, `/groups/api/groups/${group.groupId}/team-config`, 'GET')).body)
+    expect(roundtrip.memberRoles[0].provider).toBe('deepseek-official')
+    expect(roundtrip.memberRoles[0].reasoningEffort).toBe('max')
   })
 
   it('GET /groups/api/groups/:id/tasks-style deep routes are not mis-routed', async () => {
@@ -185,5 +199,181 @@ describe('web API routes (V0.3 regression)', () => {
     expect(ok.status).toBe(200)
     // with the noop adapter delivery is unavailable → honest false, no crash
     expect(typeof JSON.parse(ok.body).ok).toBe('boolean')
+  })
+})
+
+// ── V0.4.1: Role Editor discovery endpoints (live harness services) ─────────
+
+/** A secret VALUE that must never appear in any web response. */
+const SECRET_MARKER = 'sk-super-secret-value'
+
+/** Live-shape discovery source over fake harness services (no secrets). */
+function fakeDiscovery(): HostDiscoverySource {
+  return {
+    available: () => true,
+    listProviderIds: async () => ['deepseek-official', 'opencode-go', 'vanilla'],
+    listProviders: () => [
+      { id: 'deepseek-official', name: 'DeepSeek' },
+      { id: 'opencode-go', name: 'OpenCode Go' },
+      { id: 'vanilla', name: 'Vanilla Route' },
+    ],
+    listModels: async (provider) =>
+      provider === 'deepseek-official'
+        ? [
+            { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
+            { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro', description: 'Pro tier' },
+          ]
+        : [],
+    resolveReasoning: async (provider, _model) =>
+      provider === 'deepseek-official'
+        ? { efforts: [{ id: 'high', name: 'High' }, { id: 'max', name: 'Max', description: 'Max effort' }], defaultEffort: 'high' }
+        : undefined,
+    listReasoningEfforts: async (provider, _model) => (provider === 'deepseek-official' ? ['high', 'max'] : undefined),
+    listConfigurableProviders: () => [
+      { provider: 'deepseek-official', displayName: 'DeepSeek', settingsNs: 'llm-deepseek', settingsPath: [] },
+      { provider: 'opencode-go', displayName: 'OpenCode Go', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'opencode-go'] },
+    ],
+    credentialStatus: async (provider) => {
+      if (provider === 'deepseek-official') {
+        return { provider, configured: true, source: 'env', writable: false, settingsNs: 'llm-deepseek', settingsPath: [], credentialRef: 'DEEPSEEK_API_KEY' }
+      }
+      if (provider === 'opencode-go') {
+        return { provider, configured: false, writable: true, settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'opencode-go'], credentialRef: 'OPENCODE_GO_API_KEY' }
+      }
+      return { provider } // no settings entry → facts only
+    },
+  }
+}
+
+/** A GroupHost wired to a (possibly absent) discovery source. */
+function makeDiscoveryHost(discovery: HostDiscoverySource | undefined): GroupHost {
+  const h = makeHarness()
+  return new GroupHost({
+    groups: h.groups,
+    tasks: h.tasks,
+    channel: h.channel,
+    privateMessages: h.privateMessages,
+    activity: h.activity,
+    profiles: h.profiles,
+    notifier: h.notifier,
+    adapter: createNoopAdapter(),
+    leaders: h.leaders,
+    discovery,
+  })
+}
+
+describe('V0.4.1: Role Editor discovery endpoints', () => {
+  it('GET /groups/api/config/providers returns auth facts + runtimes (no models, no secrets)', async () => {
+    const host = makeDiscoveryHost(fakeDiscovery())
+    const res = await call(host, host.notifier, '/groups/api/config/providers', 'GET')
+    expect(res.status).toBe(200)
+    const body = JSON.parse(res.body) as { providers: Array<Record<string, unknown>>; runtimes: unknown[]; note?: string }
+    expect(body.note).toBeUndefined() // healthy discovery → no degraded note
+    const deepseek = body.providers.find((p) => p.id === 'deepseek-official')!
+    expect(deepseek).toMatchObject({
+      id: 'deepseek-official',
+      name: 'DeepSeek',
+      configurable: true,
+      settingsNs: 'llm-deepseek',
+      settingsPath: [],
+      credentialRef: 'DEEPSEEK_API_KEY',
+    })
+    expect(deepseek.credential).toEqual({ configured: true, source: 'env', writable: false })
+    expect(deepseek).not.toHaveProperty('models') // models live on the :id/models route
+    expect(Array.isArray(body.runtimes)).toBe(true)
+    expect(res.body).not.toContain(SECRET_MARKER)
+  })
+
+  it('GET /groups/api/config/providers degrades to an empty list + note without harness services', async () => {
+    const host = makeDiscoveryHost(undefined)
+    const res = await call(host, host.notifier, '/groups/api/config/providers', 'GET')
+    expect(res.status).toBe(200)
+    const body = JSON.parse(res.body) as { providers: unknown[]; runtimes: unknown[]; note: string }
+    expect(body.providers).toEqual([])
+    expect(body.note).toContain('not available')
+    expect(Array.isArray(body.runtimes)).toBe(true)
+  })
+
+  it('GET /groups/api/config/providers carries the note when the mounted source reports unavailable services', async () => {
+    const host = makeDiscoveryHost({ ...fakeDiscovery(), available: () => false, listProviders: () => [] })
+    const res = await call(host, host.notifier, '/groups/api/config/providers', 'GET')
+    expect(res.status).toBe(200)
+    const body = JSON.parse(res.body) as { providers: unknown[]; note?: string }
+    expect(body.providers).toEqual([])
+    expect(body.note).toBeDefined()
+  })
+
+  it('GET /groups/api/config/providers/:id/models returns per-model reasoning; unknown provider → 404', async () => {
+    const host = makeDiscoveryHost(fakeDiscovery())
+    const res = await call(host, host.notifier, '/groups/api/config/providers/deepseek-official/models', 'GET')
+    expect(res.status).toBe(200)
+    const body = JSON.parse(res.body)
+    expect(body.provider).toBe('deepseek-official')
+    const flash = body.models.find((m: { id: string }) => m.id === 'deepseek-v4-flash')
+    expect(flash.reasoning.efforts.map((e: { id: string }) => e.id)).toEqual(['high', 'max'])
+    expect(flash.reasoning.defaultEffort).toBe('high')
+    const pro = body.models.find((m: { id: string }) => m.id === 'deepseek-v4-pro')
+    expect(pro.description).toBe('Pro tier')
+    // a registered provider with no models → 200 empty list, still deterministic JSON
+    const empty = await call(host, host.notifier, '/groups/api/config/providers/opencode-go/models', 'GET')
+    expect(empty.status).toBe(200)
+    expect(JSON.parse(empty.body).models).toEqual([])
+    // unknown provider → structured {error} 404
+    const missing = await call(host, host.notifier, '/groups/api/config/providers/ghost/models', 'GET')
+    expect(missing.status).toBe(404)
+    const missingBody = JSON.parse(missing.body) as { error: string; provider: string }
+    expect(missingBody.error).toBe('unknown provider')
+    expect(missingBody.provider).toBe('ghost')
+  })
+
+  it('GET /groups/api/config/providers/:id/models degrades to empty + note without harness services', async () => {
+    const host = makeDiscoveryHost(undefined)
+    const res = await call(host, host.notifier, '/groups/api/config/providers/anything/models', 'GET')
+    expect(res.status).toBe(200)
+    const body = JSON.parse(res.body) as { provider: string; models: unknown[]; note?: string }
+    expect(body.models).toEqual([])
+    expect(body.note).toBeDefined()
+  })
+
+  it('GET /groups/api/config/providers/:id/credential returns status + settings entry (never the value)', async () => {
+    const host = makeDiscoveryHost(fakeDiscovery())
+    const res = await call(host, host.notifier, '/groups/api/config/providers/deepseek-official/credential', 'GET')
+    expect(res.status).toBe(200)
+    const body = JSON.parse(res.body)
+    expect(body.provider).toBe('deepseek-official')
+    expect(body.credential).toEqual({
+      configured: true,
+      source: 'env',
+      writable: false,
+      entry: { kind: 'settings', settingsNs: 'llm-deepseek', settingsPath: [], credentialRef: 'DEEPSEEK_API_KEY' },
+    })
+    expect(res.body).not.toContain(SECRET_MARKER)
+    // provider with no settings entry → facts-only credential object (empty, not absent)
+    const vanilla = await call(host, host.notifier, '/groups/api/config/providers/vanilla/credential', 'GET')
+    expect(vanilla.status).toBe(200)
+    expect(JSON.parse(vanilla.body).credential).toEqual({})
+    // unknown provider → structured 404
+    const missing = await call(host, host.notifier, '/groups/api/config/providers/ghost/credential', 'GET')
+    expect(missing.status).toBe(404)
+    expect((JSON.parse(missing.body) as { error: string }).error).toBe('unknown provider')
+  })
+
+  it('team-config PUT rejects secret-named role fields and never echoes secret values', async () => {
+    const host = makeDiscoveryHost(fakeDiscovery())
+    const group = await host.initGroup('lead-1', { name: 'T', objective: 'demo', acceptanceCriteria: ['x'] })
+    const res = await call(host, host.notifier, `/groups/api/groups/${group.groupId}/team-config`, 'PUT', {
+      leaderRole: { id: 'leader', name: 'Leader', runtime: 'deepseek-harness' },
+      memberRoles: [
+        { id: 'planner', name: 'Planner', runtime: 'deepseek-harness', apiKey: SECRET_MARKER, metadata: { credential: 'sk-nested-1' } },
+      ],
+    })
+    expect(res.status).toBe(409)
+    expect(res.body).not.toContain(SECRET_MARKER)
+    expect(res.body).not.toContain('sk-nested-1')
+    // the rejected payload never touched the durable config / GET responses
+    const after = await call(host, host.notifier, `/groups/api/groups/${group.groupId}/team-config`, 'GET')
+    expect(after.status).toBe(200)
+    expect(after.body).not.toContain(SECRET_MARKER)
+    expect(after.body).not.toContain('sk-nested-1')
   })
 })

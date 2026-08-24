@@ -93,9 +93,13 @@ export interface RuntimeAgentConfig {
   /** Team role id this instance was spawned under. */
   readonly role: string
   readonly profile?: string
+  /** V0.4.1: DSH model-provider id this role pins (first-class; legacy roles may still carry metadata.provider). */
+  readonly provider?: string
   readonly model?: string
   /** Abstract reasoning level; the provider translates to its own vocabulary. */
   readonly reasoningLevel?: string
+  /** V0.4.1: exact adapter-owned reasoning-effort id; preferred over `reasoningLevel` when both are set. */
+  readonly reasoningEffort?: string
   readonly systemPrompt?: string
   /** Explicit working directory — external agents must run under this. */
   readonly workspace?: string
@@ -171,6 +175,8 @@ export interface RuntimeSessionInfo {
   readonly workspace?: string
   readonly model?: string
   readonly reasoningLevel?: string
+  /** V0.4.1: exact adapter-owned reasoning-effort id the session was created with (durable). */
+  readonly reasoningEffort?: string
   /** Negotiated, normalized provider capabilities. Never contains auth data. */
   readonly providerCapabilities?: Readonly<Record<string, unknown>>
   readonly state: RuntimeSessionStatus

@@ -63,6 +63,97 @@ export interface LeaderActor {
   readonly leader: GroupMember
 }
 
+export type { RoleProviderDiscovery, HostDiscoverySource } from './harness-discovery.js'
+import type { HostDiscoverySource } from './harness-discovery.js'
+
+/** One selectable reasoning effort in the discovery view. */
+export interface DiscoveryReasoningEffortView {
+  readonly id: string
+  readonly name: string
+  readonly description?: string
+}
+
+/** One model in the discovery view (with per-model reasoning when known). */
+export interface DiscoveryModelView {
+  readonly id: string
+  readonly name: string
+  readonly description?: string
+  readonly reasoning?: { readonly efforts: readonly DiscoveryReasoningEffortView[]; readonly defaultEffort?: string }
+}
+
+/** One provider in the discovery view (never contains credential values). */
+export interface DiscoveryProviderView {
+  readonly provider: string
+  readonly name: string
+  /** Route has a configurable settings entry point. */
+  readonly configurable: boolean
+  readonly models: readonly DiscoveryModelView[]
+  readonly credential?: import('./harness-discovery.js').ProviderCredentialStatus
+}
+
+/** One provider entry in the Role Editor Authentication step (no models here,
+ * no credential values anywhere — only status facts + the settings entry
+ * point). */
+export interface DiscoveryProviderEntryView {
+  readonly id: string
+  readonly name: string
+  /** Route has a configurable settings entry point (settingsNs + settingsPath). */
+  readonly configurable: boolean
+  /** Settings entry point of the provider route (least-hardcoded credential
+   * seam; the Reference NAME below is a label, never a value). */
+  readonly settingsNs?: string
+  readonly settingsPath?: readonly string[]
+  /** The credential REFERENCE NAME (env-var id), never its value. */
+  readonly credentialRef?: string
+  readonly credential: {
+    readonly configured?: boolean
+    readonly source?: string
+    readonly writable?: boolean
+  }
+}
+
+/** Credential status for one provider route in the wizard (never the value). */
+export interface DiscoveryProviderCredentialView {
+  readonly configured?: boolean
+  readonly source?: string
+  readonly writable?: boolean
+  /** Where the credential is configured. `kind: 'settings'` → the harness
+   * settings panel (there is no deep-linkable URL in the shell today, so
+   * `kind: 'url'` is reserved for future entry points). */
+  readonly entry?: {
+    readonly kind: 'settings' | 'url'
+    readonly settingsNs?: string
+    readonly settingsPath?: readonly string[]
+    readonly credentialRef?: string
+  }
+}
+
+/** Shown by the discovery endpoints when the harness services are absent. */
+export const DISCOVERY_UNAVAILABLE_NOTE =
+  'harness discovery services are not available in this process; the provider catalog is empty'
+
+/** Team-config provider gating applies to the DSH runtime only. */
+const DSH_RUNTIME_ID = 'deepseek-harness'
+
+/**
+ * Defense in depth: reject any role payload that carries a secret-named field
+ * (apiKey / secret / credential — case and separator insensitive) anywhere in
+ * the role object, including nested `metadata`. Secrets (or credential refs)
+ * must never enter team config or durable records; auth stays owned by the
+ * harness settings, never by role payloads. Slight intentional over-match
+ * (e.g. `secretary`) is acceptable for field NAMES.
+ */
+function hasSecretField(value: unknown): boolean {
+  if (Array.isArray(value)) return value.some(hasSecretField)
+  if (typeof value === 'object' && value !== null) {
+    return Object.keys(value).some((key) => {
+      const normalized = key.replace(/[^a-z0-9]/gi, '').toLowerCase()
+      return /apikey|secret|credential/.test(normalized) || hasSecretField((value as Record<string, unknown>)[key])
+    })
+  }
+  return false
+}
+
 /**
  * The complete host surface. Constructed in the plugin's `apply` with the
  * domain-backed stores and the DSH adapter; each method is role-guarded.
@@ -85,6 +176,8 @@ export class GroupHost {
   /** Ensures a terminal event cannot settle before its durable Attempt exists. */
   private readonly attemptStarts = new Map<string, Promise<unknown>>()
   private readonly workspaces: WorkspaceManager
+  /** V0.4.1: optional live harness discovery source for team-config gating + views. */
+  private readonly discovery?: HostDiscoverySource
 
   constructor(options: {
     groups: GroupService
@@ -98,6 +191,8 @@ export class GroupHost {
     leaders: LeaderRegistry
     runtimes?: RuntimeRegistry
     workspaces?: WorkspaceManager
+    /** V0.4.1: optional live harness discovery source (see HostDiscoverySource). */
+    discovery?: HostDiscoverySource
   }) {
     this.groups = options.groups
     this.tasks = options.tasks
@@ -110,6 +205,7 @@ export class GroupHost {
     this.leaders = options.leaders
     this.runtimes = options.runtimes ?? new RuntimeRegistry()
     this.workspaces = options.workspaces ?? new GitWorktreeWorkspaceManager()
+    this.discovery = options.discovery
   }
 
   // ── actor resolution ──────────────────────────────────────────────────────
@@ -136,7 +232,7 @@ export class GroupHost {
     const group = this.groups.requireGroup(groupId)
     this.groups.assertMutable(group)
     const roleIds = new Set<string>()
-    const check = (definition: AgentRoleDefinition): void => {
+    const check = async (definition: AgentRoleDefinition): Promise<void> => {
       if (definition.id === '' || roleIds.has(definition.id)) {
         throw new GroupError('CONFLICT', `duplicate or empty role id "${definition.id}"`)
       }
@@ -147,9 +243,37 @@ export class GroupHost {
       if (definition.reasoningLevel !== undefined && !['low', 'medium', 'high'].includes(definition.reasoningLevel)) {
         throw new GroupError('CONFLICT', `role "${definition.id}": unsupported reasoning level "${definition.reasoningLevel}" (use low/medium/high)`)
       }
+      // V0.4.1: defense in depth — secrets must never enter team config.
+      if (hasSecretField(definition)) {
+        throw new GroupError('CONFLICT', `role "${definition.id}": secret-bearing field names (apiKey/secret/credential) are not allowed in role payloads`)
+      }
+      const provider = definition.provider
+      if (provider !== undefined && (typeof provider !== 'string' || provider.trim() === '')) {
+        throw new GroupError('CONFLICT', `role "${definition.id}": provider must be a non-empty string when set`)
+      }
+      const effort = definition.reasoningEffort
+      if (effort !== undefined && (typeof effort !== 'string' || effort.trim() === '')) {
+        throw new GroupError('CONFLICT', `role "${definition.id}": reasoningEffort must be a non-empty string when set`)
+      }
+      // Capability gating is DSH-only; non-DSH runtimes keep current behavior.
+      // The optional `discovery` source (harness-discovery.ts, mounted in
+      // index.ts) gates against the LIVE harness catalog (ctx.llm). When it is
+      // absent (tests/headless), we validate shape only and the runtime gates
+      // at spawn/request time.
+      if (definition.runtime !== DSH_RUNTIME_ID || this.discovery === undefined) return
+      const providers = await this.discovery.listProviderIds()
+      if (providers.length > 0 && provider !== undefined && !providers.includes(provider)) {
+        throw new GroupError('PROVIDER_UNAVAILABLE', `role "${definition.id}": provider "${provider}" is not in the harness discovery catalog`)
+      }
+      if (effort !== undefined) {
+        const efforts = await this.discovery.listReasoningEfforts(provider, definition.model)
+        if (efforts !== undefined && efforts.length > 0 && !efforts.includes(effort)) {
+          throw new GroupError('REASONING_UNAVAILABLE', `role "${definition.id}": reasoningEffort "${effort}" is not available for${provider !== undefined ? ` provider "${provider}"` : ' the default provider'}${definition.model !== undefined ? ` / model "${definition.model}"` : ''}`)
+        }
+      }
     }
-    check(next.leaderRole)
-    for (const definition of next.memberRoles) check(definition)
+    await check(next.leaderRole)
+    for (const definition of next.memberRoles) await check(definition)
     const updated = await this.groups.withGroupTouch(groupId, (current) => ({ ...current, teamConfig: next }))
     await this.activity.append({
       groupId,
@@ -232,7 +356,7 @@ export class GroupHost {
       groupId,
       type: 'member_spawn_requested',
       actorId: requestedBy,
-      payload: { role: roleId, runtime: role.runtime, model, reasoningLevel },
+      payload: { role: roleId, runtime: role.runtime, provider: role.provider, model, reasoningLevel, reasoningEffort: role.reasoningEffort },
     })
     const agentId = randomUUID()
     let workspace: string | undefined
@@ -258,8 +382,10 @@ export class GroupHost {
       agentId,
       role: roleId,
       profile: role.profile,
+      provider: role.provider,
       model,
       reasoningLevel,
+      reasoningEffort: role.reasoningEffort,
       systemPrompt: role.systemPrompt,
       workspace,
       parentMemberId: group.leaderSessionId,
@@ -314,8 +440,10 @@ export class GroupHost {
       displayRole: role.name,
       roleId: roleId,
       runtime: role.runtime,
+      provider: role.provider,
       model,
       reasoningLevel,
+      reasoningEffort: role.reasoningEffort,
       runtimeSession: this.runtimeMetadata(agentId),
     })
 
@@ -324,13 +452,13 @@ export class GroupHost {
       type: 'member_runtime_started',
       actorName: member.name,
       refMemberId: agentId,
-      payload: { role: roleId, runtime: role.runtime, model, reasoningLevel },
+      payload: { role: roleId, runtime: role.runtime, provider: role.provider, model, reasoningLevel, reasoningEffort: role.reasoningEffort },
     })
     await this.channel.post(group.groupId, {
       senderId: 'system',
       senderName: 'System',
       kind: 'system',
-      text: `${member.name} joined as ${role.name} (runtime: ${role.runtime}${model !== undefined ? `, model: ${model}` : ''}${reasoningLevel !== undefined ? `, reasoning: ${reasoningLevel}` : ''}).`,
+      text: `${member.name} joined as ${role.name} (runtime: ${role.runtime}${role.provider !== undefined ? `, provider: ${role.provider}` : ''}${model !== undefined ? `, model: ${model}` : ''}${role.reasoningEffort !== undefined ? `, reasoningEffort: ${role.reasoningEffort}` : ''}${reasoningLevel !== undefined && role.reasoningEffort === undefined ? `, reasoning: ${reasoningLevel}` : ''}).`,
     })
     return member
   }
@@ -368,8 +496,10 @@ export class GroupHost {
       groupId: group.groupId,
       agentId: member.sessionId,
       role: member.roleId ?? 'generalist',
+      provider: member.runtimeSession.provider,
       model: member.model,
       reasoningLevel: member.reasoningLevel,
+      reasoningEffort: member.runtimeSession.reasoningEffort,
       workspace: member.runtimeSession.workspace ?? group.cwd,
       parentMemberId: group.leaderSessionId,
       metadata: { provider: member.runtimeSession.provider },
@@ -378,8 +508,10 @@ export class GroupHost {
       groupId: group.groupId,
       agentId: member.sessionId,
       role: member.roleId ?? 'generalist',
+      provider: member.runtimeSession.provider,
       model: member.model,
       reasoningLevel: member.reasoningLevel,
+      reasoningEffort: member.runtimeSession.reasoningEffort,
       workspace: member.runtimeSession.workspace ?? group.cwd,
       parentMemberId: group.leaderSessionId,
     }, resumed, member.runtimeSession.queuedTurns)
@@ -399,6 +531,7 @@ export class GroupHost {
       workspace: info.workspace,
       model: info.model,
       reasoningLevel: info.reasoningLevel,
+      reasoningEffort: info.reasoningEffort,
       providerCapabilities: info.providerCapabilities,
       queuedTurns: [...entry.queuedTurns],
       state: info.state,
@@ -980,6 +1113,133 @@ export class GroupHost {
         reasoningLevels: await provider.listReasoningLevels?.() ?? [],
       }
     }))
+  }
+
+  // ── V0.4.1: live harness discovery (Role Editor data surface) ──────────────
+
+  /**
+   * Live harness view: registered providers with their per-model reasoning
+   * efforts + default and credential status. NEVER contains credential values
+   * (only `credentialRef` names/status; see ProviderCredentialStatus).
+   */
+  async discoveryView(): Promise<DiscoveryProviderView[]> {
+    const discovery = this.discovery
+    if (discovery === undefined) return []
+    const configurable = new Set(discovery.listConfigurableProviders().map((entry) => entry.provider))
+    return Promise.all(discovery.listProviders().map(async (p) => {
+      const models = await discovery.listModels(p.id)
+      const modelViews = await Promise.all(models.map(async (m) => {
+        const reasoning = await discovery.resolveReasoning(p.id, m.id)
+        return {
+          id: m.id,
+          name: m.name,
+          ...(m.description === undefined ? {} : { description: m.description }),
+          ...(reasoning === undefined ? {} : {
+            reasoning: {
+              efforts: reasoning.efforts,
+              ...(reasoning.defaultEffort === undefined ? {} : { defaultEffort: reasoning.defaultEffort }),
+            },
+          }),
+        }
+      }))
+      return {
+        provider: p.id,
+        name: p.name,
+        configurable: configurable.has(p.id),
+        models: modelViews,
+        credential: await discovery.credentialStatus(p.id),
+      }
+    }))
+  }
+
+  /**
+   * V0.4.1: true when a live discovery source is mounted AND its harness
+   * services resolved — the signal for the web API's degraded-mode note.
+   */
+  discoveryLive(): boolean {
+    if (this.discovery === undefined) return false
+    return this.discovery.available?.() ?? true
+  }
+
+  /**
+   * V0.4.1: LIGHT provider list for the wizard's Authentication step (id/name/
+   * configurable + credential status + settings entry point — never models,
+   * never credential values). `[]` when no discovery source is mounted.
+   */
+  async discoveryProvidersView(): Promise<DiscoveryProviderEntryView[]> {
+    const discovery = this.discovery
+    if (discovery === undefined) return []
+    const configurable = new Set(discovery.listConfigurableProviders().map((entry) => entry.provider))
+    return Promise.all(discovery.listProviders().map(async (p) => {
+      const status = await discovery.credentialStatus(p.id)
+      return {
+        id: p.id,
+        name: p.name,
+        configurable: configurable.has(p.id),
+        ...(status.settingsNs === undefined ? {} : { settingsNs: status.settingsNs, settingsPath: [...(status.settingsPath ?? [])] }),
+        ...(status.credentialRef === undefined ? {} : { credentialRef: status.credentialRef }),
+        credential: {
+          ...(status.configured === undefined ? {} : { configured: status.configured }),
+          ...(status.source === undefined ? {} : { source: status.source }),
+          ...(status.writable === undefined ? {} : { writable: status.writable }),
+        },
+      }
+    }))
+  }
+
+  /**
+   * V0.4.1: live models + per-model reasoning for ONE provider (Model/Reasoning
+   * wizard steps). `undefined` → provider unknown (web layer sends 404);
+   * degraded (no source / services absent) → `{ models: [], note }`.
+   */
+  async providerModelsView(provider: string): Promise<{ models: readonly DiscoveryModelView[]; note?: string } | undefined> {
+    const discovery = this.discovery
+    if (discovery === undefined) return { models: [], note: DISCOVERY_UNAVAILABLE_NOTE }
+    if ((discovery.available?.() ?? true) === false) return { models: [], note: DISCOVERY_UNAVAILABLE_NOTE }
+    if (!discovery.listProviders().some((p) => p.id === provider)) return undefined
+    const models = await discovery.listModels(provider)
+    const views = await Promise.all(models.map(async (m) => {
+      const reasoning = await discovery.resolveReasoning(provider, m.id)
+      return {
+        id: m.id,
+        name: m.name,
+        ...(m.description === undefined ? {} : { description: m.description }),
+        ...(reasoning === undefined ? {} : {
+          reasoning: {
+            efforts: reasoning.efforts,
+            ...(reasoning.defaultEffort === undefined ? {} : { defaultEffort: reasoning.defaultEffort }),
+          },
+        }),
+      }
+    }))
+    return { models: views }
+  }
+
+  /**
+   * V0.4.1: credential STATUS facts for ONE provider (Authentication step) —
+   * never the value. `undefined` → provider unknown (404); degraded →
+   * `{ credential: {}, note }`.
+   */
+  async providerCredentialView(provider: string): Promise<{ credential: DiscoveryProviderCredentialView; note?: string } | undefined> {
+    const discovery = this.discovery
+    if (discovery === undefined) return { credential: {}, note: DISCOVERY_UNAVAILABLE_NOTE }
+    if ((discovery.available?.() ?? true) === false) return { credential: {}, note: DISCOVERY_UNAVAILABLE_NOTE }
+    if (!discovery.listProviders().some((p) => p.id === provider)) return undefined
+    const status = await discovery.credentialStatus(provider)
+    const view: DiscoveryProviderCredentialView = {
+      ...(status.configured === undefined ? {} : { configured: status.configured }),
+      ...(status.source === undefined ? {} : { source: status.source }),
+      ...(status.writable === undefined ? {} : { writable: status.writable }),
+      ...(status.settingsNs === undefined ? {} : {
+        entry: {
+          kind: 'settings',
+          settingsNs: status.settingsNs,
+          settingsPath: [...(status.settingsPath ?? [])],
+          ...(status.credentialRef === undefined ? {} : { credentialRef: status.credentialRef }),
+        },
+      }),
+    }
+    return { credential: view }
   }
 
   /** Leader view of the Team Configuration + live instance counts. */

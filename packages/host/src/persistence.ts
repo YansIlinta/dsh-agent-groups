@@ -124,8 +124,12 @@ const roleDefinitionSchema = z.object({
   description: str.optional(),
   runtime: str,
   profile: str.optional(),
+  // V0.4.1: DSH model-provider id this role pins; optional → legacy roles load.
+  provider: str.optional(),
   model: str.optional(),
   reasoningLevel: str.optional(),
+  // V0.4.1: adapter-owned reasoning-effort id; optional → legacy roles load.
+  reasoningEffort: str.optional(),
   systemPrompt: str.optional(),
   maxInstances: z.number().optional(),
   defaultInstances: z.number().optional(),
@@ -167,6 +171,9 @@ const runtimeSessionSchema = z.object({
   workspace: str.optional(),
   model: str.optional(),
   reasoningLevel: str.optional(),
+  // V0.4.1: durable record of the adapter-owned effort id the session was
+  // created with; optional → legacy sessions load unchanged.
+  reasoningEffort: str.optional(),
   providerCapabilities: z.record(z.string(), z.unknown()).optional(),
   queuedTurns: z.array(z.object({
     seq: z.number(),
@@ -197,8 +204,12 @@ const memberSchema = z.object({
   displayRole: str.optional(),
   roleId: str.optional(),
   runtime: str.optional(),
+  // V0.4.1: effective provider/effort the member was spawned with (optional →
+  // legacy members load).
+  provider: str.optional(),
   model: str.optional(),
   reasoningLevel: str.optional(),
+  reasoningEffort: str.optional(),
   // V0.5: durable runtime-session metadata (optional → legacy members load).
   runtimeSession: runtimeSessionSchema.optional(),
 })

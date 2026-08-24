@@ -79,10 +79,13 @@ export class DeepSeekHarnessRuntimeProvider implements AgentRuntimeProvider {
       parentId: config.parentMemberId ?? '',
       cwd: config.workspace,
       // The member's ORIGINAL provider wins over the current global default —
-      // this is the durable configuration used on every resume.
-      provider: existing?.provider ?? (typeof config.metadata?.provider === 'string' ? config.metadata.provider : undefined),
+      // this is the durable configuration used on every resume. First-class
+      // config.provider (V0.4.1) preferred; metadata.provider kept for legacy
+      // stored roles.
+      provider: existing?.provider ?? config.provider ?? (typeof config.metadata?.provider === 'string' ? config.metadata.provider : undefined),
       model: existing?.model ?? config.model,
       reasoningLevel: existing?.reasoningLevel ?? config.reasoningLevel,
+      reasoningEffort: existing?.reasoningEffort ?? config.reasoningEffort,
     }
     return new DshMemberSession(this.adapter, config, spec, existing)
   }
@@ -93,9 +96,10 @@ export class DeepSeekHarnessRuntimeProvider implements AgentRuntimeProvider {
       sessionId: config.agentId,
       parentId: config.parentMemberId ?? '',
       cwd: config.workspace,
-      provider: typeof config.metadata?.provider === 'string' ? config.metadata.provider : selection.provider,
+      provider: config.provider ?? (typeof config.metadata?.provider === 'string' ? config.metadata.provider : selection.provider),
       model: config.model ?? selection.model,
       reasoningLevel: config.reasoningLevel,
+      reasoningEffort: config.reasoningEffort,
     })
     return {
       agentId: config.agentId,
@@ -171,6 +175,7 @@ class DshMemberSession implements RuntimeSession {
       workspace: this.spec.cwd,
       model: this.spec.model,
       reasoningLevel: this.spec.reasoningLevel,
+      reasoningEffort: this.spec.reasoningEffort,
       state: this.status,
       lastTurnId: this.lastTurnId,
       lastTaskId: this.lastTaskId,

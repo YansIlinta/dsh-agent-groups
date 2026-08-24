@@ -76,6 +76,126 @@ async function api(path, init) {
 
 function errorOf(err) { return err instanceof Error ? err.message : String(err) }
 
+// ── V0.4.1: harness discovery client (Create/Edit Role data surface) ────────
+//
+// Consumes the shared discovery contract (per the API contract, T4):
+//   GET /groups/api/config/providers              → { providers: [...] }
+//   GET /groups/api/config/providers/:id/models   → { models: [...] }   (404 = unknown provider)
+//   GET /groups/api/config/providers/:id/credential → { credential: ..., note? } (404 = unknown provider)
+// Every response is status facts only — the UI never receives or stores secrets.
+// All reads are cached per provider/model for the session and degrade to an
+// empty-but-healthy surface when the endpoints/services are absent.
+
+const DSH_RUNTIME_ID = 'deepseek-harness'
+const DISCOVERY_TTL = 30_000
+
+const discoveryCache = {
+  providers: null,
+  models: new Map(),
+  credential: new Map(),
+}
+
+function discoveryFresh(at) { return at !== undefined && Date.now() - at < DISCOVERY_TTL }
+
+/** Provider entry id, across both view shapes (`id` / `provider` key). */
+function providerIdOf(entry) { return typeof entry?.id === 'string' ? entry.id : entry?.provider }
+
+/**
+ * Normalize credential facts across the view shapes the contract carries:
+ *  - provider-entry: {settingsNs?, settingsPath?, credentialRef?, credential: {configured?, source?, writable?}}
+ *  - per-provider endpoint: { provider, credential: {configured?, source?, writable?} } (+ entry.kind === 'settings' legacy)
+ * Returns facts only — never values.
+ */
+function credentialFacts(cred) {
+  if (cred === undefined || cred === null) return {}
+  const nested = cred.credential ?? {}
+  const entry = cred.entry ?? cred
+  return {
+    configured: cred.configured ?? nested.configured,
+    source: cred.source ?? nested.source,
+    writable: cred.writable ?? nested.writable,
+    settingsNs: entry?.settingsNs ?? cred.settingsNs ?? nested.settingsNs,
+    settingsPath: entry?.settingsPath ?? cred.settingsPath ?? nested.settingsPath,
+    credentialRef: entry?.credentialRef ?? cred.credentialRef ?? nested.credentialRef,
+  }
+}
+
+async function discoveryProviders(force) {
+  const hit = discoveryCache.providers
+  if (!force && hit !== null && discoveryFresh(hit.at)) return hit
+  let entry
+  try {
+    const data = await api('/groups/api/config/providers')
+    const providers = Array.isArray(data?.providers) ? data.providers : []
+    entry = { providers, note: data?.note, at: Date.now(), ok: true, error: null }
+  } catch (error) {
+    entry = { providers: [], at: Date.now(), ok: false, error: errorOf(error) }
+  }
+  discoveryCache.providers = entry
+  return entry
+}
+
+async function discoveryModels(providerId, force) {
+  const hit = discoveryCache.models.get(providerId)
+  if (!force && hit !== undefined && discoveryFresh(hit.at)) return hit
+  let entry
+  try {
+    const data = await api(`/groups/api/config/providers/${encodeURIComponent(providerId)}/models`)
+    entry = { models: Array.isArray(data?.models) ? data.models : [], note: data?.note, at: Date.now(), ok: true, error: null }
+  } catch (error) {
+    // Endpoint absent (T4 not merged yet) → fall back to models embedded in
+    // the providers list when present, else degraded empty.
+    const providers = await discoveryProviders(true)
+    const embedded = providers.providers.find((p) => providerIdOf(p) === providerId)?.models
+    entry = { models: Array.isArray(embedded) ? embedded : [], at: Date.now(), ok: false, error: errorOf(error), embedded: Array.isArray(embedded) && embedded.length > 0 }
+  }
+  discoveryCache.models.set(providerId, entry)
+  return entry
+}
+
+async function discoveryCredential(providerId, force) {
+  const hit = discoveryCache.credential.get(providerId)
+  if (!force && hit !== undefined && discoveryFresh(hit.at)) return hit
+  let entry
+  try {
+    const data = await api(`/groups/api/config/providers/${encodeURIComponent(providerId)}/credential`)
+    entry = { credential: data?.credential ?? {}, note: data?.note, at: Date.now(), ok: true, error: null }
+  } catch (error) {
+    // Endpoint absent → fall back to the providers-list credential facts.
+    const providers = await discoveryProviders(true)
+    const provider = providers.providers.find((p) => providerIdOf(p) === providerId)
+    entry = { credential: provider?.credential ?? {}, at: Date.now(), ok: false, error: errorOf(error), embedded: provider !== undefined }
+  }
+  discoveryCache.credential.set(providerId, entry)
+  return entry
+}
+
+/**
+ * The wizard's exact step sequence per requirement: Name → Runtime → Provider
+ * → Authentication → Model → Reasoning → Instructions → Create. Only the DSH
+ * runtime carries Provider/Authentication/Model/Reasoning; ACP runtimes show
+ * their existing readiness info and jump straight to Instructions. The
+ * Reasoning step is gated by the SELECTED MODEL's capability: hidden entirely
+ * when the model exposes no reasoning efforts (per requirement).
+ */
+function wizardSteps(runtime, reasoning) {
+  const steps = [
+    { id: 'name', label: 'Name' },
+    { id: 'runtime', label: 'Runtime' },
+  ]
+  if (runtime === DSH_RUNTIME_ID) {
+    steps.push({ id: 'provider', label: 'Provider' })
+    steps.push({ id: 'auth', label: 'Authentication' })
+    steps.push({ id: 'model', label: 'Model' })
+    if (reasoning !== undefined && reasoning.efforts.length > 0) {
+      steps.push({ id: 'reasoning', label: 'Reasoning' })
+    }
+  }
+  steps.push({ id: 'instructions', label: 'Instructions' })
+  steps.push({ id: 'create', label: 'Create' })
+  return steps
+}
+
 // ── stylesheet: ag- prefixed, theme tokens only, inserted once ─────────────
 
 let cssInjected = false
@@ -127,6 +247,13 @@ function injectCss() {
 .ag-kv{display:flex;flex-direction:column;gap:1px}
 .ag-kv .ag-note{font-size:11px;text-transform:uppercase;letter-spacing:.03em}
 .ag-turn-id{font-size:11px}
+.ag-select{padding:6px 8px;border-radius:6px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}
+.ag-wiz-steps{display:flex;gap:4px;flex-wrap:wrap;margin-bottom:10px}
+.ag-wiz-step{padding:2px 10px;border-radius:999px;border:1px solid var(--dsw-alias-border-l1);color:var(--dsw-alias-label-secondary);font-size:11px;background:var(--dsw-alias-bg-layer-1);cursor:default}
+.ag-wiz-step.on{border-color:var(--dsw-alias-brand-primary);color:var(--dsw-alias-label-primary);background:color-mix(in srgb, var(--dsw-alias-brand-primary) 12%, transparent);font-weight:600}
+.ag-wiz-step.done{border-color:var(--dsw-alias-state-success-primary);color:var(--dsw-alias-state-success-primary)}
+.ag-auth-box{border:1px solid var(--dsw-alias-border-l1);border-radius:8px;padding:8px 10px;background:var(--dsw-alias-bg-layer-1);display:flex;flex-direction:column;gap:6px}
+.ag-wiz-summary{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:6px 16px}
 `
   document.head.appendChild(style)
 }
@@ -794,13 +921,32 @@ function AddMemberModal({ groupId, onClose }) {
   const [name, setName] = React.useState('')
   const [busy, setBusy] = React.useState(false)
   const [error, setError] = React.useState(null)
+  const [config, setConfig] = React.useState(null)
+  const [creating, setCreating] = React.useState(false)
 
   React.useEffect(() => {
-    api(`/groups/api/groups/${encodeURIComponent(groupId)}/team-config`).then((config) => {
-      setRoles(config.memberRoles)
-      if (config.memberRoles.length > 0) setRole(config.memberRoles[0].id)
+    api(`/groups/api/groups/${encodeURIComponent(groupId)}/team-config`).then((data) => {
+      setConfig(data)
+      setRoles(data.memberRoles)
+      if (data.memberRoles.length > 0) setRole(data.memberRoles[0].id)
     }).catch(() => undefined)
   }, [groupId])
+
+  /** V0.4.1: the Create Role wizard can surface from Add Member — a fabricated
+   * role is appended to the team config through the same PUT path, then the
+   * modal reloads and preselects it so the member can spawn immediately. */
+  const created = async (createdRole) => {
+    const current = config ?? { leaderRole: { id: 'leader', name: 'Leader', runtime: 'deepseek-harness' }, memberRoles: [] }
+    const merged = { ...current, memberRoles: [...(current.memberRoles ?? []), createdRole] }
+    const updated = await api(`/groups/api/groups/${encodeURIComponent(groupId)}/team-config`, {
+      method: 'PUT', body: JSON.stringify(merged),
+    })
+    const nextRoles = updated.teamConfig?.memberRoles ?? merged.memberRoles
+    setConfig(updated.teamConfig ?? merged)
+    setRoles(nextRoles)
+    setRole(createdRole.id)
+    setCreating(false)
+  }
 
   const add = async () => {
     if (busy) return
@@ -827,14 +973,20 @@ function AddMemberModal({ groupId, onClose }) {
   },
     React.createElement('div', { className: 'ag-form' },
       error !== null && React.createElement(ErrorLine, { message: error }),
-      React.createElement('label', null, 'Team role (runtime/model/reasoning come from the configuration)',
+      React.createElement('label', null, 'Team role (runtime/provider/model/reasoning come from the configuration)',
         React.createElement('select', { value: role, onChange: (e) => setRole(e.target.value), style: { padding: 6, borderRadius: 6, border: '1px solid var(--dsw-alias-border-l1)', background: 'var(--dsw-alias-bg-layer-2)', color: 'var(--dsw-alias-label-primary)' } },
+          roles.length === 0 && React.createElement('option', { value: '' }, '— no roles yet — create one below —'),
           roles.map((r) => React.createElement('option', { key: r.id, value: r.id }, `${r.name} [${r.runtime}]`)),
         ),
+      ),
+      React.createElement('div', { className: 'ag-toolbar', style: { marginBottom: 0 } },
+        React.createElement(Button, { variant: 'ghost', size: 'sm', icon: React.createElement(primitives.IconPlusOutline16, {}), onClick: () => setCreating(true) }, 'New Role'),
+        React.createElement('span', { className: 'ag-note' }, 'Create a role here before adding its first member.'),
       ),
       React.createElement('label', null, 'Display name (optional)',
         React.createElement(Input, { value: name, onChange: (e) => setName(e.target.value), placeholder: 'planner-1' }),
       ),
+      creating && React.createElement(CreateRoleWizard, { onClose: () => setCreating(false), onCreated: created }),
     ),
   )
 }
@@ -1068,41 +1220,379 @@ function ActivityTab({ snap }) {
 }
 
 
+// ── V0.4.1: Create Role wizard ──────────────────────────────────────────────
+
+/** Per-provider on-demand models + credential status (session-cached). */
+function useProviderData(providerId) {
+  const [models, setModels] = React.useState(null)
+  const [credential, setCredential] = React.useState(null)
+  React.useEffect(() => {
+    if (providerId === undefined) { setModels(null); setCredential(null); return }
+    let cancelled = false
+    setModels(null)
+    setCredential(null)
+    discoveryModels(providerId).then((entry) => { if (!cancelled) setModels(entry) })
+    discoveryCredential(providerId).then((entry) => { if (!cancelled) setCredential(entry) })
+    return () => { cancelled = true }
+  }, [providerId])
+  return { models, credential }
+}
+
+/** Read-only "configure" entry per T1 findings: no deep-linkable URL exists
+ * in the shell today (settings open state is component-local), so we render
+ * the configurable-provider settingsNs/settingsPath/credentialRef info. */
+function authConfigInfo(auth) {
+  if (auth.settingsNs === undefined) {
+    return React.createElement('div', { className: 'ag-col', style: { gap: 4 } },
+      React.createElement('div', { className: 'ag-note' }, 'Open Settings → Models in the sidebar to configure credentials for this provider. Agent Groups never stores or displays API keys.'),
+      auth.credentialRef !== undefined && React.createElement('div', { className: 'ag-monoblock' }, `credential ref: ${auth.credentialRef}`),
+    )
+  }
+  return React.createElement('div', { className: 'ag-col', style: { gap: 4 } },
+    React.createElement('div', { className: 'ag-note' }, 'Open Settings → Models in the sidebar and edit this provider namespace (read-only reference):'),
+    React.createElement('div', { className: 'ag-monoblock' },
+      `settings: ${auth.settingsNs}${(auth.settingsPath ?? []).length > 0 ? ` / ${auth.settingsPath.join(' / ')}` : ''}`),
+    auth.credentialRef !== undefined && React.createElement('div', { className: 'ag-monoblock' }, `credential ref: ${auth.credentialRef}`),
+    React.createElement('div', { className: 'ag-note' }, 'No API keys are entered or stored in Agent Groups — authentication belongs to the Harness settings.'),
+  )
+}
+
+function CreateRoleWizard({ runtimes: runtimesProp, onClose, onCreated }) {
+  const [runtimes, setRuntimes] = React.useState(() => (Array.isArray(runtimesProp) ? runtimesProp : []))
+  const [providers, setProviders] = React.useState(null)
+  const [models, setModels] = React.useState(null)
+  const [credential, setCredential] = React.useState(null)
+  const [step, setStep] = React.useState('name')
+  const [busy, setBusy] = React.useState(false)
+  const [error, setError] = React.useState(null)
+  const [draft, setDraft] = React.useState(() => ({
+    id: `role-${Date.now().toString(36)}`,
+    name: '',
+    description: '',
+    runtime: DSH_RUNTIME_ID,
+    profile: 'group-member',
+    provider: undefined,
+    model: undefined,
+    reasoningEffort: undefined,
+    systemPrompt: '',
+    maxInstances: 2,
+  }))
+
+  React.useEffect(() => {
+    if (!Array.isArray(runtimesProp)) {
+      api('/groups/api/runtimes').then(setRuntimes).catch(() => setRuntimes([]))
+    }
+    discoveryProviders().then(setProviders)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const runtime = runtimes.find((r) => r.id === draft.runtime)
+  const isDsh = draft.runtime === DSH_RUNTIME_ID
+
+  // Per-provider on-demand model/credential loads (cached module-wide).
+  React.useEffect(() => {
+    if (!isDsh || draft.provider === undefined) { setModels(null); setCredential(null); return }
+    let cancelled = false
+    setModels(null)
+    setCredential(null)
+    discoveryModels(draft.provider).then((entry) => { if (!cancelled) setModels(entry) })
+    discoveryCredential(draft.provider).then((entry) => { if (!cancelled) setCredential(entry) })
+    return () => { cancelled = true }
+  }, [isDsh, draft.provider])
+
+  const modelInfo = models?.models?.find((m) => m.id === draft.model)
+  const reasoning = modelInfo?.reasoning
+  // Merge the providers-list entry facts (settingsNs/path/ref) with the live
+  // per-provider status (config/endpoint fresh wins).
+  const providerEntry = (providers?.providers ?? []).find((p) => providerIdOf(p) === draft.provider)
+  const auth = credentialFacts({ ...(providerEntry ?? {}), ...(credential?.credential ?? {}) })
+  const [showConfigure, setShowConfigure] = React.useState(false)
+
+  const steps = wizardSteps(draft.runtime, isDsh ? reasoning : undefined)
+  const stepIndex = Math.max(0, steps.findIndex((s) => s.id === step))
+  const current = steps[stepIndex] !== undefined ? steps[stepIndex] : steps[steps.length - 1]
+  const isLast = current.id === 'create'
+
+  const pickRuntime = (value) => {
+    setDraft((d) => ({
+      ...d,
+      runtime: value,
+      provider: value === DSH_RUNTIME_ID ? d.provider : undefined,
+      model: value === DSH_RUNTIME_ID ? d.model : undefined,
+      reasoningEffort: value === DSH_RUNTIME_ID ? d.reasoningEffort : undefined,
+    }))
+  }
+  const pickProvider = (value) => {
+    setDraft((d) => ({ ...d, provider: value === '' ? undefined : value, model: undefined, reasoningEffort: undefined }))
+  }
+  const pickModel = (value) => {
+    const model = value === '' ? undefined : value
+    setDraft((d) => {
+      const info = models?.models?.find((m) => m.id === model)
+      const next = { ...d, model, reasoningEffort: undefined }
+      if (info?.reasoning !== undefined && info.reasoning.efforts.length > 0) {
+        // Requirement: the model's defaultEffort is preselected when present.
+        next.reasoningEffort = info.reasoning.defaultEffort
+      }
+      return next
+    })
+  }
+
+  const canNext = current.id !== 'name' || draft.name.trim() !== ''
+
+  const create = async () => {
+    if (busy) return
+    setBusy(true)
+    setError(null)
+    try {
+      await onCreated({
+        id: draft.id,
+        name: draft.name.trim(),
+        description: draft.description.trim() === '' ? undefined : draft.description.trim(),
+        runtime: draft.runtime,
+        profile: draft.profile.trim() === '' ? undefined : draft.profile.trim(),
+        provider: draft.provider,
+        model: draft.model,
+        reasoningEffort: draft.reasoningEffort,
+        systemPrompt: draft.systemPrompt.trim() === '' ? undefined : draft.systemPrompt,
+        maxInstances: Number.isFinite(Number(draft.maxInstances)) ? Math.max(1, Number(draft.maxInstances)) : undefined,
+      })
+    } catch (cause) {
+      setError(errorOf(cause))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const stepBody = () => {
+    if (current.id === 'name') {
+      return React.createElement('div', { className: 'ag-form' },
+        React.createElement('label', null, 'Role name (required)',
+          React.createElement(Input, { value: draft.name, onChange: (e) => setDraft((d) => ({ ...d, name: e.target.value })), placeholder: 'e.g. Researcher' }),
+        ),
+        React.createElement('label', null, 'Description',
+          React.createElement(Input, { value: draft.description, onChange: (e) => setDraft((d) => ({ ...d, description: e.target.value })), placeholder: 'What this role is for (shown in the Team Configuration)' }),
+        ),
+      )
+    }
+    if (current.id === 'runtime') {
+      return React.createElement('div', { className: 'ag-form' },
+        React.createElement('label', null, 'Agent runtime',
+          React.createElement('select', { className: 'ag-select', value: draft.runtime, onChange: (e) => pickRuntime(e.target.value) },
+            runtimes.length === 0 ? React.createElement('option', { value: draft.runtime }, draft.runtime)
+              : runtimes.map((r) => React.createElement('option', { key: r.id, value: r.id }, r.name)),
+          ),
+        ),
+        runtime === undefined
+          ? React.createElement('div', { className: 'ag-note' }, 'Runtime not registered — members of this role will fail to spawn until a provider is configured.')
+          : runtime.id === DSH_RUNTIME_ID
+            ? React.createElement('div', { className: 'ag-note' }, 'DeepSeek Harness — members are durable DSH subagents in this shell. Provider, authentication, model and reasoning are configured in the next steps from the live harness catalog.')
+            : React.createElement('div', { className: 'ag-auth-box' },
+                React.createElement('span', null,
+                  runtime.name,
+                  runtime.available === false && React.createElement('span', { className: 'ag-badge warn', style: { marginLeft: 6 } }, 'Not configured'),
+                  runtime.available !== false && runtime.readiness?.initialized === true && React.createElement('span', { className: 'ag-badge ok', style: { marginLeft: 6 } }, 'ACP initialized'),
+                  runtime.available !== false && runtime.readiness?.initialized === false && React.createElement('span', { className: 'ag-badge', style: { marginLeft: 6 } }, `Launchable · ${runtime.readiness.executor ?? 'executor'}`),
+                  runtime.available !== false && runtime.readiness === undefined && React.createElement('span', { className: 'ag-badge ok', style: { marginLeft: 6 } }, 'Available'),
+                ),
+                runtime.description !== undefined && React.createElement('div', { className: 'ag-note' }, runtime.description),
+                React.createElement('div', { className: 'ag-note' }, 'External coding-agent runtime — provider/model/reasoning are managed by that runtime, not by Agent Groups discovery.'),
+              ),
+      )
+    }
+    if (current.id === 'provider') {
+      const unavailable = providers !== null && (providers.ok === false || (providers.providers.length === 0 && providers.error !== undefined))
+      const degradedNote = providers !== null && providers.providers.length === 0 && (providers.note !== undefined || unavailable)
+      return React.createElement('div', { className: 'ag-form' },
+        React.createElement('label', null, 'Model provider (DSH harness route)',
+          React.createElement('select', { className: 'ag-select', value: draft.provider ?? '', onChange: (e) => pickProvider(e.target.value) },
+            React.createElement('option', { value: '' }, '— harness default —'),
+            (providers?.providers ?? []).map((p) => React.createElement('option', { key: providerIdOf(p), value: providerIdOf(p) }, p.name ?? providerIdOf(p))),
+          ),
+        ),
+        providers === null
+          ? React.createElement('div', { className: 'ag-note' }, 'Loading provider catalog…')
+          : degradedNote
+            ? React.createElement('div', { className: 'ag-note' }, `Harness discovery unavailable — ${providers.error ?? providers.note}. The harness default route will apply; you can pin a provider later in Edit Role once discovery is up.`)
+            : draft.provider === undefined
+              ? React.createElement('div', { className: 'ag-note' }, 'No provider pinned — the harness’ default provider route applies to this role. Pick a provider to configure authentication/model/reasoning explicitly.')
+              : React.createElement('div', { className: 'ag-note' }, `Route pinned to ${draft.provider}. This is the model-provider id the harness adapter owns (never a secret).`),
+      )
+    }
+    if (current.id === 'auth') {
+      if (draft.provider === undefined) {
+        return React.createElement('div', { className: 'ag-auth-box' },
+          React.createElement('span', null, 'Authentication: ', React.createElement('span', { className: 'ag-note' }, 'no provider pinned — the harness default provider applies; credentials live in Settings → Models')),
+        )
+      }
+      if (credential === null) {
+        return React.createElement('div', { className: 'ag-auth-box' }, 'Loading credential status…')
+      }
+      if (auth.configured === true) {
+        return React.createElement('div', { className: 'ag-auth-box' },
+          React.createElement('span', null,
+            'Authentication: ', React.createElement('span', { className: 'ag-badge ok' }, 'Configured'),
+            auth.source !== undefined && React.createElement('span', { className: 'ag-note', style: { marginLeft: 6 } }, `· ${auth.source}`),
+          ),
+          auth.writable === false && React.createElement('div', { className: 'ag-note' }, 'Credential is read-only (managed outside this shell).'),
+          React.createElement('div', { className: 'ag-note' }, 'This provider is ready for members. No secret is stored or shown here.'),
+        )
+      }
+      if (auth.configured === false) {
+        return React.createElement('div', { className: 'ag-auth-box' },
+          React.createElement('span', null,
+            'Authentication: ', React.createElement('span', { className: 'ag-badge warn' }, 'Not configured'),
+          ),
+          React.createElement(Button, { variant: 'ghost', size: 'sm', onClick: () => setShowConfigure((v) => !v) }, showConfigure ? 'Hide configuration info' : 'Configure'),
+          showConfigure && authConfigInfo(auth),
+          React.createElement('div', { className: 'ag-note' }, 'Configure the credential in the Harness settings first, or members of this role may fail at request time.'),
+        )
+      }
+      return React.createElement('div', { className: 'ag-auth-box' },
+        React.createElement('span', null, 'Authentication: ', React.createElement('span', { className: 'ag-note' }, credential !== null && credential.error !== undefined ? `status unknown (${credential.error})` : 'status unknown (no settings/credential service)')),
+        React.createElement(Button, { variant: 'ghost', size: 'sm', onClick: () => setShowConfigure((v) => !v) }, showConfigure ? 'Hide configuration info' : 'Configure'),
+        showConfigure && authConfigInfo(auth),
+      )
+    }
+    if (current.id === 'model') {
+      const modelsUnavailable = models !== null && models.ok === false && !(models.embedded === true)
+      return React.createElement('div', { className: 'ag-form' },
+        React.createElement('label', null, 'Model (per provider)',
+          React.createElement('select', { className: 'ag-select', value: draft.model ?? '', onChange: (e) => pickModel(e.target.value) },
+            React.createElement('option', { value: '' }, '— default —'),
+            (models?.models ?? []).map((m) => React.createElement('option', { key: m.id, value: m.id, title: m.description ?? '' }, m.name ?? m.id)),
+          ),
+        ),
+        models === null
+          ? React.createElement('div', { className: 'ag-note' }, 'Loading model catalog…')
+          : modelsUnavailable
+            ? React.createElement('div', { className: 'ag-note' }, `Model catalog unavailable for ${draft.provider} (${models.error}) — the provider default model applies.`)
+            : draft.model === undefined
+              ? React.createElement('div', { className: 'ag-note' }, 'No model pinned — the provider’s default model applies to this role.')
+              : React.createElement('div', { className: 'ag-note' }, `Model pinned to ${draft.model}.`),
+      )
+    }
+    if (current.id === 'reasoning') {
+      return React.createElement('div', { className: 'ag-form' },
+        React.createElement('label', null, 'Reasoning effort (per selected model)',
+          React.createElement('select', { className: 'ag-select', value: draft.reasoningEffort ?? '', onChange: (e) => setDraft((d) => ({ ...d, reasoningEffort: e.target.value === '' ? undefined : e.target.value })) },
+            React.createElement('option', { value: '' }, '— default —'),
+            (reasoning?.efforts ?? []).map((effort) => React.createElement('option', { key: effort.id, value: effort.id, title: effort.description ?? '' }, effort.name ?? effort.id)),
+          ),
+        ),
+        reasoning?.defaultEffort !== undefined && React.createElement('div', { className: 'ag-note' }, `This model’s default effort is “${reasoning.defaultEffort}” (preselected). “— default —” leaves the provider’s configured default.`),
+        React.createElement('div', { className: 'ag-note' }, 'Effort ids are adapter-owned and validated against the live catalog when saving.'),
+      )
+    }
+    if (current.id === 'instructions') {
+      return React.createElement('div', { className: 'ag-form' },
+        React.createElement('label', null, 'Role instructions (system prompt)',
+          React.createElement('textarea', { className: 'ag-input', rows: 5, value: draft.systemPrompt, onChange: (e) => setDraft((d) => ({ ...d, systemPrompt: e.target.value })), placeholder: 'Layered below the member protocol. e.g. “You research deeply and document sources.”', style: { padding: 8, borderRadius: 6, border: '1px solid var(--dsw-alias-border-l1)', background: 'var(--dsw-alias-bg-layer-2)', color: 'var(--dsw-alias-label-primary)', fontFamily: 'inherit' } }),
+        ),
+      )
+    }
+    // create
+    return React.createElement('div', { className: 'ag-col', style: { gap: 10 } },
+      React.createElement('div', { className: 'ag-wiz-summary' },
+        React.createElement('span', { className: 'ag-note' }, 'Name'), React.createElement('span', { className: 'ag-monoblock' }, draft.name.trim() === '' ? '—' : draft.name.trim()),
+        React.createElement('span', { className: 'ag-note' }, 'Role id'), React.createElement('span', { className: 'ag-monoblock' }, draft.id),
+        React.createElement('span', { className: 'ag-note' }, 'Runtime'), React.createElement('span', null, runtime !== undefined ? runtime.name : draft.runtime),
+        React.createElement('span', { className: 'ag-note' }, 'Provider'), React.createElement('span', { className: 'ag-monoblock' }, isDsh ? (draft.provider ?? 'harness default') : '—'),
+        React.createElement('span', { className: 'ag-note' }, 'Model'), React.createElement('span', { className: 'ag-monoblock' }, isDsh ? (draft.model ?? 'provider default') : '—'),
+        React.createElement('span', { className: 'ag-note' }, 'Reasoning'), React.createElement('span', { className: 'ag-monoblock' }, isDsh ? (draft.reasoningEffort ?? 'provider default') : '—'),
+        React.createElement('span', { className: 'ag-note' }, 'Role profile'), React.createElement('span', { className: 'ag-monoblock' }, draft.profile.trim() === '' ? 'none' : draft.profile.trim()),
+        React.createElement('span', { className: 'ag-note' }, 'System prompt'), React.createElement('span', { className: 'ag-note' }, draft.systemPrompt.trim() === '' ? '—' : `${draft.systemPrompt.trim().length} chars`),
+      ),
+      React.createElement('div', { className: 'ag-form', style: { gap: 6 } },
+        React.createElement('div', { className: 'ag-col', style: { flexDirection: 'row', gap: 8, flexWrap: 'wrap' } },
+          React.createElement('label', null, 'Role profile',
+            React.createElement('input', { className: 'ag-input', value: draft.profile, onChange: (e) => setDraft((d) => ({ ...d, profile: e.target.value })), style: { width: 150, padding: 4, borderRadius: 6, border: '1px solid var(--dsw-alias-border-l1)', background: 'var(--dsw-alias-bg-layer-2)', color: 'var(--dsw-alias-label-primary)' } }),
+          ),
+          React.createElement('label', null, 'Max instances',
+            React.createElement('input', { className: 'ag-input', type: 'number', min: 1, max: 12, value: String(draft.maxInstances), onChange: (e) => setDraft((d) => ({ ...d, maxInstances: e.target.value === '' ? 1 : Number(e.target.value) })), style: { width: 80, padding: 4, borderRadius: 6, border: '1px solid var(--dsw-alias-border-l1)', background: 'var(--dsw-alias-bg-layer-2)', color: 'var(--dsw-alias-label-primary)' } }),
+          ),
+        ),
+      ),
+      React.createElement('div', { className: 'ag-note' }, 'Creating appends this role to the team configuration and saves via the same team-config API used by the Roles tab.'),
+    )
+  }
+
+  return React.createElement(Modal, {
+    open: true,
+    onClose,
+    title: 'Create Role',
+    footer: React.createElement('div', { style: { display: 'flex', gap: 8, justifyContent: 'flex-end' } },
+      React.createElement(Button, { variant: 'ghost', size: 'sm', onClick: onClose }, 'Cancel'),
+      stepIndex > 0 && React.createElement(Button, { variant: 'ghost', size: 'sm', onClick: () => setStep(steps[Math.max(0, stepIndex - 1)].id) }, 'Back'),
+      isLast
+        ? React.createElement(Button, { variant: 'primary', size: 'sm', disabled: busy || draft.name.trim() === '', onClick: () => void create() }, busy ? 'Creating…' : 'Create Role')
+        : React.createElement(Button, { variant: 'primary', size: 'sm', disabled: !canNext, onClick: () => setStep(steps[Math.min(steps.length - 1, stepIndex + 1)].id) }, 'Next'),
+    ),
+  },
+    React.createElement('div', { className: 'ag-col', style: { gap: 8 } },
+      React.createElement('div', { className: 'ag-wiz-steps' },
+        steps.map((s, index) =>
+          React.createElement('span', { key: s.id, className: `ag-wiz-step${s.id === current.id ? ' on' : ''}${index < stepIndex ? ' done' : ''}` }, `${index + 1}. ${s.label}`)),
+      ),
+      error !== null && React.createElement(ErrorLine, { message: error }),
+      stepBody(),
+    ),
+  )
+}
+
 // ── Team Configuration (V0.4): roles + runtimes ────────────────────────────
 
 function RolesTab({ snap }) {
   const groupId = snap.group.groupId
   const [config, setConfig] = React.useState(null)
   const [runtimes, setRuntimes] = React.useState([])
+  const [discovery, setDiscovery] = React.useState(null)
   const [error, setError] = React.useState(null)
   const [saved, setSaved] = React.useState(null)
   const [busy, setBusy] = React.useState(false)
   const [initialConfig, setInitialConfig] = React.useState(null)
+  const [creating, setCreating] = React.useState(false)
 
   const load = React.useCallback(() => {
     setError(null)
     api(`/groups/api/groups/${encodeURIComponent(groupId)}/team-config`).then((data) => { setConfig(data); setInitialConfig(data) }).catch((err) => setError(errorOf(err)))
     api('/groups/api/runtimes').then(setRuntimes).catch(() => undefined)
+    discoveryProviders().then(setDiscovery)
   }, [groupId])
 
   React.useEffect(() => { load() }, [load])
 
-  const save = async () => {
-    if (busy || config === null) return
+  /** V0.4.1: save accepts an explicit config (the wizard merges a new role
+   * into the local state and saves through this same PUT path). */
+  const save = async (next) => {
+    const payload = next ?? config
+    if (busy || payload === null) return
     setBusy(true)
     setError(null)
     try {
       const updated = await api(`/groups/api/groups/${encodeURIComponent(groupId)}/team-config`, {
-        method: 'PUT', body: JSON.stringify(config),
+        method: 'PUT', body: JSON.stringify(payload),
       })
       setConfig(updated.teamConfig)
+      setInitialConfig(updated.teamConfig)
       setSaved('Team configuration saved.')
       window.setTimeout(() => setSaved(null), 2500)
     } catch (cause) {
       setError(errorOf(cause))
+      throw cause
     } finally {
       setBusy(false)
     }
+  }
+
+  /** Wizard completion: insert the new role into team config state and save
+   * via the same PUT path as the Save button. */
+  const createRole = async (role) => {
+    if (config === null) return
+    const merged = { ...config, memberRoles: [...config.memberRoles, role] }
+    setConfig(merged)
+    await save(merged)
+    setCreating(false)
   }
 
   const patchRole = (index, patch) => {
@@ -1111,15 +1601,6 @@ function RolesTab({ snap }) {
       const roles = current.memberRoles.map((role, i) => (i === index ? { ...role, ...patch } : role))
       return { ...current, memberRoles: roles }
     })
-  }
-  const addRole = () => {
-    setConfig((current) => (current === null ? current : {
-      ...current,
-      memberRoles: [...current.memberRoles, {
-        id: `role-${Date.now().toString(36)}`, name: 'New Role', runtime: 'deepseek-harness',
-        profile: 'group-member', reasoningLevel: 'medium', maxInstances: 2,
-      }],
-    }))
   }
   const removeRole = (index) => {
     setConfig((current) => (current === null ? current : {
@@ -1173,34 +1654,126 @@ function RolesTab({ snap }) {
     error !== null && React.createElement(ErrorLine, { message: error }),
     React.createElement('div', { className: 'ag-toolbar' },
       React.createElement(Button, { variant: 'primary', size: 'sm', onClick: () => void save(), disabled: busy }, busy ? 'Saving…' : 'Save Team Configuration'),
-      React.createElement(Button, { variant: 'ghost', size: 'sm', onClick: addRole, icon: React.createElement(primitives.IconPlusOutline16, {}) }, 'Add Role'),
+      React.createElement(Button, { variant: 'ghost', size: 'sm', onClick: () => setCreating(true), icon: React.createElement(primitives.IconPlusOutline16, {}) }, 'Add Role'),
       React.createElement(Button, { variant: 'ghost', size: 'sm', onClick: exportConfig }, 'Export'),
       React.createElement(Button, { variant: 'ghost', size: 'sm', onClick: importConfig }, 'Import'),
       React.createElement(Button, { variant: 'ghost', size: 'sm', onClick: resetConfig, disabled: initialConfig === null }, 'Reset'),
       saved !== null && React.createElement('span', { className: 'ag-note' }, saved),
     ),
     React.createElement('div', { className: 'ag-note', style: { marginBottom: 8 } },
-      'Configured Roles define HOW each kind of member spawns (runtime / model / reasoning / profile / max instances). Running instances appear on the Team tab.'),
+      'Configured Roles define HOW each kind of member spawns (runtime / provider / model / reasoning effort / profile / max instances). Running instances appear on the Team tab.'),
     React.createElement('div', { className: 'ag-col' },
       React.createElement(RoleCard, {
         role: config.leaderRole, leader: true,
-        runtimes, onPatch: () => undefined, onRemove: () => undefined,
+        runtimes, discovery, onPatch: () => undefined, onRemove: () => undefined,
       }),
       config.memberRoles.map((role, index) => React.createElement(RoleCard, {
-        key: role.id, role, runtimes,
+        key: role.id, role, runtimes, discovery,
         onPatch: (patch) => patchRole(index, patch),
         onRemove: () => removeRole(index),
         onDuplicate: (role) => duplicateRole(role),
       })),
     ),
+    creating && React.createElement(CreateRoleWizard, {
+      runtimes, onClose: () => setCreating(false), onCreated: createRole,
+    }),
   )
 }
 
-function RoleCard({ role, leader, runtimes, onPatch, onRemove, onDuplicate }) {
+function RoleCard({ role, leader, runtimes, onPatch, onRemove, onDuplicate, discovery }) {
   const runtime = runtimes.find((r) => r.id === role.runtime)
   const unavailable = runtime !== undefined && !runtime.available
-  const models = runtime?.capabilities?.models === true ? (runtime.models ?? []) : []
-  const levels = (runtime?.reasoningLevels?.length ?? 0) > 0 ? runtime.reasoningLevels : [{ id: 'low', label: 'Low' }, { id: 'medium', label: 'Medium' }, { id: 'high', label: 'High' }]
+  const legacyModels = runtime?.capabilities?.models === true ? (runtime.models ?? []) : []
+  const legacyLevels = (runtime?.reasoningLevels?.length ?? 0) > 0 ? runtime.reasoningLevels : [{ id: 'low', label: 'Low' }, { id: 'medium', label: 'Medium' }, { id: 'high', label: 'High' }]
+  const isDsh = role.runtime === DSH_RUNTIME_ID
+  const discoveryOk = discovery !== null && discovery !== undefined && discovery.ok === true && isDsh
+  const providerOptions = discoveryOk ? (discovery.providers ?? []) : []
+  const selectedProvider = role.provider
+  const { models, credential } = useProviderData(discoveryOk ? selectedProvider : undefined)
+  const [showConfigure, setShowConfigure] = React.useState(false)
+
+  // V0.4.1: live model list per provider (fall back to the legacy runtime
+  // models — the DSH runtime mirrors the harness default route — when no
+  // provider is pinned or discovery is unavailable).
+  const showDiscoveryModels = discoveryOk && selectedProvider !== undefined
+  const modelOptions = showDiscoveryModels ? (models?.models ?? []) : legacyModels
+  const modelInfo = modelOptions.find((m) => m.id === role.model)
+  const reasoning = modelInfo?.reasoning
+  // Merge the providers-list entry facts (settingsNs/path/ref) with the live
+  // per-provider status (config/endpoint fresh wins).
+  const providerEntry = (discovery?.providers ?? []).find((p) => providerIdOf(p) === selectedProvider)
+  const auth = credentialFacts({ ...(providerEntry ?? {}), ...(credential?.credential ?? {}) })
+
+  // Reasoning select gated by the SELECTED MODEL's capability: real effort ids
+  // from the live catalog when known; hidden/disabled when the model exposes
+  // no efforts; legacy low/medium/high fallback when the route is unresolved
+  // or discovery is down (per requirement: keep legacy fields working).
+  let reasoningControl
+  if (!isDsh || !discoveryOk || selectedProvider === undefined || role.model === undefined) {
+    reasoningControl = React.createElement(React.Fragment, null,
+      React.createElement('select', { className: 'ag-input', value: role.reasoningLevel ?? '', disabled: leader, onChange: (e) => onPatch({ reasoningLevel: e.target.value === '' ? undefined : e.target.value, reasoningEffort: undefined }), style: { padding: 4, borderRadius: 6, border: '1px solid var(--dsw-alias-border-l1)', background: 'var(--dsw-alias-bg-layer-2)', color: 'var(--dsw-alias-label-primary)' } },
+        React.createElement('option', { value: '' }, '— default —'),
+        legacyLevels.map((level) => React.createElement('option', { key: level.id, value: level.id }, level.label)),
+      ),
+      discoveryOk && React.createElement('span', { className: 'ag-note', style: { marginTop: 2 } }, 'abstract level — pin a provider + model to pick real effort ids from the live catalog'),
+    )
+  } else if (reasoning !== undefined && reasoning.efforts.length > 0) {
+    reasoningControl = React.createElement(React.Fragment, null,
+      React.createElement('select', { className: 'ag-input', value: role.reasoningEffort ?? '', disabled: leader, onChange: (e) => onPatch({ reasoningEffort: e.target.value === '' ? undefined : e.target.value, reasoningLevel: undefined }), style: { padding: 4, borderRadius: 6, border: '1px solid var(--dsw-alias-border-l1)', background: 'var(--dsw-alias-bg-layer-2)', color: 'var(--dsw-alias-label-primary)' } },
+        React.createElement('option', { value: '' }, '— default —'),
+        reasoning.efforts.map((effort) => React.createElement('option', { key: effort.id, value: effort.id, title: effort.description ?? '' }, effort.name ?? effort.id)),
+      ),
+      role.reasoningLevel !== undefined && React.createElement('span', { className: 'ag-note', style: { marginTop: 2 } }, `legacy level "${role.reasoningLevel}" ignored — the selected effort takes precedence`),
+      role.reasoningEffort !== undefined && !reasoning.efforts.some((e) => e.id === role.reasoningEffort) && React.createElement('span', { className: 'ag-note', style: { marginTop: 2 } }, `stored effort "${role.reasoningEffort}" is not offered by this model — pick an option below (save is otherwise rejected)`),
+    )
+  } else {
+    reasoningControl = React.createElement(React.Fragment, null,
+      React.createElement('select', { className: 'ag-input', disabled: true, value: '', style: { padding: 4, borderRadius: 6, border: '1px solid var(--dsw-alias-border-l1)', background: 'var(--dsw-alias-bg-layer-2)', color: 'var(--dsw-alias-label-secondary)' } },
+        React.createElement('option', { value: '' }, '— none —'),
+      ),
+      React.createElement('span', { className: 'ag-note', style: { marginTop: 2 } },
+        role.reasoningEffort !== undefined ? `effort "${role.reasoningEffort}" is not supported by this model — clear it or switch model` : 'this model exposes no reasoning efforts'),
+    )
+  }
+
+  const authNode = () => {
+    if (!discoveryOk) {
+      return React.createElement('div', { className: 'ag-auth-box' },
+        React.createElement('span', null, 'Authentication: ', React.createElement('span', { className: 'ag-note' }, 'harness discovery unavailable — credentials live in Settings → Models')),
+      )
+    }
+    if (selectedProvider === undefined) {
+      return React.createElement('div', { className: 'ag-auth-box' },
+        React.createElement('span', null, 'Authentication: ', React.createElement('span', { className: 'ag-note' }, 'no provider pinned — harness default provider applies; credentials live in Settings → Models')),
+      )
+    }
+    if (credential === null) {
+      return React.createElement('div', { className: 'ag-auth-box' }, 'Authentication: loading…')
+    }
+    if (auth.configured === true) {
+      return React.createElement('div', { className: 'ag-auth-box' },
+        React.createElement('span', null,
+          'Authentication: ', React.createElement('span', { className: 'ag-badge ok' }, 'Configured'),
+          auth.source !== undefined && React.createElement('span', { className: 'ag-note', style: { marginLeft: 6 } }, `· ${auth.source}`),
+        ),
+        auth.writable === false && React.createElement('div', { className: 'ag-note' }, 'Credential is read-only (managed outside this shell).'),
+      )
+    }
+    if (auth.configured === false) {
+      return React.createElement('div', { className: 'ag-auth-box' },
+        React.createElement('span', null, 'Authentication: ', React.createElement('span', { className: 'ag-badge warn' }, 'Not configured')),
+        React.createElement(Button, { variant: 'ghost', size: 'sm', onClick: () => setShowConfigure((v) => !v) }, showConfigure ? 'Hide configuration info' : 'Configure'),
+        showConfigure && authConfigInfo(auth),
+      )
+    }
+    return React.createElement('div', { className: 'ag-auth-box' },
+      React.createElement('span', null, 'Authentication: ', React.createElement('span', { className: 'ag-note' }, credential !== null && credential.error !== undefined ? `status unknown (${credential.error})` : 'status unknown (no settings/credential service)')),
+      React.createElement(Button, { variant: 'ghost', size: 'sm', onClick: () => setShowConfigure((v) => !v) }, showConfigure ? 'Hide configuration info' : 'Configure'),
+      showConfigure && authConfigInfo(auth),
+    )
+  }
+
+  const inputStyle = { padding: 4, borderRadius: 6, border: '1px solid var(--dsw-alias-border-l1)', background: 'var(--dsw-alias-bg-layer-2)', color: 'var(--dsw-alias-label-primary)' }
   return React.createElement('div', { style: { border: '1px solid var(--dsw-alias-border-l1)', borderRadius: 10, padding: 10, marginBottom: 10, background: 'var(--dsw-alias-bg-layer-1)' } },
     React.createElement('div', { className: 'ag-toolbar', style: { marginBottom: 6 } },
       React.createElement('strong', null, role.name),
@@ -1211,36 +1784,47 @@ function RoleCard({ role, leader, runtimes, onPatch, onRemove, onDuplicate }) {
       runtime !== undefined && runtime.available && runtime.readiness?.initialized === true && React.createElement('span', { className: 'ag-badge ok' }, 'ACP initialized'),
       runtime !== undefined && runtime.available && runtime.readiness?.initialized === false && React.createElement('span', { className: 'ag-badge' }, `Launchable · ${runtime.readiness.executor ?? 'executor'}`),
       runtime !== undefined && runtime.available && runtime.readiness === undefined && React.createElement('span', { className: 'ag-badge ok' }, 'Available'),
+      selectedProvider !== undefined && React.createElement('span', { className: 'ag-badge ag-monoblock', title: 'Pinned model provider' }, selectedProvider),
       !leader && React.createElement(Button, { variant: 'ghost', size: 'sm', onClick: () => onDuplicate(role), style: { marginLeft: 'auto' } }, 'Duplicate'),
       !leader && React.createElement(Button, { variant: 'ghost', size: 'sm', onClick: onRemove }, 'Remove'),
     ),
     React.createElement('div', { className: 'ag-form', style: { gap: 6 } },
-      leader && React.createElement('label', null, 'Description', React.createElement('input', { className: 'ag-input', value: role.description ?? '', disabled: true, style: { padding: 4, borderRadius: 6, border: '1px solid var(--dsw-alias-border-l1)', background: 'var(--dsw-alias-bg-layer-2)', color: 'var(--dsw-alias-label-primary)' } })),
+      leader && React.createElement('label', null, 'Description', React.createElement('input', { className: 'ag-input', value: role.description ?? '', disabled: true, style: inputStyle })),
       React.createElement('div', { className: 'ag-col', style: { flexDirection: 'row', gap: 8, flexWrap: 'wrap' } },
         React.createElement('label', null, 'Runtime',
-          React.createElement('select', { className: 'ag-input', value: role.runtime, disabled: leader, onChange: (e) => onPatch({ runtime: e.target.value }), style: { padding: 4, borderRadius: 6, border: '1px solid var(--dsw-alias-border-l1)', background: 'var(--dsw-alias-bg-layer-2)', color: 'var(--dsw-alias-label-primary)' } },
+          React.createElement('select', { className: 'ag-input', value: role.runtime, disabled: leader, onChange: (e) => onPatch({ runtime: e.target.value }), style: inputStyle },
             runtimes.length === 0 ? React.createElement('option', { value: role.runtime }, role.runtime)
               : runtimes.map((r) => React.createElement('option', { key: r.id, value: r.id }, r.name)),
           )),
+        isDsh && React.createElement('label', null, 'Provider',
+          React.createElement('select', { className: 'ag-input', value: selectedProvider ?? '', disabled: leader, onChange: (e) => onPatch({ provider: e.target.value === '' ? undefined : e.target.value, model: undefined, reasoningEffort: undefined }), style: inputStyle },
+            React.createElement('option', { value: '' }, '— default —'),
+            discoveryOk
+              ? providerOptions.map((p) => React.createElement('option', { key: providerIdOf(p), value: providerIdOf(p) }, p.name ?? providerIdOf(p)))
+              : selectedProvider !== undefined && React.createElement('option', { value: selectedProvider }, selectedProvider),
+          ),
+          !discoveryOk && React.createElement('span', { className: 'ag-note', style: { marginTop: 2 } }, 'provider catalog unavailable'),
+          discoveryOk && providerOptions.length === 0 && React.createElement('span', { className: 'ag-note', style: { marginTop: 2 } }, discovery.note ?? 'no providers listed — harness default applies'),
+        ),
         React.createElement('label', null, 'Model',
-          React.createElement('select', { className: 'ag-input', value: role.model ?? '', disabled: leader, onChange: (e) => onPatch({ model: e.target.value === '' ? undefined : e.target.value }), style: { padding: 4, borderRadius: 6, border: '1px solid var(--dsw-alias-border-l1)', background: 'var(--dsw-alias-bg-layer-2)', color: 'var(--dsw-alias-label-primary)' } },
+          React.createElement('select', { className: 'ag-input', value: role.model ?? '', disabled: leader || (showDiscoveryModels && models === null), onChange: (e) => onPatch({ model: e.target.value === '' ? undefined : e.target.value, reasoningEffort: undefined }), style: inputStyle },
             React.createElement('option', { value: '' }, '— default —'),
-            models.map((m) => React.createElement('option', { key: m.id, value: m.id }, m.name ?? m.id)),
-          )),
-        React.createElement('label', null, 'Reasoning',
-          React.createElement('select', { className: 'ag-input', value: role.reasoningLevel ?? '', disabled: leader, onChange: (e) => onPatch({ reasoningLevel: e.target.value === '' ? undefined : e.target.value }), style: { padding: 4, borderRadius: 6, border: '1px solid var(--dsw-alias-border-l1)', background: 'var(--dsw-alias-bg-layer-2)', color: 'var(--dsw-alias-label-primary)' } },
-            React.createElement('option', { value: '' }, '— default —'),
-            levels.map((level) => React.createElement('option', { key: level.id, value: level.id }, level.label)),
-          )),
+            modelOptions.map((m) => React.createElement('option', { key: m.id, value: m.id, title: m.description ?? '' }, m.name ?? m.id)),
+          ),
+          showDiscoveryModels && models === null && React.createElement('span', { className: 'ag-note', style: { marginTop: 2 } }, 'loading catalog…'),
+          showDiscoveryModels && models !== null && models.ok === false && !(models.embedded === true) && React.createElement('span', { className: 'ag-note', style: { marginTop: 2 } }, 'catalog unavailable — provider default model applies'),
+        ),
+        React.createElement('label', null, 'Reasoning', reasoningControl),
         React.createElement('label', null, 'Profile',
-          React.createElement('input', { className: 'ag-input', value: role.profile ?? '', disabled: leader, onChange: (e) => onPatch({ profile: e.target.value }), style: { padding: 4, borderRadius: 6, border: '1px solid var(--dsw-alias-border-l1)', background: 'var(--dsw-alias-bg-layer-2)', color: 'var(--dsw-alias-label-primary)' } }),
+          React.createElement('input', { className: 'ag-input', value: role.profile ?? '', disabled: leader, onChange: (e) => onPatch({ profile: e.target.value }), style: inputStyle }),
         ),
         React.createElement('label', null, 'Max instances',
-          React.createElement('input', { className: 'ag-input', type: 'number', min: 1, value: role.maxInstances ?? '', disabled: leader, onChange: (e) => onPatch({ maxInstances: e.target.value === '' ? undefined : Number(e.target.value) }), style: { width: 80, padding: 4, borderRadius: 6, border: '1px solid var(--dsw-alias-border-l1)', background: 'var(--dsw-alias-bg-layer-2)', color: 'var(--dsw-alias-label-primary)' } }),
+          React.createElement('input', { className: 'ag-input', type: 'number', min: 1, value: role.maxInstances ?? '', disabled: leader, onChange: (e) => onPatch({ maxInstances: e.target.value === '' ? undefined : Number(e.target.value) }), style: { ...inputStyle, width: 80 } }),
         ),
       ),
+      isDsh && authNode(),
       !leader && React.createElement('label', null, 'Role instructions (system prompt)',
-        React.createElement('textarea', { className: 'ag-input', rows: 2, value: role.systemPrompt ?? '', onChange: (e) => onPatch({ systemPrompt: e.target.value }), style: { padding: 4, borderRadius: 6, border: '1px solid var(--dsw-alias-border-l1)', background: 'var(--dsw-alias-bg-layer-2)', color: 'var(--dsw-alias-label-primary)', fontFamily: 'inherit' } }),
+        React.createElement('textarea', { className: 'ag-input', rows: 2, value: role.systemPrompt ?? '', onChange: (e) => onPatch({ systemPrompt: e.target.value }), style: { ...inputStyle, fontFamily: 'inherit' } }),
       ),
     ),
   )

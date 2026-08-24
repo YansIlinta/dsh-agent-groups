@@ -46,6 +46,7 @@ export type GroupErrorCode =
   | 'ROLE_INSTANCE_LIMIT'
   | 'RUNTIME_UNAVAILABLE'
   | 'MODEL_UNAVAILABLE'
+  | 'PROVIDER_UNAVAILABLE'
   | 'REASONING_UNAVAILABLE'
   | 'SPAWN_FAILED'
   // V0.5: loud runtime failure vocabulary (requirement §21)

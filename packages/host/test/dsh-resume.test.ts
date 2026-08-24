@@ -212,6 +212,232 @@ describe('V0.5: DSH member resume configuration drift (regression)', () => {
     await adapter.createMemberAgent({ sessionId: 'm-9', parentId: 'p' })
     expect(agents.created[0]!.agentOptions).toEqual({ provider: 'provider-z', model: 'model-z' })
   })
+
+  it('V0.4.1: first-class provider + reasoningEffort are durable and resume re-applies the ORIGINAL effort', async () => {
+    const agents = new FakeAgentRegistry()
+    const adapter = makeAdapter(agents)
+    const provider = new DeepSeekHarnessRuntimeProvider(adapter as unknown as AgentRuntimeAdapter, { currentSelection: () => GLOBAL_DEFAULT })
+    const session = await provider.createSession({
+      groupId: 'g', agentId: 'm-1', role: 'implementation',
+      provider: 'provider-a', model: 'model-a', reasoningLevel: 'low', reasoningEffort: 'max',
+      parentMemberId: 'lead',
+    })
+    await session.start()
+    expect(agents.created[0]!.agentOptions).toEqual({ provider: 'provider-a', model: 'model-a' })
+    // durable info() records BOTH legacy level and exact effort
+    expect(session.info().provider).toBe('provider-a')
+    expect(session.info().reasoningLevel).toBe('low')
+    expect(session.info().reasoningEffort).toBe('max')
+
+    // restart: the durable info() re-applies the ORIGINAL config — a
+    // mismatched role config on resume must NOT override provider/effort
+    const agents2 = new FakeAgentRegistry()
+    agents2.persisted.add('m-1')
+    const adapter2 = makeAdapter(agents2)
+    const provider2 = new DeepSeekHarnessRuntimeProvider(adapter2 as unknown as AgentRuntimeAdapter, { currentSelection: () => GLOBAL_DEFAULT })
+    const resumed = await provider2.createSession(
+      { groupId: 'g', agentId: 'm-1', role: 'implementation', provider: 'wrong-provider', reasoningEffort: 'low', parentMemberId: 'lead' },
+      session.info(),
+    )
+    await resumed.start()
+    expect(resumed.info().provider).toBe('provider-a')
+    expect(resumed.info().reasoningEffort).toBe('max')
+    expect(agents2.resumed[0]!.agentOptions).toEqual({ provider: 'provider-a', model: 'model-a' })
+    expect(agents2.resumed[0]!.setup).toBeDefined() // effort re-installed via memberSetup
+  })
+
+  it('V0.4.1: product — role with first-class provider + reasoningEffort survives a host restart', async () => {
+    const stores = makeStores()
+    const agents = new FakeAgentRegistry()
+    const adapter = makeAdapter(agents)
+    const provider = new DeepSeekHarnessRuntimeProvider(adapter as unknown as AgentRuntimeAdapter, { currentSelection: () => GLOBAL_DEFAULT })
+    const registry = new RuntimeRegistry()
+    registry.register(provider)
+
+    const h = makeHarness(stores)
+    const host1 = new GroupHost({
+      groups: h.groups, tasks: h.tasks, channel: h.channel, privateMessages: h.privateMessages,
+      activity: h.activity, profiles: h.profiles, notifier: h.notifier,
+      adapter: adapter as unknown as AgentRuntimeAdapter, leaders: h.leaders, runtimes: registry,
+    })
+    const group = await host1.initGroup('lead-1', { name: 'T', objective: 'demo', acceptanceCriteria: ['x'] })
+    await host1.updateTeamConfig(group.groupId, {
+      leaderRole: { id: 'leader', name: 'Leader', runtime: 'deepseek-harness' },
+      memberRoles: [{ id: 'implementation', name: 'Implementation', runtime: 'deepseek-harness', provider: 'provider-a', model: 'model-a', reasoningLevel: 'low', reasoningEffort: 'max', maxInstances: 1 }],
+    }, 'User')
+    const member = await host1.spawnByRole('lead-1', { role: 'implementation' })
+    expect(member.provider).toBe('provider-a')
+    expect(member.reasoningEffort).toBe('max')
+    expect(member.model).toBe('model-a')
+    expect(member.runtimeSession?.reasoningEffort).toBe('max') // durable at spawn
+
+    // "host restart": fresh host + fresh adapter + fresh provider world
+    const agents2 = new FakeAgentRegistry()
+    agents2.persisted.add(member.sessionId)
+    const adapter2 = makeAdapter(agents2)
+    const provider2 = new DeepSeekHarnessRuntimeProvider(adapter2 as unknown as AgentRuntimeAdapter, { currentSelection: () => GLOBAL_DEFAULT })
+    const registry2 = new RuntimeRegistry()
+    registry2.register(provider2)
+    const h2 = makeHarness(stores)
+    const host2 = new GroupHost({
+      groups: h2.groups, tasks: h2.tasks, channel: h2.channel, privateMessages: h2.privateMessages,
+      activity: h2.activity, profiles: h2.profiles, notifier: h2.notifier,
+      adapter: adapter2 as unknown as AgentRuntimeAdapter, leaders: h2.leaders, runtimes: registry2,
+    })
+    await host2.resumeAllMemberRuntimes()
+
+    // dispatch one task — the resume spec must be provider-a + model-a
+    const task = await host2.createTask('lead-1', { subject: 'x', description: 'x', kind: 'implementation', acceptanceCriteria: ['x'] })
+    await host2.assignTask('lead-1', { taskId: task.taskId, ownerId: member.sessionId })
+    expect(agents2.resumed).toHaveLength(1)
+    expect(agents2.resumed[0]!.agentOptions).toEqual({ provider: 'provider-a', model: 'model-a' })
+    expect(agents2.resumed[0]!.setup).toBeDefined()
+    const memberAfter = host2.groups.listMembers(group.groupId, () => undefined).find((m) => m.sessionId === member.sessionId)!
+    expect(memberAfter.provider).toBe('provider-a')
+    expect(memberAfter.reasoningEffort).toBe('max')
+    expect(memberAfter.runtimeSession?.provider).toBe('provider-a')
+    expect(memberAfter.runtimeSession?.reasoningEffort).toBe('max')
+    // the SAVED role config also survives the restart on the durable team
+    // record (persist → reload, not just the member snapshot)
+    expect(host2.groups.requireGroup(group.groupId).teamConfig?.memberRoles[0]).toMatchObject({ provider: 'provider-a', reasoningEffort: 'max' })
+  })
+})
+
+describe('V0.4.1: memberSetup installs the exact reasoning effort (installModelSelection)', () => {
+  /**
+   * Minimal agent-scoped context: `effect` runs installs synchronously (the
+   * adapter setup contract), `on` captures the waterfall listeners that
+   * installModelSelection registers (the REAL @deepseek-ai/dsh-agent
+   * implementation — no mocking).
+   */
+  function makeCaptureCtx() {
+    const handlers = new Map<string, (...args: unknown[]) => unknown>()
+    const effects: Array<() => void> = []
+    const ctx = {
+      effect: (fn: () => void) => { effects.push(fn); fn() },
+      on: (event: string, handler: (...args: unknown[]) => unknown) => {
+        handlers.set(event, handler)
+        return () => { handlers.delete(event) }
+      },
+    }
+    return { ctx: ctx as never, handlers, effects }
+  }
+
+  /** Drive the installed selection: system-prompt/assemble first (it snapshots
+   * `assembled`), then agent/request (applies provider/model/effort). */
+  async function drive(handlers: Map<string, (...args: unknown[]) => unknown>) {
+    const assemble = handlers.get('system-prompt/assemble') as (
+      assembly: unknown, context: unknown, next: () => Promise<unknown>,
+    ) => Promise<{ variables: Record<string, unknown> }>
+    const assembled = await assemble({}, {}, async () => ({ variables: { subject: 'x' } }))
+    const request = handlers.get('agent/request') as (
+      payload: unknown, next: () => Promise<Record<string, unknown>>,
+    ) => Promise<Record<string, unknown>>
+    const resolved = await request({}, async () => ({ provider: 'base-provider', model: 'base-model', reasoningEffort: 'inherited', temperature: 0.5 }))
+    return { assembled, resolved }
+  }
+
+  it('pinned reasoningEffort takes precedence over the legacy level and reaches installModelSelection', async () => {
+    const agents = new FakeAgentRegistry()
+    const adapter = makeAdapter(agents)
+    await adapter.createMemberAgent({ sessionId: 'm-e1', parentId: 'p', provider: 'provider-a', model: 'model-a', reasoningLevel: 'low', reasoningEffort: 'max' })
+    expect(agents.created[0]!.agentOptions).toEqual({ provider: 'provider-a', model: 'model-a' })
+    const { ctx, handlers, effects } = makeCaptureCtx()
+    await agents.created[0]!.setup!(ctx)
+    expect(effects).toHaveLength(1) // exactly one model-selection install per setup
+    const { assembled, resolved } = await drive(handlers)
+    expect(assembled.variables).toMatchObject({ provider: 'provider-a', model: 'model-a' })
+    // the EXACT effort id rides the selection — the inherited placeholder is gone
+    expect(resolved).toMatchObject({ provider: 'provider-a', model: 'model-a', reasoningEffort: 'max', temperature: 0.5 })
+    expect(resolved.reasoningEffort).not.toBe('inherited')
+  })
+
+  it('an empty-string reasoningEffort falls back to the legacy reasoningLevel', async () => {
+    const agents = new FakeAgentRegistry()
+    const adapter = makeAdapter(agents)
+    await adapter.createMemberAgent({ sessionId: 'm-e2', parentId: 'p', provider: 'provider-a', model: 'model-a', reasoningLevel: 'high', reasoningEffort: '' })
+    const { ctx, handlers, effects } = makeCaptureCtx()
+    await agents.created[0]!.setup!(ctx)
+    expect(effects).toHaveLength(1)
+    const { resolved } = await drive(handlers)
+    expect(resolved.reasoningEffort).toBe('high')
+  })
+
+  it('a reasoningLevel-only role installs the mapped effort on its own provider/model', async () => {
+    const agents = new FakeAgentRegistry()
+    const adapter = makeAdapter(agents)
+    await adapter.createMemberAgent({ sessionId: 'm-e3', parentId: 'p', provider: 'provider-a', model: 'model-a', reasoningLevel: 'low' })
+    const { ctx, handlers } = makeCaptureCtx()
+    await agents.created[0]!.setup!(ctx)
+    const { resolved } = await drive(handlers)
+    expect(resolved).toMatchObject({ provider: 'provider-a', model: 'model-a', reasoningEffort: 'low' })
+  })
+
+  it('a provider-less role with a reasoning level installs the mapped effort on the harness default pair', async () => {
+    const agents = new FakeAgentRegistry()
+    const adapter = makeAdapter(agents)
+    await adapter.createMemberAgent({ sessionId: 'm-e5', parentId: 'p', reasoningLevel: 'high' })
+    const { ctx, handlers, effects } = makeCaptureCtx()
+    await agents.created[0]!.setup!(ctx)
+    expect(effects).toHaveLength(1)
+    const { resolved } = await drive(handlers)
+    expect(resolved).toMatchObject({ provider: 'provider-z', model: 'model-z', reasoningEffort: 'high' })
+  })
+
+  it('a role with no reasoning config installs NOTHING and falls back to the harness default pair', async () => {
+    const agents = new FakeAgentRegistry()
+    const adapter = makeAdapter(agents)
+    await adapter.createMemberAgent({ sessionId: 'm-e4', parentId: 'p' })
+    expect(agents.created[0]!.agentOptions).toEqual({ provider: 'provider-z', model: 'model-z' })
+    const { ctx, handlers, effects } = makeCaptureCtx()
+    await agents.created[0]!.setup!(ctx)
+    expect(effects).toHaveLength(0) // provider default effort, no selection installed
+    expect(handlers.has('agent/request')).toBe(false)
+  })
+
+  it('resume keeps the SAVED config even when the global default changed after the role was saved', async () => {
+    const agents = new FakeAgentRegistry()
+    const adapter = makeAdapter(agents) // default today: provider-z/model-z
+    await adapter.createMemberAgent({ sessionId: 'm-drift', parentId: 'p', provider: 'provider-a', model: 'model-a', reasoningLevel: 'low', reasoningEffort: 'max' })
+    expect(agents.created[0]!.agentOptions).toEqual({ provider: 'provider-a', model: 'model-a' })
+
+    // "restart": the harness' default model now points somewhere else entirely
+    const agents2 = new FakeAgentRegistry()
+    agents2.persisted.add('m-drift')
+    const adapter2 = new DshAgentRuntimeAdapter({
+      agents: agents2 as unknown as AgentRegistry,
+      agentPresets: new FakePresets() as never,
+      agentDefaultModel: { currentSelection: () => ({ provider: 'provider-b', model: 'model-b' }) },
+    })
+    await adapter2.resumeAgent('m-drift', { provider: 'provider-a', model: 'model-a', reasoningLevel: 'low', reasoningEffort: 'max' })
+    expect(agents2.resumed[0]!.agentOptions).toEqual({ provider: 'provider-a', model: 'model-a' }) // NOT provider-b/model-b
+    expect(agents2.resumed[0]!.setup).toBeDefined()
+  })
+
+  it('product: a role without provider/model/effort spawns on the harness default (unchanged legacy path)', async () => {
+    const stores = makeStores()
+    const agents = new FakeAgentRegistry()
+    const adapter = makeAdapter(agents)
+    const provider = new DeepSeekHarnessRuntimeProvider(adapter as unknown as AgentRuntimeAdapter, { currentSelection: () => GLOBAL_DEFAULT })
+    const registry = new RuntimeRegistry()
+    registry.register(provider)
+    const h = makeHarness(stores)
+    const host = new GroupHost({
+      groups: h.groups, tasks: h.tasks, channel: h.channel, privateMessages: h.privateMessages,
+      activity: h.activity, profiles: h.profiles, notifier: h.notifier,
+      adapter: adapter as unknown as AgentRuntimeAdapter, leaders: h.leaders, runtimes: registry,
+    })
+    const group = await host.initGroup('lead-1', { name: 'T', objective: 'demo', acceptanceCriteria: ['x'] })
+    await host.updateTeamConfig(group.groupId, {
+      leaderRole: { id: 'leader', name: 'Leader', runtime: 'deepseek-harness' },
+      memberRoles: [{ id: 'plain', name: 'Plain', runtime: 'deepseek-harness', maxInstances: 1 }],
+    }, 'User')
+    const member = await host.spawnByRole('lead-1', { role: 'plain' })
+    expect(agents.created).toHaveLength(1)
+    expect(agents.created[0]!.agentOptions).toEqual({ provider: 'provider-z', model: 'model-z' }) // harness default
+    expect(member.provider).toBeUndefined()
+    expect(member.reasoningEffort).toBeUndefined()
+  })
 })
 
 describe('V0.6: DSH native steering + queued future turns', () => {

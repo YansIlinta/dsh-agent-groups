@@ -8,6 +8,7 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
+import { DISCOVERY_UNAVAILABLE_NOTE } from '../group-host.js'
 import type { GroupHost } from '../group-host.js'
 import { GroupError } from '../group-service.js'
 import type { GroupNotifier } from '../notifier.js'
@@ -76,7 +77,7 @@ export async function handleApi(
     // /groups/api/… → capabilities hint
     sendJson(res, 200, {
       name: 'agent-groups',
-      paths: ['groups', 'group/:id', 'events', 'templates', 'sessions/leaders', 'profiles'],
+      paths: ['groups', 'group/:id', 'events', 'templates', 'sessions/leaders', 'profiles', 'config/providers'],
     })
     return
   }
@@ -196,6 +197,42 @@ export async function handleApi(
   if (rest.length === 3 && rest[0] === 'groups' && rest[2] === 'team-config' && method === 'PUT') {
     const body = (await readJsonBody(req)) ?? {}
     sendJson(res, 200, await host.updateTeamConfig(rest[1]!, normalizeTeamConfig(body), 'User'))
+    return
+  }
+
+  // ── V0.4.1: Role Editor discovery (live harness services; zero secret material) ─
+
+  if (rest.length === 2 && rest[0] === 'config' && rest[1] === 'providers' && method === 'GET') {
+    // Runtime (ACP runtimes) + Authentication (provider credential status)
+    // steps in one view. Never contains credential values.
+    const [providers, runtimes] = await Promise.all([host.discoveryProvidersView(), host.runtimesView()])
+    sendJson(res, 200, {
+      providers,
+      runtimes,
+      ...(host.discoveryLive() ? {} : { note: DISCOVERY_UNAVAILABLE_NOTE }),
+    })
+    return
+  }
+
+  if (rest.length === 4 && rest[0] === 'config' && rest[1] === 'providers' && rest[3] === 'models' && method === 'GET') {
+    const provider = rest[2]!
+    const view = await host.providerModelsView(provider)
+    if (view === undefined) {
+      sendJson(res, 404, { error: 'unknown provider', provider })
+      return
+    }
+    sendJson(res, 200, { provider, ...view })
+    return
+  }
+
+  if (rest.length === 4 && rest[0] === 'config' && rest[1] === 'providers' && rest[3] === 'credential' && method === 'GET') {
+    const provider = rest[2]!
+    const view = await host.providerCredentialView(provider)
+    if (view === undefined) {
+      sendJson(res, 404, { error: 'unknown provider', provider })
+      return
+    }
+    sendJson(res, 200, { provider, ...view })
     return
   }
 
@@ -431,8 +468,10 @@ function normalizeTeamConfig(body: Record<string, unknown>): import('../core-typ
       description: optionalString(r.description),
       runtime: optionalString(r.runtime) ?? 'deepseek-harness',
       profile: optionalString(r.profile),
+      provider: optionalString(r.provider),
       model: optionalString(r.model),
       reasoningLevel: optionalString(r.reasoningLevel),
+      reasoningEffort: optionalString(r.reasoningEffort),
       systemPrompt: optionalString(r.systemPrompt),
       maxInstances: optionalNumber(r.maxInstances),
       defaultInstances: optionalNumber(r.defaultInstances),
