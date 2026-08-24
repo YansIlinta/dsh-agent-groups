@@ -212,11 +212,30 @@ rejects unknown ids:
 
 Consequence: **a DSH member role with `reasoningLevel: 'low'` or `'medium'`
 (the defaults for Generalist/Researcher/Writer, `runtime/team-config.ts:31,50,99,107`)
-would currently be rejected at request time** on the DeepSeek adapter — the
-abstract low/medium/high vocabulary is NOT the DeepSeek effort vocabulary. This
-is a behavior we did not run live (no `DEEPSEEK_API_KEY`), but the static path
-is unambiguous. The Role Editor must map (or surface the exact per-model
-efforts from `resolveModelInfo`).
+is rejected at request time** on the DeepSeek adapter — the abstract
+low/medium/high vocabulary is NOT the DeepSeek effort vocabulary. The static
+path (agent loop `prepareCall` → `resolveCallFor` → `UNSUPPORTED_REASONING_EFFORT`)
+is unambiguous on its own.
+
+**Live confirmation (group-channel incident, recorded by the Leader for the
+implementers):** while this investigation was running, the preconfigured
+`generalist` role carried `reasoningLevel: 'medium'` and the pi-ai provider
+route `opencode-go` / model `deepseek-v4-flash` does NOT support effort
+`'medium'` — every spawned member turn died instantly with
+`UNSUPPORTED_REASONING_EFFORT` (pi-ai rejection path:
+`DeepSeek-Harness/packages/llm/llm-pi-ai/src/adapter.ts:125-134`
+`resolveReasoningLevel`). The fix applied live was `PUT team-config` dropping
+`generalist.reasoningLevel`. The Leader's recorded key facts agree with this
+report: (1) `role.reasoningLevel` is passed directly as the DSH
+`ReasoningEffortId` (`dsh-adapter.ts:150`); (2) the live capability source is
+`ctx.llm.resolveModelInfo(provider, model).reasoning.efforts`, and when a model
+exposes no efforts the seam **omits `reasoning` entirely** — that omission is
+the "hide/disable Reasoning" signal for the Role Editor; (3) the live
+provider topology must always be read, never hardcoded (see Q4e note).
+
+The Role Editor must therefore map the abstract level to each adapter's real
+effort ids — or surface the exact per-model efforts from `resolveModelInfo`
+(with a "— default —" option that lets the adapter default apply).
 
 ---
 
@@ -375,7 +394,16 @@ efforts from `resolveModelInfo`).
   `DeepSeekHarnessRuntimeProvider.defaultModel` (`runtime/deepseek-harness.ts:52`,
   `:91`, `listModels()` `:65-69`, registered `index.ts:140-143`).
 - Bundle default: `provider: deepseek-official, model: deepseek-v4-flash`
-  (`bundle/base/cordis.patch.yml:64-67`).
+  (`bundle/base/cordis.patch.yml:64-67`). **The LIVING default is a settings
+  value, not a static list**: `AgentDefaultModelConfig` layers the
+  `agent-default-model` settings namespace over the composition entry
+  (`packages/core/agent-default-model/src/index.ts:21-38, 64-82`) and any
+  consumer must read `currentSelection()` at runtime. The live harness at
+  investigation time reported `opencode-go / deepseek-v4-flash` (max effort)
+  as its agent default — i.e. the running topology differs from the bundle
+  default. Never hardcode provider/model topology in Agent Groups; read
+  `ctx.get('agentDefaultModel')` and `ctx.llm` live (this is exactly what
+  `index.ts:124` and `deepseek-harness.ts:91-98` already do).
 
 ### f. Settings ("设置入口")
 
@@ -528,9 +556,11 @@ Codex/Claude providers.
 
 ## What could NOT be verified
 
-1. Live request behavior of `reasoningEffort` rejection (Q3 ⚠) — the static
-   path (`prepareCall` → `UNSUPPORTED_REASONING_EFFORT`) is unambiguous in
-   source, but no `DEEPSEEK_API_KEY` was available to run a real request.
+1. ~~Live request behavior of `reasoningEffort` rejection (Q3 ⚠)~~ — **now
+   confirmed live**: the group-channel incident reproduced
+   `UNSUPPORTED_REASONING_EFFORT` for `reasoningLevel: 'medium'` on the pi-ai
+   `opencode-go` route (see Q3 ⚠). The DeepSeek-official adapter path itself
+   was still not exercised with a real key.
 2. Whether the deepseek-v4 model names (`deepseek-v4-flash`/`deepseek-v4-pro`,
    `llm-deepseek/src/index.ts:49-52`) actually resolve on the live API.
 3. Behavior of the DSH member sessions under a real, restarted harness process
