@@ -20,9 +20,9 @@
 
 **DSH Agent Groups** 是一个运行在 [DeepSeek Harness](https://github.com/deepseek-ai/DeepSeek-Harness) 内部的多 Agent 协作工作区。
 
-它关注的是让 Coding Agent 在同一个 Group 中拥有持续存在的身份、运行时会话、任务历史和共享工作上下文。Leader 可以把工作派发给 DSH Agent 或任意已配置的 ACP Coding Agent，并在后续继续追问、纠正、复用同一个会话，而不是每个任务都重新开始。
+它关注的是让 Coding Agent 在同一个 Group 中拥有持续存在的身份、运行时会话、任务历史和共享工作上下文。Leader 可以把工作派发给 DSH Agent 或任意已配置的 ACP Coding Agent，并在后续继续追问、复用同一个会话。
 
-项目通过 DSH / Cordis 的扩展能力接入，不修改或复制 DeepSeek Harness 源码；Agent Groups 直接出现在原生 DSH shell 中，而不是额外打开一套独立 dashboard。
+项目通过 DSH / Cordis 的扩展能力接入，不修改或复制 DeepSeek Harness 源码；Agent Groups 直接出现在原生 DSH shell 中。
 
 ```text
 User
@@ -40,7 +40,7 @@ Leader ───────── mission / planning / assignment / verificatio
 ```
 
 > [!NOTE]
-> Agent Groups 仍处于活跃开发阶段。持久会话和多运行时模型已经落地，但跨重启队列恢复、失败重试与长时间运行时耐久性仍在持续加固。
+> Agent Groups 仍处于活跃开发阶段。。
 
 ## 它想解决什么
 
@@ -58,7 +58,7 @@ Group
             └── Turn 4  ← Task B
 ```
 
-因此同一个 Codex / Claude / DSH Member 可以持续工作：先实现功能，再接受 review，再修复，再继续接下一个相关任务，而不是每次都丢失上下文。
+因此同一个 Codex / Claude / DSH Member 可以持续工作：先实现功能，再接受 review，再修复，再继续接下一个相关任务。
 
 ## 核心能力
 
