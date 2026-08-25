@@ -4,12 +4,27 @@ import type { TaskService } from '../task-service.js'
 import type { GroupNotifier } from '../notifier.js'
 import type { CreateFlowArtifactKind, CreateFlowService, CreateFlowStage } from './service.js'
 
-const ROLE_STAGE: Readonly<Record<string, { stage: CreateFlowStage; kind: CreateFlowArtifactKind }>> = {
+type Projection = { stage: CreateFlowStage; kind: CreateFlowArtifactKind }
+
+const ROLE_STAGE: Readonly<Record<string, Projection>> = {
   'topic-strategist': { stage: 'topic', kind: 'topic' },
   researcher: { stage: 'research', kind: 'source' },
   'material-producer': { stage: 'materials', kind: 'material' },
   scriptwriter: { stage: 'script', kind: 'script' },
   'video-producer': { stage: 'render', kind: 'other' },
+}
+
+/**
+ * Pre-V0.4/template-materialized members can carry only `displayRole` because
+ * the original template path spawned by profile. Keep that durable path
+ * compatible while role-based members use the authoritative `roleId` above.
+ */
+const DISPLAY_ROLE_STAGE: Readonly<Record<string, Projection>> = {
+  'Topic Strategist': ROLE_STAGE['topic-strategist']!,
+  Researcher: ROLE_STAGE.researcher!,
+  'Material Producer': ROLE_STAGE['material-producer']!,
+  Scriptwriter: ROLE_STAGE.scriptwriter!,
+  'Video Producer': ROLE_STAGE['video-producer']!,
 }
 
 /**
@@ -52,8 +67,11 @@ export class CreateFlowTaskProjector {
     const task = this.tasks.requireTask(groupId, taskId)
     if (task.verification?.passed !== true || task.result === undefined || task.ownerId === undefined) return 0
     const member = this.groups.getMembership(groupId, task.ownerId)
-    const roleId = member?.roleId
-    const projection = roleId !== undefined ? ROLE_STAGE[roleId] : undefined
+    const projection = member?.roleId !== undefined
+      ? ROLE_STAGE[member.roleId]
+      : member?.displayRole !== undefined
+        ? DISPLAY_ROLE_STAGE[member.displayRole]
+        : undefined
     if (projection === undefined) return 0
 
     const status = await this.flow.status(groupId)
@@ -68,7 +86,13 @@ export class CreateFlowTaskProjector {
         stage: projection.stage,
         title: `${task.subject}: ${basename(path) || path}`,
         path,
-        metadata: { taskId, ownerId: task.ownerId, roleId, projectedFromTask: true },
+        metadata: {
+          taskId,
+          ownerId: task.ownerId,
+          roleId: member?.roleId ?? null,
+          displayRole: member?.displayRole ?? null,
+          projectedFromTask: true,
+        },
       })
       added += 1
     }

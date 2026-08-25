@@ -33,7 +33,7 @@ export const GENERALIST_ROLE: AgentRoleDefinition = role({
   defaultInstances: 1,
 })
 
-/** Built-in role templates (§22) shared by template configs. */
+/** Generic built-in role templates (§22), shared by the original team types. */
 export const ROLE_TEMPLATES: readonly AgentRoleDefinition[] = [
   role({
     id: 'planner',
@@ -75,6 +75,10 @@ export const ROLE_TEMPLATES: readonly AgentRoleDefinition[] = [
     maxInstances: 2,
     systemPrompt: 'Focus on inspecting implementation and identifying problems.',
   }),
+]
+
+/** Create Flow-specific roles stay scoped to the video-production specialization. */
+const CREATE_FLOW_ROLE_TEMPLATES: readonly AgentRoleDefinition[] = [
   role({
     id: 'topic-strategist',
     name: 'Topic Strategist',
@@ -110,7 +114,7 @@ export const ROLE_TEMPLATES: readonly AgentRoleDefinition[] = [
 /** Team templates → role sets (§23); runtime stays decoupled. */
 export function templateTeamConfig(templateId: string | undefined): TeamConfig {
   const byId = (id: string): AgentRoleDefinition => {
-    const found = ROLE_TEMPLATES.find((t) => t.id === id)
+    const found = [...ROLE_TEMPLATES, ...CREATE_FLOW_ROLE_TEMPLATES].find((t) => t.id === id)
     if (found !== undefined) return found
     return { ...GENERALIST_ROLE, id, name: id }
   }
