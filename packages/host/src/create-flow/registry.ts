@@ -131,7 +131,7 @@ for (const definition of CREATE_FLOW_WORKFLOW_REGISTRY) {
   if (definition.displayRole !== undefined) BY_DISPLAY_ROLE.set(definition.displayRole, definition)
 }
 
-export function defineCreateFlowStage<T extends CreateFlowWorkflowStageDefinition>(definition: T): T {
+export function defineCreateFlowStage(definition: CreateFlowWorkflowStageDefinition): CreateFlowWorkflowStageDefinition {
   return definition
 }
 
