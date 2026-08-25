@@ -16,6 +16,7 @@ export class CreateFlowTaskProjector {
   private readonly tasks: TaskService
   private readonly notifier: GroupNotifier
   private readonly flow: CreateFlowService
+  private readonly taskLocks = new Map<string, Promise<void>>()
   private unsubscribe?: () => void
 
   constructor(options: { groups: GroupService; tasks: TaskService; notifier: GroupNotifier; flow: CreateFlowService }) {
@@ -41,6 +42,22 @@ export class CreateFlowTaskProjector {
   }
 
   async projectTask(groupId: string, taskId: string): Promise<number> {
+    const lockKey = `${groupId}:${taskId}`
+    const previous = this.taskLocks.get(lockKey) ?? Promise.resolve()
+    let release!: () => void
+    const gate = new Promise<void>((resolveGate) => { release = resolveGate })
+    const tail = previous.then(() => gate)
+    this.taskLocks.set(lockKey, tail)
+    await previous
+    try {
+      return await this.projectTaskUnlocked(groupId, taskId)
+    } finally {
+      release()
+      if (this.taskLocks.get(lockKey) === tail) this.taskLocks.delete(lockKey)
+    }
+  }
+
+  private async projectTaskUnlocked(groupId: string, taskId: string): Promise<number> {
     const group = this.groups.requireGroup(groupId)
     if (group.templateId !== 'content-team') return 0
     const task = this.tasks.requireTask(groupId, taskId)
@@ -50,12 +67,14 @@ export class CreateFlowTaskProjector {
     if (projection === undefined) return 0
 
     const status = await this.flow.status(groupId)
+    const projectedPaths = new Set(
+      status.state.artifacts
+        .filter((artifact) => artifact.metadata?.taskId === taskId && artifact.path !== undefined)
+        .map((artifact) => artifact.path!),
+    )
     let added = 0
     for (const path of task.result.artifacts) {
-      const exists = status.state.artifacts.some((artifact) =>
-        artifact.path === path && artifact.metadata?.taskId === taskId,
-      )
-      if (exists) continue
+      if (projectedPaths.has(path)) continue
       await this.flow.addArtifact(groupId, task.ownerId, {
         kind: projection.kind,
         stage: projection.stage,
@@ -69,6 +88,7 @@ export class CreateFlowTaskProjector {
           projectedFromTask: true,
         },
       })
+      projectedPaths.add(path)
       added += 1
     }
     return added

@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { mkdir, rm, writeFile } from 'node:fs/promises'
-import { extname, dirname, join } from 'node:path'
+import { mkdir, realpath, rm, stat, writeFile } from 'node:fs/promises'
+import { dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
 
 export interface CommandTemplate {
   readonly command: string
@@ -57,6 +57,11 @@ export interface LocalMediaRuntimeOptions {
  * No shell is involved: executables and argv are passed directly to spawn().
  * ASR/TTS are intentionally adapter-shaped because local installations differ.
  * Configure them with CREATE_FLOW_{ASR,TTS}_COMMAND and a JSON argv template.
+ *
+ * The runtime also re-checks workspace containment at the media boundary. This
+ * is intentionally stricter than lexical path validation in higher layers: an
+ * in-workspace symlink must not allow a media command to read or write outside
+ * the group workspace.
  */
 export class LocalMediaRuntime {
   readonly asr?: CommandTemplate
@@ -98,8 +103,10 @@ export class LocalMediaRuntime {
     if (this.tts === undefined) {
       throw new MediaRuntimeError('local TTS is not configured; set CREATE_FLOW_TTS_COMMAND and CREATE_FLOW_TTS_ARGS_JSON')
     }
+    await assertWorkspaceInput(input.cwd, input.textPath, 'TTS text input')
+    await assertWorkspaceOutput(input.cwd, input.outputPath, 'TTS output')
     await mkdir(dirname(input.outputPath), { recursive: true })
-    return this.executeTemplate(this.tts, input.cwd, {
+    const result = await this.executeTemplate(this.tts, input.cwd, {
       input: input.textPath,
       text: input.textPath,
       output: input.outputPath,
@@ -107,6 +114,8 @@ export class LocalMediaRuntime {
       language: input.language ?? '',
       cwd: input.cwd,
     })
+    await verifyOutputFile(input.cwd, input.outputPath, 'TTS output', true)
+    return result
   }
 
   async runAsr(input: {
@@ -118,13 +127,18 @@ export class LocalMediaRuntime {
     if (this.asr === undefined) {
       throw new MediaRuntimeError('local ASR is not configured; set CREATE_FLOW_ASR_COMMAND and CREATE_FLOW_ASR_ARGS_JSON')
     }
+    await assertWorkspaceInput(input.cwd, input.inputPath, 'ASR input')
+    await assertWorkspaceOutput(input.cwd, input.outputPath, 'ASR output')
     await mkdir(dirname(input.outputPath), { recursive: true })
-    return this.executeTemplate(this.asr, input.cwd, {
+    const result = await this.executeTemplate(this.asr, input.cwd, {
       input: input.inputPath,
       output: input.outputPath,
       language: input.language ?? '',
       cwd: input.cwd,
     })
+    // An empty caption file can be a legitimate ASR result for silent media.
+    await verifyOutputFile(input.cwd, input.outputPath, 'ASR output', false)
+    return result
   }
 
   async renderVideo(input: {
@@ -135,10 +149,14 @@ export class LocalMediaRuntime {
     outputPath: string
     fps?: number
   }): Promise<MediaCommandResult> {
+    await assertWorkspaceInput(input.cwd, input.visualPath, 'render visual input')
+    await assertWorkspaceInput(input.cwd, input.audioPath, 'render audio input')
+    if (input.subtitlePath) await assertWorkspaceInput(input.cwd, input.subtitlePath, 'render subtitle input')
+    await assertWorkspaceOutput(input.cwd, input.outputPath, 'render output')
     await mkdir(dirname(input.outputPath), { recursive: true })
     const image = isStillImage(input.visualPath)
     const fps = clampFps(input.fps)
-    const args: string[] = ['-y']
+    const args: string[] = ['-y', '-nostdin']
     if (image) args.push('-loop', '1', '-framerate', String(fps), '-i', input.visualPath)
     else args.push('-stream_loop', '-1', '-i', input.visualPath)
     args.push('-i', input.audioPath)
@@ -154,7 +172,9 @@ export class LocalMediaRuntime {
       '-movflags', '+faststart',
       input.outputPath,
     )
-    return this.execute(this.ffmpegCommand, args, input.cwd)
+    const result = await this.execute(this.ffmpegCommand, args, input.cwd)
+    await verifyOutputFile(input.cwd, input.outputPath, 'render output', true)
+    return result
   }
 
   /**
@@ -171,6 +191,16 @@ export class LocalMediaRuntime {
     height?: number
   }): Promise<MediaCommandResult> {
     if (input.scenes.length === 0) throw new MediaRuntimeError('timeline has no scenes')
+    await assertWorkspaceOutput(input.cwd, input.outputPath, 'timeline output')
+    for (const scene of input.scenes) {
+      await assertWorkspaceInput(input.cwd, scene.visualPath, `timeline scene ${scene.sceneId} visual input`)
+      if (scene.audioPath !== undefined) {
+        await assertWorkspaceInput(input.cwd, scene.audioPath, `timeline scene ${scene.sceneId} audio input`)
+      }
+      if (scene.subtitlePath !== undefined) {
+        await assertWorkspaceInput(input.cwd, scene.subtitlePath, `timeline scene ${scene.sceneId} subtitle input`)
+      }
+    }
     await mkdir(dirname(input.outputPath), { recursive: true })
 
     const fps = clampFps(input.fps)
@@ -189,7 +219,7 @@ export class LocalMediaRuntime {
         }
         const segmentPath = join(tempDir, `${String(index).padStart(4, '0')}.mp4`)
         segmentPaths.push(segmentPath)
-        const args: string[] = ['-y']
+        const args: string[] = ['-y', '-nostdin']
         if (isStillImage(scene.visualPath)) args.push('-loop', '1', '-framerate', String(fps), '-i', scene.visualPath)
         else args.push('-stream_loop', '-1', '-i', scene.visualPath)
 
@@ -221,12 +251,14 @@ export class LocalMediaRuntime {
         else args.push('-shortest')
         args.push(segmentPath)
         results.push(await this.execute(this.ffmpegCommand, args, input.cwd))
+        await verifyOutputFile(input.cwd, segmentPath, `timeline scene ${scene.sceneId} segment`, true)
       }
 
       const concatPath = join(tempDir, 'segments.ffconcat')
       await writeFile(concatPath, `${segmentPaths.map((path) => `file '${ffconcatPath(path)}'`).join('\n')}\n`, 'utf8')
       const concatArgs = [
         '-y',
+        '-nostdin',
         '-f', 'concat',
         '-safe', '0',
         '-i', concatPath,
@@ -235,6 +267,7 @@ export class LocalMediaRuntime {
         input.outputPath,
       ]
       results.push(await this.execute(this.ffmpegCommand, concatArgs, input.cwd))
+      await verifyOutputFile(input.cwd, input.outputPath, 'timeline output', true)
       return aggregateResults(this.ffmpegCommand, input.scenes.length, results)
     } finally {
       await rm(tempDir, { recursive: true, force: true }).catch(() => undefined)
@@ -242,9 +275,10 @@ export class LocalMediaRuntime {
   }
 
   private executeTemplate(template: CommandTemplate, cwd: string, values: Record<string, string>): Promise<MediaCommandResult> {
-    const args = template.args
-      .map((arg) => substitute(arg, values))
-      .filter((arg) => arg !== '')
+    // Preserve empty substituted argv entries. Removing them can shift an
+    // optional value flag onto the next token (for example --voice --output),
+    // producing a command that is syntactically valid but semantically wrong.
+    const args = template.args.map((arg) => substitute(arg, values))
     return this.execute(template.command, args, cwd)
   }
 
@@ -265,7 +299,7 @@ export class LocalMediaRuntime {
         child.kill('SIGTERM')
         setTimeout(() => child.kill('SIGKILL'), 2_000).unref()
         settled = true
-        reject(new MediaRuntimeError(`media command timed out after ${this.timeoutMs}ms`, { command }))
+        reject(new MediaRuntimeError(`media command timed out after ${this.timeoutMs}ms`, { command, stderr }))
       }, this.timeoutMs)
       timer.unref()
 
@@ -275,7 +309,7 @@ export class LocalMediaRuntime {
         if (settled) return
         settled = true
         clearTimeout(timer)
-        reject(new MediaRuntimeError(`failed to start media command ${command}: ${error.message}`, { command }))
+        reject(new MediaRuntimeError(`failed to start media command ${command}: ${error.message}`, { command, stderr }))
       })
       child.on('close', (code) => {
         if (settled) return
@@ -310,7 +344,86 @@ export function commandTemplateFromEnv(env: NodeJS.ProcessEnv, prefix: 'CREATE_F
 }
 
 function substitute(value: string, variables: Record<string, string>): string {
-  return value.replace(/\{([a-zA-Z0-9_]+)\}/g, (_match, key: string) => variables[key] ?? '')
+  return value.replace(/\{([a-zA-Z0-9_]+)\}/g, (_match, key: string) => {
+    if (!Object.prototype.hasOwnProperty.call(variables, key)) {
+      throw new MediaRuntimeError(`unknown media command template placeholder {${key}}`)
+    }
+    return variables[key]!
+  })
+}
+
+async function assertWorkspaceInput(cwd: string, path: string, label: string): Promise<void> {
+  const candidate = await assertWorkspacePath(cwd, path, label, true)
+  const info = await stat(candidate)
+  if (!info.isFile()) throw new MediaRuntimeError(`${label} must be a file: ${path}`)
+}
+
+async function assertWorkspaceOutput(cwd: string, path: string, label: string): Promise<void> {
+  await assertWorkspacePath(cwd, path, label, false)
+}
+
+async function verifyOutputFile(cwd: string, path: string, label: string, requireNonEmpty: boolean): Promise<void> {
+  const candidate = await assertWorkspacePath(cwd, path, label, true)
+  const info = await stat(candidate)
+  if (!info.isFile()) throw new MediaRuntimeError(`${label} was not produced as a file: ${path}`)
+  if (requireNonEmpty && info.size <= 0) throw new MediaRuntimeError(`${label} is empty: ${path}`)
+}
+
+async function assertWorkspacePath(cwd: string, path: string, label: string, mustExist: boolean): Promise<string> {
+  const root = resolve(cwd)
+  const candidate = resolve(cwd, path)
+  if (!isPathContained(root, candidate)) {
+    throw new MediaRuntimeError(`${label} escapes the media workspace: ${path}`)
+  }
+
+  let realRoot: string
+  try {
+    realRoot = await realpath(root)
+  } catch (error) {
+    throw new MediaRuntimeError(`media workspace is unavailable: ${root}: ${error instanceof Error ? error.message : String(error)}`)
+  }
+
+  if (mustExist) {
+    let realCandidate: string
+    try {
+      realCandidate = await realpath(candidate)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        throw new MediaRuntimeError(`${label} does not exist: ${path}`)
+      }
+      throw error
+    }
+    if (!isPathContained(realRoot, realCandidate)) {
+      throw new MediaRuntimeError(`${label} escapes the media workspace through a symlink: ${path}`)
+    }
+    return candidate
+  }
+
+  // Outputs may not exist yet. Resolve the nearest existing ancestor so a
+  // symlinked parent directory cannot redirect writes outside the workspace.
+  let probe = candidate
+  while (true) {
+    try {
+      const realProbe = await realpath(probe)
+      if (!isPathContained(realRoot, realProbe)) {
+        throw new MediaRuntimeError(`${label} escapes the media workspace through a symlink: ${path}`)
+      }
+      return candidate
+    } catch (error) {
+      if (error instanceof MediaRuntimeError) throw error
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      const parent = dirname(probe)
+      if (parent === probe) {
+        throw new MediaRuntimeError(`cannot resolve ${label} inside media workspace: ${path}`)
+      }
+      probe = parent
+    }
+  }
+}
+
+function isPathContained(root: string, candidate: string): boolean {
+  const rel = relative(root, candidate)
+  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))
 }
 
 function positiveNumber(value: string | undefined): number | undefined {
@@ -329,7 +442,13 @@ function isStillImage(path: string): boolean {
 }
 
 function ffmpegFilterPath(path: string): string {
-  return path.replace(/\\/g, '/').replace(/:/g, '\\:').replace(/'/g, "\\'")
+  return path
+    .replace(/\\/g, '/')
+    .replace(/:/g, '\\:')
+    .replace(/'/g, "\\'")
+    .replace(/,/g, '\\,')
+    .replace(/\[/g, '\\[')
+    .replace(/\]/g, '\\]')
 }
 
 function ffconcatPath(path: string): string {
