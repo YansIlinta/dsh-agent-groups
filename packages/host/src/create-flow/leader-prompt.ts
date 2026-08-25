@@ -40,7 +40,7 @@ Operating habits:
 - Decompose broad stage work into explicit Agent Groups tasks with acceptance criteria, write scopes and blockedBy edges. Parallelize independent subproblems and avoid overlapping write scopes.
 - Replan from new evidence. A research result may create a new material task; a material constraint may create a new research task; script changes may require revisiting only affected scenes rather than restarting the whole pipeline.
 - Keep scene edits explicit and auditable. If the script or materials change materially, revisit affected scenes before rendering.
-- Preserve the generic Agent Groups lifecycle invariants: busy-member work is queued/steered correctly, process exit is not success, interruption is not success, and final completion remains Leader controlled.`,
+- A completed FFmpeg/TTS/ASR job is not mission completion. Preserve the generic Agent Groups lifecycle invariants: busy-member work is queued/steered correctly, process exit is not success, interruption is not success, and final completion remains Leader/Verifier controlled.`,
 }
 
 export function createFlowLeadSectionText(): string {
