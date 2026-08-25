@@ -3,6 +3,8 @@ import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
 import type { GroupHost } from '../group-host.js'
 import { GroupError } from '../group-service.js'
 import type { CreateFlowArtifactKind, CreateFlowService, CreateFlowStage } from './service.js'
+import { CREATE_FLOW_ARTIFACT_KINDS, CREATE_FLOW_STAGES } from './registry.js'
+import { readCreateFlowWorkbenchStatus } from './workflow.js'
 
 /**
  * Create Flow workspace API. Registered before the broad /groups/api route so
@@ -50,6 +52,8 @@ export async function handleCreateFlowApi(
         ':groupId/timeline/render',
       ],
       capabilities: createFlow.capabilities(),
+      stages: CREATE_FLOW_STAGES,
+      artifactKinds: CREATE_FLOW_ARTIFACT_KINDS,
     })
     return
   }
@@ -62,15 +66,15 @@ export async function handleCreateFlowApi(
   host.groups.requireGroup(groupId)
 
   if (rest.length === 1 && method === 'GET') {
-    sendJson(res, 200, await createFlow.status(groupId))
+    sendJson(res, 200, await readCreateFlowWorkbenchStatus(host, createFlow, groupId))
     return
   }
 
   if (rest.length === 2 && rest[1] === 'artifacts' && method === 'POST') {
     const body = (await readJsonBody(req)) ?? {}
     sendJson(res, 200, await createFlow.addArtifact(groupId, 'User', {
-      kind: enumString(body.kind, 'kind', ARTIFACT_KINDS),
-      stage: enumString(body.stage, 'stage', STAGES),
+      kind: enumString(body.kind, 'kind', CREATE_FLOW_ARTIFACT_KINDS),
+      stage: enumString(body.stage, 'stage', CREATE_FLOW_STAGES),
       title: stringOf(body.title, 'title'),
       path: optionalString(body.path),
       sourceUrl: optionalString(body.sourceUrl),
@@ -151,8 +155,6 @@ export async function handleCreateFlowApi(
   sendJson(res, 404, { error: 'not found', path: rest.join('/') })
 }
 
-const STAGES = ['topic', 'research', 'materials', 'script', 'voice', 'captions', 'render'] as const satisfies readonly CreateFlowStage[]
-const ARTIFACT_KINDS = ['topic', 'source', 'material', 'script', 'audio', 'captions', 'video', 'other'] as const satisfies readonly CreateFlowArtifactKind[]
 const MAX_BODY = 1024 * 1024
 
 async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown> | undefined> {

@@ -2,6 +2,8 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { GroupHost } from '../group-host.js'
 import { registerGroupTool, strArg, strOptArg, numOptArg } from '../tools.js'
 import type { CreateFlowArtifactKind, CreateFlowService, CreateFlowStage } from './service.js'
+import { CREATE_FLOW_ARTIFACT_KINDS, CREATE_FLOW_STAGES } from './registry.js'
+import { readCreateFlowWorkbenchStatus } from './workflow.js'
 
 const string = 'string' as const
 const number = 'number' as const
@@ -12,16 +14,19 @@ export function installCreateFlowLeaderTools(ctx: Context, host: GroupHost, crea
 
   registerGroupTool(ctx, host, {
     name: 'leader_create_flow_status',
-    description: 'Read Create Flow artifacts, timeline scenes, local media jobs, workspace root, and ASR/TTS/FFmpeg capabilities for this group.',
-    run: (_host, actor) => createFlow.status(groupIdFor(actor)),
+    description: 'Read Create Flow artifacts, timeline scenes, local media jobs, workflow readiness/blockers/recommended actions, workspace root, and ASR/TTS/FFmpeg capabilities for this group.',
+    run: (_host, actor) => {
+      const groupId = groupIdFor(actor)
+      return readCreateFlowWorkbenchStatus(host, createFlow, groupId)
+    },
   })
 
   registerGroupTool(ctx, host, {
     name: 'leader_create_flow_add_artifact',
     description: 'Register a topic, source, material, script, audio, captions, video, or other workspace artifact in the Create Flow production state.',
     parameters: {
-      kind: { type: string, required: true, enum: ['topic', 'source', 'material', 'script', 'audio', 'captions', 'video', 'other'] },
-      stage: { type: string, required: true, enum: ['topic', 'research', 'materials', 'script', 'voice', 'captions', 'render'] },
+      kind: { type: string, required: true, enum: [...CREATE_FLOW_ARTIFACT_KINDS] },
+      stage: { type: string, required: true, enum: [...CREATE_FLOW_STAGES] },
       title: { type: string, required: true },
       path: { type: string, description: 'Workspace-relative artifact path, if this artifact is a local file.' },
       sourceUrl: { type: string, description: 'Source URL for research/material provenance.' },

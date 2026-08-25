@@ -19,10 +19,14 @@ TOPIC
 
 The model-facing production protocol lives in `leader-prompt.ts`. It guides the Leader through these stages but does not create a second scheduler or state machine.
 
+Stage vocabulary and role-to-stage projection live in `registry.ts`. Machine-readable readiness lives in `workflow.ts` and is derived on read from Agent Groups task/verification truth plus Create Flow production state; readiness is not persisted into `.create-flow/state.json`.
+
 ## First entry by task
 
 | You want to change... | Start here | Notes |
 | --- | --- | --- |
+| Stage vocabulary / role projection | `registry.ts` | Shared contract consumed by tools, API, projector and readiness |
+| Stage readiness / blockers / next actions | `workflow.ts` | Read-only projection; never a second orchestrator |
 | Artifact / scene / job state | `service.ts` | Workspace-scoped state and validation |
 | TTS / ASR / FFmpeg behavior | `media-runtime.ts` | Deterministic subprocess boundary; no shell |
 | Tools available to the Leader | `leader-tools.ts` | Keep tools narrow and typed |
@@ -53,6 +57,8 @@ Group workspace
 ```
 
 Do not infer task success from a media job. A successful TTS, ASR or FFmpeg command only means the deterministic production operation completed.
+
+`workflow.ts` deliberately reads both domains without writing a new one. For example, a manually registered `topic` artifact cannot make the Topic gate complete by itself; the task-driven Topic/Research/Materials/Script gates require verified Agent Groups task evidence. Likewise, render readiness can observe a completed media job, while final Verify remains tied to normal Mission completion.
 
 ## Scene timeline
 
@@ -95,6 +101,8 @@ When changing this slice, cover the smallest relevant contract:
 - workspace path escape rejection;
 - state persistence and backward-compatible reads;
 - idempotent task artifact projection;
+- stage-registry ordering and role projection;
+- readiness cannot bypass Agent Groups verification;
 - scene ordering/update/removal;
 - timeline render inputs and output artifact creation;
 - Leader production protocol gates when stage behavior changes.
