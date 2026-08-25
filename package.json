@@ -9,6 +9,7 @@
     "build:native": "node scripts/build-native-client.mjs",
     "typecheck": "npm --prefix packages/host run typecheck",
     "test": "npm --prefix packages/host run test",
+    "test:create-flow": "npm --prefix packages/host run test:create-flow",
     "verify": "npm run typecheck && npm test && npm run build && node --check packages/host/lib/client.js",
     "install-web-profile": "bash scripts/install-web-profile.sh",
     "relaunch-web": "bash scripts/relaunch-web.sh"
