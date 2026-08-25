@@ -11,6 +11,7 @@ import type { GroupHost } from './group-host.js'
 import type { CreateFlowService } from './create-flow/service.js'
 import { installLeaderTools } from './leader-tools.js'
 import { installCreateFlowLeaderTools } from './create-flow/leader-tools.js'
+import { CREATE_FLOW_LEADER_PROTOCOL_SECTION } from './create-flow/leader-prompt.js'
 import { LEADER_PROTOCOL_SECTION } from './leader-prompt.js'
 
 export const name = 'agent-groups:leader'
@@ -22,4 +23,5 @@ export function apply(ctx: Context): void {
   installLeaderTools(ctx, host)
   installCreateFlowLeaderTools(ctx, host, createFlow)
   ctx.systemPrompt.section(LEADER_PROTOCOL_SECTION)
+  ctx.systemPrompt.section(CREATE_FLOW_LEADER_PROTOCOL_SECTION)
 }
