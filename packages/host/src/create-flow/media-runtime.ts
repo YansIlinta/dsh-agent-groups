@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process'
-import { mkdir } from 'node:fs/promises'
-import { extname, dirname } from 'node:path'
+import { randomUUID } from 'node:crypto'
+import { mkdir, rm, writeFile } from 'node:fs/promises'
+import { extname, dirname, join } from 'node:path'
 
 export interface CommandTemplate {
   readonly command: string
@@ -19,6 +20,14 @@ export interface MediaCommandResult {
   readonly exitCode: number
   readonly stdout: string
   readonly stderr: string
+}
+
+export interface TimelineRenderScene {
+  readonly sceneId: string
+  readonly visualPath: string
+  readonly audioPath?: string
+  readonly subtitlePath?: string
+  readonly durationSec?: number
 }
 
 export class MediaRuntimeError extends Error {
@@ -128,7 +137,7 @@ export class LocalMediaRuntime {
   }): Promise<MediaCommandResult> {
     await mkdir(dirname(input.outputPath), { recursive: true })
     const image = isStillImage(input.visualPath)
-    const fps = Math.max(1, Math.min(120, Math.round(input.fps ?? 30)))
+    const fps = clampFps(input.fps)
     const args: string[] = ['-y']
     if (image) args.push('-loop', '1', '-framerate', String(fps), '-i', input.visualPath)
     else args.push('-stream_loop', '-1', '-i', input.visualPath)
@@ -146,6 +155,90 @@ export class LocalMediaRuntime {
       input.outputPath,
     )
     return this.execute(this.ffmpegCommand, args, input.cwd)
+  }
+
+  /**
+   * Render a multi-scene timeline without a shell or server-side media daemon.
+   * Every scene is normalized to the same H.264/AAC geometry first, then the
+   * temporary segments are concatenated losslessly into the final MP4.
+   */
+  async renderTimeline(input: {
+    cwd: string
+    scenes: readonly TimelineRenderScene[]
+    outputPath: string
+    fps?: number
+    width?: number
+    height?: number
+  }): Promise<MediaCommandResult> {
+    if (input.scenes.length === 0) throw new MediaRuntimeError('timeline has no scenes')
+    await mkdir(dirname(input.outputPath), { recursive: true })
+
+    const fps = clampFps(input.fps)
+    const width = clampDimension(input.width ?? 1280)
+    const height = clampDimension(input.height ?? 720)
+    const tempDir = join(dirname(input.outputPath), `.timeline-${randomUUID()}`)
+    await mkdir(tempDir, { recursive: true })
+    const results: MediaCommandResult[] = []
+
+    try {
+      const segmentPaths: string[] = []
+      for (let index = 0; index < input.scenes.length; index += 1) {
+        const scene = input.scenes[index]!
+        if (scene.audioPath === undefined && scene.durationSec === undefined) {
+          throw new MediaRuntimeError(`timeline scene ${scene.sceneId} needs audioPath or durationSec`)
+        }
+        const segmentPath = join(tempDir, `${String(index).padStart(4, '0')}.mp4`)
+        segmentPaths.push(segmentPath)
+        const args: string[] = ['-y']
+        if (isStillImage(scene.visualPath)) args.push('-loop', '1', '-framerate', String(fps), '-i', scene.visualPath)
+        else args.push('-stream_loop', '-1', '-i', scene.visualPath)
+
+        if (scene.audioPath !== undefined) args.push('-i', scene.audioPath)
+        else args.push('-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000')
+
+        const filters = [
+          `scale=${width}:${height}:force_original_aspect_ratio=decrease`,
+          `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2`,
+          'setsar=1',
+          `fps=${fps}`,
+        ]
+        if (scene.subtitlePath !== undefined) filters.push(`subtitles=${ffmpegFilterPath(scene.subtitlePath)}`)
+
+        args.push(
+          '-map', '0:v:0',
+          '-map', '1:a:0',
+          '-vf', filters.join(','),
+          '-c:v', 'libx264',
+          '-preset', 'medium',
+          '-pix_fmt', 'yuv420p',
+          '-c:a', 'aac',
+          '-b:a', '192k',
+          '-ar', '48000',
+          '-ac', '2',
+          '-r', String(fps),
+        )
+        if (scene.durationSec !== undefined) args.push('-t', formatSeconds(scene.durationSec))
+        else args.push('-shortest')
+        args.push(segmentPath)
+        results.push(await this.execute(this.ffmpegCommand, args, input.cwd))
+      }
+
+      const concatPath = join(tempDir, 'segments.ffconcat')
+      await writeFile(concatPath, `${segmentPaths.map((path) => `file '${ffconcatPath(path)}'`).join('\n')}\n`, 'utf8')
+      const concatArgs = [
+        '-y',
+        '-f', 'concat',
+        '-safe', '0',
+        '-i', concatPath,
+        '-c', 'copy',
+        '-movflags', '+faststart',
+        input.outputPath,
+      ]
+      results.push(await this.execute(this.ffmpegCommand, concatArgs, input.cwd))
+      return aggregateResults(this.ffmpegCommand, input.scenes.length, results)
+    } finally {
+      await rm(tempDir, { recursive: true, force: true }).catch(() => undefined)
+    }
   }
 
   private executeTemplate(template: CommandTemplate, cwd: string, values: Record<string, string>): Promise<MediaCommandResult> {
@@ -237,4 +330,32 @@ function isStillImage(path: string): boolean {
 
 function ffmpegFilterPath(path: string): string {
   return path.replace(/\\/g, '/').replace(/:/g, '\\:').replace(/'/g, "\\'")
+}
+
+function ffconcatPath(path: string): string {
+  return path.replace(/\\/g, '/').replace(/'/g, "'\\''")
+}
+
+function clampFps(value: number | undefined): number {
+  return Math.max(1, Math.min(120, Math.round(value ?? 30)))
+}
+
+function clampDimension(value: number): number {
+  const rounded = Math.max(16, Math.min(8192, Math.round(value)))
+  return rounded % 2 === 0 ? rounded : rounded + 1
+}
+
+function formatSeconds(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) throw new MediaRuntimeError('scene durationSec must be a positive number')
+  return String(Math.min(24 * 60 * 60, value))
+}
+
+function aggregateResults(command: string, sceneCount: number, results: readonly MediaCommandResult[]): MediaCommandResult {
+  return {
+    command,
+    args: [`<timeline:${sceneCount}-scenes>`],
+    exitCode: 0,
+    stdout: results.map((result) => result.stdout).filter(Boolean).join('\n'),
+    stderr: results.map((result) => result.stderr).filter(Boolean).join('\n'),
+  }
 }
