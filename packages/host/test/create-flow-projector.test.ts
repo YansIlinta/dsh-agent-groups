@@ -8,7 +8,7 @@ import { LocalMediaRuntime } from '../src/create-flow/media-runtime.js'
 import { makeHarness } from './helpers.js'
 
 describe('Create Flow task projector', () => {
-  it('projects verified Scriptwriter artifacts into the script stage exactly once', async () => {
+  it('projects verified legacy-template Scriptwriter artifacts into the script stage exactly once', async () => {
     const h = makeHarness()
     const cwd = await mkdtemp(join(tmpdir(), 'create-flow-projector-'))
     const group = await h.groups.initGroup(
@@ -18,13 +18,16 @@ describe('Create Flow task projector', () => {
       { objective: 'make a video' },
       { cwd, templateId: 'content-team' },
     )
+    // The existing template materialization path is profile-based and carries
+    // displayRole but may not carry a V0.4 roleId. The projector must support
+    // that durable compatibility shape as well as role-based members.
     await h.groups.addMember(group.groupId, {
       sessionId: 'writer-1',
       profileId: 'reviewer',
       name: 'Scriptwriter',
       status: 'idle',
       role: 'member',
-      roleId: 'scriptwriter',
+      displayRole: 'Scriptwriter',
     })
     const task = await h.tasks.createTask(group.groupId, {
       subject: 'Write final script',
@@ -61,5 +64,6 @@ describe('Create Flow task projector', () => {
       path: 'production/script.md',
     })
     expect(status.state.artifacts[0]?.metadata?.taskId).toBe(task.taskId)
+    expect(status.state.artifacts[0]?.metadata?.displayRole).toBe('Scriptwriter')
   })
 })
