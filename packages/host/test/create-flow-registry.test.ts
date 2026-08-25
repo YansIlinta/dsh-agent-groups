@@ -14,7 +14,7 @@ import { readCreateFlowWorkbenchStatus } from '../src/create-flow/workflow.js'
 import { makeHost } from './helpers.js'
 
 describe('Create Flow registry and readiness', () => {
-  it('keeps one ordered registry for stages and durable role projection', () => {
+  it('keeps one ordered registry for stages, production dependencies and durable role projection', () => {
     expect(CREATE_FLOW_STAGES).toEqual(['topic', 'research', 'materials', 'script', 'voice', 'captions', 'render'])
     expect(CREATE_FLOW_ARTIFACT_KINDS).toContain('video')
     expect(CREATE_FLOW_WORKFLOW_REGISTRY.map((stage) => stage.id)).toEqual([
@@ -28,11 +28,14 @@ describe('Create Flow registry and readiness', () => {
       'verify',
     ])
     expect(new Set(CREATE_FLOW_WORKFLOW_REGISTRY.map((stage) => stage.order)).size).toBe(CREATE_FLOW_WORKFLOW_REGISTRY.length)
+    expect(CREATE_FLOW_WORKFLOW_REGISTRY.find((stage) => stage.id === 'research')?.requires).toEqual(['topic'])
+    expect(CREATE_FLOW_WORKFLOW_REGISTRY.find((stage) => stage.id === 'materials')?.requires).toEqual(['topic'])
+    expect(CREATE_FLOW_WORKFLOW_REGISTRY.find((stage) => stage.id === 'script')?.requires).toEqual(['research', 'materials'])
     expect(projectionForCreateFlowRole('scriptwriter')).toEqual({ stage: 'script', kind: 'script' })
     expect(projectionForCreateFlowRole(undefined, 'Scriptwriter')).toEqual({ stage: 'script', kind: 'script' })
   })
 
-  it('derives readiness from verified Agent Groups tasks instead of trusting a production artifact alone', async () => {
+  it('derives readiness from Agent Groups task state and exposes independent ready stages together', async () => {
     const host = makeHost()
     const cwd = await mkdtemp(join(tmpdir(), 'create-flow-readiness-'))
     const group = await host.groups.initGroup(
@@ -68,7 +71,10 @@ describe('Create Flow registry and readiness', () => {
 
     let status = await readCreateFlowWorkbenchStatus(host, flow, group.groupId)
     expect(status.workflow.focusStage).toBe('topic')
+    expect(status.workflow.readyStages).toEqual(['topic'])
     expect(status.workflow.stages[0]).toMatchObject({ status: 'ready' })
+    expect(status.workflow.stages.find((stage) => stage.id === 'research')).toMatchObject({ status: 'blocked' })
+    expect(status.workflow.stages.find((stage) => stage.id === 'materials')).toMatchObject({ status: 'blocked' })
     expect(status.workflow.blockers[0]).toContain('No verified Topic Strategist task')
     expect(status.workflow.recommendedActions[0]).toMatchObject({ action: 'delegate_task', roleId: 'topic-strategist' })
     expect(await flow.status(group.groupId)).not.toHaveProperty('workflow')
@@ -93,6 +99,13 @@ describe('Create Flow registry and readiness', () => {
     expect(status.workflow.stages[0]).toMatchObject({ status: 'complete' })
     expect(status.workflow.stages[0]?.evidence.taskIds).toContain(task.taskId)
     expect(status.workflow.focusStage).toBe('research')
-    expect(status.workflow.recommendedActions[0]).toMatchObject({ action: 'delegate_task', roleId: 'researcher' })
+    expect(status.workflow.readyStages).toEqual(['research', 'materials'])
+    expect(status.workflow.stages.find((stage) => stage.id === 'research')).toMatchObject({ status: 'ready' })
+    expect(status.workflow.stages.find((stage) => stage.id === 'materials')).toMatchObject({ status: 'ready' })
+    expect(status.workflow.stages.find((stage) => stage.id === 'script')).toMatchObject({ status: 'blocked' })
+    expect(status.workflow.recommendedActions).toEqual(expect.arrayContaining([
+      expect.objectContaining({ action: 'delegate_task', roleId: 'researcher' }),
+      expect.objectContaining({ action: 'delegate_task', roleId: 'material-producer' }),
+    ]))
   })
 })
