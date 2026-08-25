@@ -48,6 +48,8 @@ export interface CreateFlowWorkflowStageDefinition {
   readonly id: CreateFlowWorkflowStageId
   readonly order: number
   readonly label: string
+  /** Production prerequisites. Stages without an edge may become ready in parallel. */
+  readonly requires?: readonly CreateFlowWorkflowStageId[]
   /** Persistent production role responsible for task-driven stage evidence. */
   readonly roleId?: string
   /** Compatibility label for pre-V0.4/template-materialized members. */
@@ -72,6 +74,7 @@ export const CREATE_FLOW_WORKFLOW_REGISTRY = [
     id: 'research',
     order: 20,
     label: 'Research',
+    requires: ['topic'],
     roleId: 'researcher',
     displayRole: 'Researcher',
     taskProjection: { stage: 'research', kind: 'source' },
@@ -81,6 +84,7 @@ export const CREATE_FLOW_WORKFLOW_REGISTRY = [
     id: 'materials',
     order: 30,
     label: 'Materials',
+    requires: ['topic'],
     roleId: 'material-producer',
     displayRole: 'Material Producer',
     taskProjection: { stage: 'materials', kind: 'material' },
@@ -90,6 +94,7 @@ export const CREATE_FLOW_WORKFLOW_REGISTRY = [
     id: 'script',
     order: 40,
     label: 'Script',
+    requires: ['research', 'materials'],
     roleId: 'scriptwriter',
     displayRole: 'Scriptwriter',
     taskProjection: { stage: 'script', kind: 'script' },
@@ -99,18 +104,21 @@ export const CREATE_FLOW_WORKFLOW_REGISTRY = [
     id: 'scenes',
     order: 50,
     label: 'Scenes',
+    requires: ['script'],
     productionStages: [],
   }),
   defineCreateFlowStage({
     id: 'voice_captions',
     order: 60,
     label: 'Voice / Captions',
+    requires: ['scenes'],
     productionStages: ['voice', 'captions'],
   }),
   defineCreateFlowStage({
     id: 'render',
     order: 70,
     label: 'Render',
+    requires: ['scenes', 'voice_captions'],
     roleId: 'video-producer',
     displayRole: 'Video Producer',
     taskProjection: { stage: 'render', kind: 'other' },
@@ -120,6 +128,7 @@ export const CREATE_FLOW_WORKFLOW_REGISTRY = [
     id: 'verify',
     order: 80,
     label: 'Verify',
+    requires: ['render'],
     productionStages: [],
   }),
 ] as const satisfies readonly CreateFlowWorkflowStageDefinition[]
