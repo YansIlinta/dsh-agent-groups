@@ -39,7 +39,16 @@ export async function handleCreateFlowApi(
   if (rest.length === 0 && method === 'GET') {
     sendJson(res, 200, {
       name: 'create-flow',
-      paths: [':groupId', ':groupId/artifacts', ':groupId/tts', ':groupId/asr', ':groupId/render'],
+      paths: [
+        ':groupId',
+        ':groupId/artifacts',
+        ':groupId/scenes',
+        ':groupId/scenes/:sceneId',
+        ':groupId/tts',
+        ':groupId/asr',
+        ':groupId/render',
+        ':groupId/timeline/render',
+      ],
       capabilities: createFlow.capabilities(),
     })
     return
@@ -68,6 +77,26 @@ export async function handleCreateFlowApi(
       mimeType: optionalString(body.mimeType),
       metadata: recordOf(body.metadata),
     }))
+    return
+  }
+
+  if (rest.length === 2 && rest[1] === 'scenes' && method === 'POST') {
+    const body = (await readJsonBody(req)) ?? {}
+    sendJson(res, 200, await createFlow.upsertScene(groupId, 'User', {
+      sceneId: optionalString(body.sceneId),
+      order: optionalNumber(body.order),
+      title: optionalString(body.title),
+      visualPath: optionalString(body.visualPath),
+      audioPath: optionalString(body.audioPath),
+      subtitlePath: optionalString(body.subtitlePath),
+      narration: optionalRawString(body.narration),
+      durationSec: optionalNumber(body.durationSec),
+    }))
+    return
+  }
+
+  if (rest.length === 3 && rest[1] === 'scenes' && method === 'DELETE') {
+    sendJson(res, 200, await createFlow.removeScene(groupId, 'User', stringOf(rest[2], 'sceneId')))
     return
   }
 
@@ -107,6 +136,18 @@ export async function handleCreateFlowApi(
     return
   }
 
+  if (rest.length === 3 && rest[1] === 'timeline' && rest[2] === 'render' && method === 'POST') {
+    const body = (await readJsonBody(req)) ?? {}
+    sendJson(res, 200, await createFlow.renderTimeline(groupId, 'User', {
+      outputPath: optionalString(body.outputPath),
+      fps: optionalNumber(body.fps),
+      width: optionalNumber(body.width),
+      height: optionalNumber(body.height),
+      title: optionalString(body.title),
+    }))
+    return
+  }
+
   sendJson(res, 404, { error: 'not found', path: rest.join('/') })
 }
 
@@ -141,6 +182,11 @@ function stringOf(value: unknown, name: string): string {
 
 function optionalString(value: unknown): string | undefined {
   if (value === undefined || value === null || value === '') return undefined
+  return String(value).trim() || undefined
+}
+
+function optionalRawString(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined
   return String(value)
 }
 
