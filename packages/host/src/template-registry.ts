@@ -37,14 +37,16 @@ export const TEAM_TEMPLATES: readonly TeamTemplate[] = [
   },
   {
     id: 'content-team',
-    name: 'Content Team',
-    description: 'Research → writing → editorial pass for documentation and copy.',
+    name: 'Create Flow',
+    description: 'End-to-end video production workspace: topic → research → materials → script → local voice/captions → render.',
     leaderProfile: 'product-planner',
-    icon: '✍️',
+    icon: '🎬',
     members: [
+      { role: 'Topic Strategist', profile: 'implementation-engineer', count: 1 },
       { role: 'Researcher', profile: 'implementation-engineer', count: 1 },
-      { role: 'Writer', profile: 'reviewer', count: 1 },
-      { role: 'Editor', profile: 'reviewer', count: 1 },
+      { role: 'Material Producer', profile: 'implementation-engineer', count: 1 },
+      { role: 'Scriptwriter', profile: 'reviewer', count: 1 },
+      { role: 'Video Producer', profile: 'implementation-engineer', count: 1 },
     ],
   },
   {

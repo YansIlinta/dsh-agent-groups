@@ -1,0 +1,77 @@
+import { basename } from 'node:path'
+import type { GroupService } from '../group-service.js'
+import type { TaskService } from '../task-service.js'
+import type { GroupNotifier } from '../notifier.js'
+import type { CreateFlowArtifactKind, CreateFlowService, CreateFlowStage } from './service.js'
+
+const ROLE_STAGE: Readonly<Record<string, { stage: CreateFlowStage; kind: CreateFlowArtifactKind }>> = {
+  'topic-strategist': { stage: 'topic', kind: 'topic' },
+  researcher: { stage: 'research', kind: 'source' },
+  'material-producer': { stage: 'materials', kind: 'material' },
+  scriptwriter: { stage: 'script', kind: 'script' },
+  'video-producer': { stage: 'render', kind: 'other' },
+}
+
+/**
+ * Bridges the generic Agent Groups task lifecycle into the Create Flow lens.
+ * Only VERIFIED task results are projected. The member role determines which
+ * production stage receives the result artifact.
+ */
+export class CreateFlowTaskProjector {
+  private readonly groups: GroupService
+  private readonly tasks: TaskService
+  private readonly notifier: GroupNotifier
+  private readonly flow: CreateFlowService
+  private unsubscribe?: () => void
+
+  constructor(options: { groups: GroupService; tasks: TaskService; notifier: GroupNotifier; flow: CreateFlowService }) {
+    this.groups = options.groups
+    this.tasks = options.tasks
+    this.notifier = options.notifier
+    this.flow = options.flow
+  }
+
+  start(): void {
+    if (this.unsubscribe !== undefined) return
+    this.unsubscribe = this.notifier.subscribe((update) => {
+      if (update.event?.type !== 'verification_passed' || update.event.refTaskId === undefined) return
+      void this.projectTask(update.groupId, update.event.refTaskId).catch((error) => {
+        console.error('[create-flow] failed to project verified task artifacts', error)
+      })
+    })
+  }
+
+  stop(): void {
+    this.unsubscribe?.()
+    this.unsubscribe = undefined
+  }
+
+  async projectTask(groupId: string, taskId: string): Promise<number> {
+    const group = this.groups.requireGroup(groupId)
+    if (group.templateId !== 'content-team') return 0
+    const task = this.tasks.requireTask(groupId, taskId)
+    if (task.verification?.passed !== true || task.result === undefined || task.ownerId === undefined) return 0
+    const member = this.groups.getMembership(groupId, task.ownerId)
+    const roleId = member?.roleId
+    const projection = roleId !== undefined ? ROLE_STAGE[roleId] : undefined
+    if (projection === undefined) return 0
+
+    const status = await this.flow.status(groupId)
+    let added = 0
+    for (const path of task.result.artifacts) {
+      const exists = status.state.artifacts.some((artifact) =>
+        artifact.path === path && artifact.metadata?.taskId === taskId,
+      )
+      if (exists) continue
+      await this.flow.addArtifact(groupId, task.ownerId, {
+        kind: projection.kind,
+        stage: projection.stage,
+        title: `${task.subject}: ${basename(path) || path}`,
+        path,
+        metadata: { taskId, ownerId: task.ownerId, roleId, projectedFromTask: true },
+      })
+      added += 1
+    }
+    return added
+  }
+}

@@ -27,6 +27,10 @@ import { DshAgentRuntimeAdapter, type DefaultModelSelection } from './dsh-adapte
 import { installMemberPeerContactPolicy } from './policy.js'
 import { buildCompatibilityReport, detectSurfaces, printCompatibility } from './compatibility.js'
 import { createGroupWebApi } from './web/api.js'
+import { CreateFlowService } from './create-flow/service.js'
+import { LocalMediaRuntime } from './create-flow/media-runtime.js'
+import { createCreateFlowWebApi } from './create-flow/web-api.js'
+import { CreateFlowTaskProjector } from './create-flow/task-projector.js'
 import { LeaderRegistry } from './leader-registry.js'
 import { RuntimeRegistry } from './runtime/registry.js'
 import { DeepSeekHarnessRuntimeProvider } from './runtime/deepseek-harness.js'
@@ -85,6 +89,11 @@ export { BRIDGE_MARKER, parseBridgeAction, codexBridgeInstructions, executeBridg
 export type { CodexBridgeAction } from './runtime/codex-bridge.js'
 export type { ExternalBridgeMethod, ExternalBridgeParams, ExternalAgentContext, ExternalBridgeCall } from './runtime/bridge.js'
 export type { PromptSection, PromptCompileOptions, CompiledPrompt, CompiledPromptSection, AgentPromptLayers, AgentTaskPrompt, AgentRelevantContext } from './prompt-compiler.js'
+export { CreateFlowService } from './create-flow/service.js'
+export type { CreateFlowArtifact, CreateFlowArtifactKind, CreateFlowJob, CreateFlowJobKind, CreateFlowJobStatus, CreateFlowStage, CreateFlowState, CreateFlowStatus } from './create-flow/service.js'
+export { LocalMediaRuntime, MediaRuntimeError, commandTemplateFromEnv } from './create-flow/media-runtime.js'
+export type { CommandTemplate, LocalMediaRuntimeOptions, MediaCommandResult, MediaRuntimeCapabilities } from './create-flow/media-runtime.js'
+export { CreateFlowTaskProjector } from './create-flow/task-projector.js'
 export * from './core-types.js'
 
 export const name = 'agent-groups'
@@ -94,6 +103,8 @@ declare module '@deepseek-ai/cordis' {
   interface Context {
     /** The DSH Agent Groups product service (leader & member operations). */
     groupHost: GroupHost
+    /** Create Flow project/media service, shared by Leader tools and native UI. */
+    createFlow: CreateFlowService
   }
 }
 
@@ -124,6 +135,8 @@ export async function apply(ctx: Context): Promise<void> {
   const tasks = new TaskService(stores.tasks, activity)
   const channel = new ChannelService(stores.channel, activity, notifier)
   const profiles = new ProfileRegistry(stores.profiles)
+  const createFlow = new CreateFlowService({ groups, activity, notifier, media: LocalMediaRuntime.fromEnv() })
+  const createFlowProjector = new CreateFlowTaskProjector({ groups, tasks, notifier, flow: createFlow })
   const agentDefaultModel = ctx.get('agentDefaultModel') as { currentSelection(): DefaultModelSelection } | undefined
   const adapter = new DshAgentRuntimeAdapter({
     agents: ctx.agents,
@@ -157,6 +170,7 @@ export async function apply(ctx: Context): Promise<void> {
   const host = new GroupHost({ groups, tasks, channel, privateMessages, activity, profiles, notifier, adapter, leaders, runtimes, discovery: mountHarnessDiscovery(ctx) })
   codexBridge = new ExternalAgentBridge(host)
   ctx.provide('groupHost', host)
+  ctx.provide('createFlow', createFlow)
 
   // Deterministic, non-overlapping reconciliation: re-attach durable ACP/DSH
   // sessions, then drain persisted future turns without duplicating work.
@@ -164,22 +178,27 @@ export async function apply(ctx: Context): Promise<void> {
     onError: (error) => console.error('[agent-groups] runtime reconciliation failed', error),
   })
   reconciler.start()
+  createFlowProjector.start()
 
   // Policy: no raw peer messaging for group members (defense-in-depth).
   installMemberPeerContactPolicy(ctx, groups)
 
-  // Data API (`/groups/api/*`) on the same webserver as the DSH GUI; the
-  // native page (client bundle) is loaded by the DSH shell itself.
-  for (const route of createGroupWebApi({ host, notifier, compatibility: report })) {
+  // Create Flow has a more-specific API prefix and is registered before the
+  // broad Agent Groups API route.
+  for (const route of [
+    ...createCreateFlowWebApi({ host, createFlow }),
+    ...createGroupWebApi({ host, notifier, compatibility: report }),
+  ]) {
     ctx.webServer.register(route)
   }
 
-  ctx.effect(() => () =>
-    Promise.allSettled([
+  ctx.effect(() => () => {
+    createFlowProjector.stop()
+    return Promise.allSettled([
       Promise.resolve(reconciler.stop()),
       adapter.drain(),
       ...acpProviders.map((provider) => provider.dispose()),
       domain.close(),
-    ]).then(() => undefined),
-  )
+    ]).then(() => undefined)
+  })
 }
