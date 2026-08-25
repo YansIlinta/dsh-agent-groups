@@ -9,6 +9,15 @@
 
 The host package links against the DSH runtime packages available in the local environment. CI currently installs and verifies against `@deepseek-ai/dsh@0.1.0-rc.6`.
 
+## Find the owning module first
+
+Before scanning large source files, use the local code maps:
+
+- [`packages/host/src/README.md`](../packages/host/src/README.md) — Host/runtime/domain/UI first-entry map.
+- [`packages/host/src/create-flow/README.md`](../packages/host/src/create-flow/README.md) — Create Flow production state/media/tools/protocol/API map.
+
+Coding agents should also read [`AGENTS.md`](../AGENTS.md); task-scoped guides live under `skills/`.
+
 ## Install dependencies
 
 From the repository root:
@@ -24,11 +33,12 @@ The host package `postinstall` script links the DSH packages used for compilatio
 ## Core commands
 
 ```bash
-npm run build          # host + native DSH client bundle
-npm run typecheck      # source + test typecheck
-npm test               # Vitest suite
-npm run build:native   # native client bundle only
-npm run verify         # complete pre-PR verification chain
+npm run build             # host + native DSH client bundle
+npm run typecheck         # source + test typecheck
+npm test                  # full Vitest suite
+npm run test:create-flow  # focused Create Flow tests
+npm run build:native      # native client bundle only
+npm run verify            # complete pre-PR verification chain
 ```
 
 Useful integration helpers:
@@ -80,6 +90,18 @@ AGENT_GROUPS_CODEX_SMOKE=1 npm test
 
 Provider tests should cover failure paths as well as happy paths: malformed messages, disconnects, late turn events, resume failures, steering failures, permission/input requests, interruption, and retry/reconciliation behavior.
 
+## Create Flow work
+
+Create Flow is a production specialization, not a second orchestrator. Read [Create Flow](create-flow.md) and the [implementation map](../packages/host/src/create-flow/README.md) before changing it.
+
+During iteration, prefer the focused suite:
+
+```bash
+npm run test:create-flow
+```
+
+Keep tests close to the production contract being changed: path containment, artifact projection, scene persistence/order, media inputs/output, API wiring, or Leader stage gates. Run the full `npm run verify` before completion.
+
 ## Native client
 
 The native page source lives under `packages/host/src/native-client/`. The build script wraps it into the DSH client-module format and writes `packages/host/lib/client.js`.
@@ -105,7 +127,8 @@ Also run the smallest relevant integration/demo path for the behavior you change
 ## Repository conventions
 
 - Keep the root README product-focused.
-- Put implementation notes and investigations under `docs/`.
+- Put architecture/protocol/development notes under `docs/`.
+- Put local "where should I start?" maps beside the source they describe.
 - Treat runtime lifecycle rules in [Architecture](architecture.md) as invariants.
 - Prefer small, auditable changes with regression tests over broad rewrites of `group-host.ts` or provider implementations.
 - Never persist credentials, API keys, auth files, or secret-bearing provider payloads.
