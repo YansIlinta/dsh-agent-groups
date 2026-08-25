@@ -33,7 +33,7 @@ export const GENERALIST_ROLE: AgentRoleDefinition = role({
   defaultInstances: 1,
 })
 
-/** Generic built-in role templates (§22), shared by the original team types. */
+/** Built-in role templates (§22) shared by template configs. */
 export const ROLE_TEMPLATES: readonly AgentRoleDefinition[] = [
   role({
     id: 'planner',
@@ -77,44 +77,10 @@ export const ROLE_TEMPLATES: readonly AgentRoleDefinition[] = [
   }),
 ]
 
-/** Create Flow-specific roles stay scoped to the video-production specialization. */
-const CREATE_FLOW_ROLE_TEMPLATES: readonly AgentRoleDefinition[] = [
-  role({
-    id: 'topic-strategist',
-    name: 'Topic Strategist',
-    description: 'Finds and evaluates content angles, audience fit, novelty, stakes and production potential.',
-    reasoningLevel: 'high',
-    maxInstances: 2,
-    systemPrompt: 'Focus on discovering and evaluating content topics. Produce concrete candidate angles, audience rationale, novelty, stakes, evidence needs and a recommended direction.',
-  }),
-  role({
-    id: 'material-producer',
-    name: 'Material Producer',
-    description: 'Collects, organizes and creates production materials in the workspace, preserving source provenance and usable file paths.',
-    reasoningLevel: 'medium',
-    maxInstances: 2,
-  }),
-  role({
-    id: 'scriptwriter',
-    name: 'Scriptwriter',
-    description: 'Turns an approved topic and research pack into a structured, production-ready script.',
-    reasoningLevel: 'high',
-    maxInstances: 2,
-    systemPrompt: 'Write production-ready scripts from the approved topic and research evidence. Preserve factual traceability, structure the narrative clearly, and flag unsupported claims instead of inventing them.',
-  }),
-  role({
-    id: 'video-producer',
-    name: 'Video Producer',
-    description: 'Owns deterministic media assembly: prepares local inputs, invokes Create Flow ASR/TTS/render tools through the Leader, and verifies produced media files.',
-    reasoningLevel: 'medium',
-    maxInstances: 2,
-  }),
-]
-
 /** Team templates → role sets (§23); runtime stays decoupled. */
 export function templateTeamConfig(templateId: string | undefined): TeamConfig {
   const byId = (id: string): AgentRoleDefinition => {
-    const found = [...ROLE_TEMPLATES, ...CREATE_FLOW_ROLE_TEMPLATES].find((t) => t.id === id)
+    const found = ROLE_TEMPLATES.find((t) => t.id === id)
     if (found !== undefined) return found
     return { ...GENERALIST_ROLE, id, name: id }
   }
@@ -135,17 +101,11 @@ export function templateTeamConfig(templateId: string | undefined): TeamConfig {
       }
     case 'content-team':
       return {
-        leaderRole: {
-          ...LEADER_ROLE,
-          name: 'Create Flow Lead',
-          description: 'Owns topic selection, research/material collection, script approval, local media generation and final render verification.',
-        },
+        leaderRole: LEADER_ROLE,
         memberRoles: [
-          { ...byId('topic-strategist'), defaultInstances: 1 },
-          { ...byId('researcher'), defaultInstances: 1, maxInstances: 3, description: 'Searches sources and builds an evidence-backed research pack for the approved topic.' },
-          { ...byId('material-producer'), defaultInstances: 1 },
-          { ...byId('scriptwriter'), defaultInstances: 1 },
-          { ...byId('video-producer'), defaultInstances: 1 },
+          byId('researcher'),
+          { ...byId('implementation'), id: 'writer', name: 'Writer', description: 'Writes documentation and copy.', maxInstances: 2, reasoningLevel: 'medium' },
+          { ...byId('reviewer'), id: 'editor', name: 'Editor', description: 'Editorial pass on writing.' },
         ],
       }
     case 'general-team':
