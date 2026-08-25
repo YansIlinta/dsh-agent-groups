@@ -8,14 +8,18 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { GroupHost } from './group-host.js'
+import type { CreateFlowService } from './create-flow/service.js'
 import { installLeaderTools } from './leader-tools.js'
+import { installCreateFlowLeaderTools } from './create-flow/leader-tools.js'
 import { LEADER_PROTOCOL_SECTION } from './leader-prompt.js'
 
 export const name = 'agent-groups:leader'
-export const inject = ['groupHost', 'tools', 'systemPrompt']
+export const inject = ['groupHost', 'createFlow', 'tools', 'systemPrompt']
 
 export function apply(ctx: Context): void {
   const host = ctx.groupHost as GroupHost
+  const createFlow = (ctx as Context & { createFlow: CreateFlowService }).createFlow
   installLeaderTools(ctx, host)
+  installCreateFlowLeaderTools(ctx, host, createFlow)
   ctx.systemPrompt.section(LEADER_PROTOCOL_SECTION)
 }
