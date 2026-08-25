@@ -36,13 +36,14 @@ describe('Create Flow native client extension', () => {
     expect(() => sandbox.module.exports.apply?.({ get: () => undefined })).not.toThrow()
   })
 
-  it('contains the production stages and local media actions', () => {
+  it('contains the production stages and wires all local media actions through the dynamic endpoint', () => {
     const source = readFileSync(CREATE_FLOW, 'utf8')
     for (const stage of ['topic', 'research', 'materials', 'script', 'voice', 'captions', 'render']) {
       expect(source).toContain(`'${stage}'`)
     }
-    expect(source).toContain('/tts')
-    expect(source).toContain('/asr')
-    expect(source).toContain('/render')
+    expect(source).toContain('/groups/api/create-flow/${encodeURIComponent(groupId)}/${kind}')
+    expect(source).toContain("run('tts', payload)")
+    expect(source).toContain("run('asr', payload)")
+    expect(source).toContain("run('render', payload)")
   })
 })
