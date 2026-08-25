@@ -25,7 +25,7 @@
 
 这个分支把 **DSH Agent Groups** 从通用长期多 Agent 协作继续向视频生产场景扩展。
 
-它不是把 Topic、Research、Materials、Script、Render 写成一条固定 Agent 流水线。Create Flow 保留一张明确的 **Production DAG** 来表达真实生产依赖，同时把“谁来做、拆成几个任务、哪些并行、是否继续增加 Specialist”交给 Agent Groups 的 Task DAG 与 Leader 动态决定。
+Create Flow 保留一张明确的 **Production DAG** 来表达真实生产依赖，同时把“谁来做、拆成几个任务、哪些并行、是否继续增加 Specialist”交给 Agent Groups 的 Task DAG 与 Leader 动态决定。
 
 ```text
                          Create Flow Lead
