@@ -43,8 +43,10 @@ export interface CreateFlowStageReadiness {
 }
 
 export interface CreateFlowWorkflowReadiness {
-  /** First stage whose gate is not complete; undefined only after mission completion. */
+  /** First incomplete stage in display order. Kept as a compact UI hint, not a scheduler cursor. */
   readonly focusStage?: CreateFlowWorkflowStageId
+  /** Every incomplete stage whose declared production dependencies are complete. */
+  readonly readyStages: readonly CreateFlowWorkflowStageId[]
   readonly complete: boolean
   readonly stages: readonly CreateFlowStageReadiness[]
   readonly blockers: readonly string[]
@@ -74,8 +76,12 @@ export async function readCreateFlowWorkbenchStatus(
 
 /**
  * Derive stage readiness from authoritative Agent Groups task/verification
- * state plus Create Flow's production projection. This function never mutates
- * either source of truth and therefore cannot become a second orchestrator.
+ * state plus Create Flow's production projection. The registry declares only
+ * production dependencies; independent stages can therefore become ready in
+ * parallel while concrete task decomposition stays in Agent Groups.
+ *
+ * This function never mutates either source of truth and therefore cannot
+ * become a second orchestrator.
  */
 export function projectCreateFlowWorkflow(
   host: GroupHost,
@@ -85,19 +91,19 @@ export function projectCreateFlowWorkflow(
   const group = host.groups.requireGroup(groupId)
   const tasks = host.tasks.listTasks(groupId)
   const rows: CreateFlowStageReadiness[] = []
-  let prerequisitesComplete = true
+  const rowsById = new Map<CreateFlowWorkflowStageId, CreateFlowStageReadiness>()
 
   for (const definition of CREATE_FLOW_WORKFLOW_REGISTRY) {
     const evaluation = evaluateStage(host, groupId, state, tasks, definition, group.status === 'completed')
-    const status: CreateFlowReadinessState = prerequisitesComplete
-      ? evaluation.complete ? 'complete' : 'ready'
-      : 'blocked'
+    const unmetDependencies = (definition.requires ?? []).filter((stageId) => rowsById.get(stageId)?.status !== 'complete')
+    const status: CreateFlowReadinessState = unmetDependencies.length > 0
+      ? 'blocked'
+      : evaluation.complete ? 'complete' : 'ready'
     const blockers = status === 'blocked'
-      ? [`Prerequisite stage ${rows.at(-1)?.label ?? 'unknown'} is not complete.`]
+      ? [`Prerequisite stages ${unmetDependencies.map((stageId) => rowsById.get(stageId)?.label ?? stageId).join(', ')} are not complete.`]
       : evaluation.blockers
-    const recommendedActions = status === 'blocked' ? [] : evaluation.recommendedActions
-
-    rows.push({
+    const recommendedActions = status === 'ready' ? evaluation.recommendedActions : []
+    const row: CreateFlowStageReadiness = {
       id: definition.id,
       order: definition.order,
       label: definition.label,
@@ -105,17 +111,20 @@ export function projectCreateFlowWorkflow(
       blockers,
       evidence: evaluation.evidence,
       recommendedActions,
-    })
-    prerequisitesComplete = prerequisitesComplete && status === 'complete'
+    }
+    rows.push(row)
+    rowsById.set(definition.id, row)
   }
 
   const focus = rows.find((row) => row.status !== 'complete')
+  const ready = rows.filter((row) => row.status === 'ready')
   return {
     ...(focus !== undefined ? { focusStage: focus.id } : {}),
+    readyStages: ready.map((row) => row.id),
     complete: focus === undefined,
     stages: rows,
-    blockers: focus?.blockers ?? [],
-    recommendedActions: focus?.recommendedActions ?? [],
+    blockers: ready.flatMap((row) => row.blockers),
+    recommendedActions: ready.flatMap((row) => row.recommendedActions),
   }
 }
 
@@ -179,7 +188,7 @@ function evaluateTaskStage(
       recommendedActions: [{
         action: 'delegate_task',
         roleId: definition.roleId,
-        reason: `Create and assign the ${definition.label} work to the ${role} role, then verify its result.`,
+        reason: `Create and assign the ${definition.label} work to the ${role} role. Split independent subproblems into parallel Agent Groups tasks when useful.`,
       }],
     }
   }
@@ -195,13 +204,13 @@ function evaluateTaskStage(
           roleId: definition.roleId,
           taskIds: reviewable.map((task) => task.taskId),
           tool: 'leader_verify_task',
-          reason: `Inspect the ${definition.label} result and verify it before advancing.`,
+          reason: `Inspect the ${definition.label} result and verify it before dependent production work advances.`,
         }]
       : [{
           action: 'continue_task',
           roleId: definition.roleId,
           taskIds,
-          reason: `Continue the in-flight ${definition.label} work before verification.`,
+          reason: `Continue the in-flight ${definition.label} work; independent ready stages may proceed concurrently.`,
         }],
   }
 }
