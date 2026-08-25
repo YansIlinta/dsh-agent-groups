@@ -30,6 +30,7 @@ import { createGroupWebApi } from './web/api.js'
 import { CreateFlowService } from './create-flow/service.js'
 import { LocalMediaRuntime } from './create-flow/media-runtime.js'
 import { createCreateFlowWebApi } from './create-flow/web-api.js'
+import { CreateFlowTaskProjector } from './create-flow/task-projector.js'
 import { LeaderRegistry } from './leader-registry.js'
 import { RuntimeRegistry } from './runtime/registry.js'
 import { DeepSeekHarnessRuntimeProvider } from './runtime/deepseek-harness.js'
@@ -92,6 +93,7 @@ export { CreateFlowService } from './create-flow/service.js'
 export type { CreateFlowArtifact, CreateFlowArtifactKind, CreateFlowJob, CreateFlowJobKind, CreateFlowJobStatus, CreateFlowStage, CreateFlowState, CreateFlowStatus } from './create-flow/service.js'
 export { LocalMediaRuntime, MediaRuntimeError, commandTemplateFromEnv } from './create-flow/media-runtime.js'
 export type { CommandTemplate, LocalMediaRuntimeOptions, MediaCommandResult, MediaRuntimeCapabilities } from './create-flow/media-runtime.js'
+export { CreateFlowTaskProjector } from './create-flow/task-projector.js'
 export * from './core-types.js'
 
 export const name = 'agent-groups'
@@ -134,6 +136,7 @@ export async function apply(ctx: Context): Promise<void> {
   const channel = new ChannelService(stores.channel, activity, notifier)
   const profiles = new ProfileRegistry(stores.profiles)
   const createFlow = new CreateFlowService({ groups, activity, notifier, media: LocalMediaRuntime.fromEnv() })
+  const createFlowProjector = new CreateFlowTaskProjector({ groups, tasks, notifier, flow: createFlow })
   const agentDefaultModel = ctx.get('agentDefaultModel') as { currentSelection(): DefaultModelSelection } | undefined
   const adapter = new DshAgentRuntimeAdapter({
     agents: ctx.agents,
@@ -175,6 +178,7 @@ export async function apply(ctx: Context): Promise<void> {
     onError: (error) => console.error('[agent-groups] runtime reconciliation failed', error),
   })
   reconciler.start()
+  createFlowProjector.start()
 
   // Policy: no raw peer messaging for group members (defense-in-depth).
   installMemberPeerContactPolicy(ctx, groups)
@@ -188,12 +192,13 @@ export async function apply(ctx: Context): Promise<void> {
     ctx.webServer.register(route)
   }
 
-  ctx.effect(() => () =>
-    Promise.allSettled([
+  ctx.effect(() => () => {
+    createFlowProjector.stop()
+    return Promise.allSettled([
       Promise.resolve(reconciler.stop()),
       adapter.drain(),
       ...acpProviders.map((provider) => provider.dispose()),
       domain.close(),
-    ]).then(() => undefined),
-  )
+    ]).then(() => undefined)
+  })
 }
