@@ -2,19 +2,60 @@
 
 # DSH Agent Groups
 
-**Long-running AI teams, natively inside DeepSeek Harness.**  
-让 Claude、Codex 与 DSH Agent 不再只是一次性子任务，而是可以持续协作的长期队友。
+## 🎬 Create Flow Agent
+
+**Agent-native video production on persistent multi-agent teams.**  
+基于长期 Member、Task DAG 与 DSH 原生工作区的视频生产 Flow Agent：固定生产依赖，动态拆解任务，并行 Specialist，确定性 TTS / ASR / FFmpeg。
+
+*Built on the long-running Agent Groups runtime inside DeepSeek Harness.*
 
 [![CI](https://github.com/YansIlinta/dsh-agent-groups/actions/workflows/ci.yml/badge.svg)](https://github.com/YansIlinta/dsh-agent-groups/actions/workflows/ci.yml)
 [![License](https://img.shields.io/github/license/YansIlinta/dsh-agent-groups)](LICENSE)
 [![GitHub stars](https://img.shields.io/github/stars/YansIlinta/dsh-agent-groups?style=social)](https://github.com/YansIlinta/dsh-agent-groups/stargazers)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.9-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
-[![Node.js](https://img.shields.io/badge/Node.js-22%20recommended-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
+[![Node.js](https://img.shields.io/badge/Node.js-22%20recommended-339933?logo=node.js)](https://nodejs.org/)
 [![DeepSeek Harness](https://img.shields.io/badge/DeepSeek%20Harness-native-5B5BD6)](https://github.com/deepseek-ai/DeepSeek-Harness)
+[![Branch](https://img.shields.io/badge/branch-create--flow--agent-8A2BE2)](https://github.com/YansIlinta/dsh-agent-groups/tree/create-flow-agent)
 
-[快速开始](#快速开始) · [核心能力](#核心能力) · [运行时模型](#运行时模型) · [文档](#文档与开发) · [Architecture](docs/architecture.md)
+[Create Flow](#create-flow-agent-1) · [详细设计](docs/create-flow-agent.md) · [快速开始](#快速开始) · [核心能力](#核心能力) · [运行时模型](#运行时模型) · [Architecture](docs/architecture.md)
 
 </div>
+
+## Create Flow Agent
+
+这个分支把 **DSH Agent Groups** 从通用长期多 Agent 协作继续向视频生产场景扩展。
+
+它不是把 Topic、Research、Materials、Script、Render 写成一条固定 Agent 流水线。Create Flow 保留一张明确的 **Production DAG** 来表达真实生产依赖，同时把“谁来做、拆成几个任务、哪些并行、是否继续增加 Specialist”交给 Agent Groups 的 Task DAG 与 Leader 动态决定。
+
+```text
+                         Create Flow Lead
+                                │
+                    production state + planning
+                                │
+                  ┌─────────────┴─────────────┐
+                  ▼                           ▼
+              Research                    Materials
+             ┌────┴────┐                  ┌───┴───┐
+             ▼         ▼                  ▼       ▼
+          Task A     Task B            Task C   Task D
+             │         │                  │       │
+       Researcher A Researcher B      Producer A Producer B
+                  └─────────────┬─────────────┘
+                                ▼
+                              Script
+                                ▼
+                              Scenes
+                                ▼
+                        Voice / Captions
+                                ▼
+                              Render
+```
+
+当前分支已经具备长期生产成员、Workstream / Task DAG、`blockedBy` 依赖、并行 Ready Stages、生产 Artifact 投影、Scene Timeline、TTS / ASR、单镜头与多 Scene FFmpeg Render，以及嵌入原生 DSH shell 的 Create Flow 工作区。
+
+其中 **Topic → {Research, Materials} → Script → Scenes → Voice/Captions → Render** 描述的是生产依赖，而不是固定 Agent 执行顺序。一个 Research 阶段可以动态拆成多个任务并行交给多个长期 Researcher；新的研究或素材结果也可以继续触发新的任务，而不需要重新运行整条 pipeline。
+
+完整的能力边界、编排模型与方向见 [Create Flow Agent](docs/create-flow-agent.md)。
 
 ## 项目简介
 
@@ -40,7 +81,7 @@ Leader ───────── mission / planning / assignment / verificatio
 ```
 
 > [!NOTE]
-> Agent Groups 仍处于活跃开发阶段。。
+> Agent Groups 仍处于活跃开发阶段。
 
 ## 它想解决什么
 
@@ -101,7 +142,9 @@ Agent Groups 通过 DSH client plugin system 注入：
 
 **Overview · Tasks · Team · Channel · Leader Chat · Workspace · Activity · Profiles · Team Configuration**
 
-实现说明见 [Native UI](docs/native-ui.md)。
+Create Flow 在同一套 DSH shell 中增加生产工作区，用于查看 production stages、artifacts、scenes、media jobs，并操作 Scene Timeline 与本地媒体能力。
+
+实现说明见 [Native UI](docs/native-ui.md) 与 [Create Flow Agent](docs/create-flow-agent.md)。
 
 ## 快速开始
 
@@ -118,7 +161,7 @@ Agent Groups 通过 DSH client plugin system 注入：
 ### 获取与构建
 
 ```bash
-git clone https://github.com/YansIlinta/dsh-agent-groups.git
+git clone -b create-flow-agent https://github.com/YansIlinta/dsh-agent-groups.git
 cd dsh-agent-groups
 
 cd packages/host
@@ -127,7 +170,7 @@ cd ../..
 
 npm run build
 npm run typecheck
-npm test
+npm run test:create-flow
 ```
 
 ### 安装到 DSH Web Profile
@@ -139,7 +182,7 @@ npm run relaunch-web
 
 安装脚本会构建 native client bundle，将 `@dsh-agent-groups/host` 安装到本地 DSH profile module tree，写入 `group-leader` / `group-member` presets，并把插件加入 web profile patch。
 
-DSH 重启后，在原本的 Web UI sidebar 底部打开 **Agent Groups** 即可。
+DSH 重启后，在原本的 Web UI sidebar 底部打开 **Agent Groups**，并从 Create Flow 入口进入视频生产工作区。
 
 可通过 `AGENT_GROUPS_ACP_AGENTS_JSON` 注册自定义 ACP 命令；值为 definition 数组，例如 `[{"id":"opencode","name":"OpenCode","command":"opencode","args":["acp"]}]`。命令使用无 shell 的参数数组启动，`env` 只传给子进程，不进入持久记录或 UI。
 
@@ -148,13 +191,13 @@ DSH 重启后，在原本的 Web UI sidebar 底部打开 **Agent Groups** 即可
 ## 基本使用流程
 
 1. 启动或选择一个 **Agent Group · Team Lead** session。
-2. 打开 **Agent Groups**，创建新的 Group。
-3. 选择 team template、runtime，以及共享目录或每成员独立 Git worktree。
-4. 输入整个团队要完成的 mission。
-5. Leader 将 mission 拆成任务并分配给不同成员。
-6. 在 Tasks、Team、Channel、Leader Chat、Workspace 和 Activity 中查看执行过程。
-7. 对进行中的成员追加要求、排队后续任务、处理 approval / input，或在必要时 interrupt 当前 turn。
-8. Leader 对完成声明进行验证，再决定是否结束 mission。
+2. 打开 **Agent Groups**，以 **Create Flow** team template 创建 Group。
+3. 输入视频生产目标、约束与期望产物。
+4. Leader 根据当前 production state 拆分 Topic / Research / Materials 等工作，并用 Task DAG 表达真正的数据依赖。
+5. 独立 Research / Materials 工作可以由多个长期 Specialist 并行推进；相关后续工作可以继续复用同一 Member session。
+6. Script 与 Materials 形成后组织 Scene Timeline，再运行 Voice / Captions 与 Render。
+7. 在 Tasks、Team、Channel、Leader Chat、Create Flow Workspace 和 Activity 中查看生产过程。
+8. 新的研究、素材或场景约束可以继续触发新的任务，而不需要重跑整条固定 pipeline。
 
 ## 文档与开发
 
@@ -162,6 +205,8 @@ DSH 重启后，在原本的 Web UI sidebar 底部打开 **Agent Groups** 即可
 
 | 文档 | 内容 |
 | --- | --- |
+| [Create Flow Agent](docs/create-flow-agent.md) | `create-flow-agent` 分支的能力、Production DAG、动态 Task Graph 与生产边界。 |
+| [Create Flow](docs/create-flow.md) | Create Flow production state、Scene Timeline、媒体 runtime 与 API。 |
 | [Documentation Index](docs/README.md) | 文档入口与阅读顺序。 |
 | [Architecture](docs/architecture.md) | Domain model、runtime/session lifecycle、completion rules 与 persistence invariants。 |
 | [ACP Rebuild Report](docs/acp-rebuild-report.md) | 实现证据、测试结果、许可边界与剩余限制。 |
@@ -175,15 +220,14 @@ DSH 重启后，在原本的 Web UI sidebar 底部打开 **Agent Groups** 即可
 ```bash
 npm run build
 npm run typecheck
-npm test
+npm run test:create-flow
 npm run build:native
 ```
 
-集成与耐久性验证脚本：
+完整检查仍可运行：
 
 ```bash
-node scripts/verify-durability.mjs
-node scripts/demo-v02.mjs
+npm run verify
 ```
 
 ## 仓库结构
@@ -194,11 +238,11 @@ node scripts/demo-v02.mjs
 │   ├── host/                  # host services, tools, runtime adapters, API, native client
 │   └── profiles/              # group-leader / group-member presets and profile fragments
 ├── scripts/                   # build, install, relaunch, demo, durability helpers
-├── docs/                      # architecture, development and provider protocol notes
+├── docs/                      # architecture, Create Flow, development and provider notes
 ├── .github/workflows/         # CI
 ├── AGENTS.md                  # coding-agent rules and repository invariants
 ├── CONTRIBUTING.md            # contribution workflow
-└── README.md                  # product entry point
+└── README.md                  # branch product entry point
 ```
 
 `packages/host/src/` 的主要边界：
@@ -207,10 +251,11 @@ node scripts/demo-v02.mjs
 src/
 ├── group-host.ts              # product/service facade + runtime coordination
 ├── group-service.ts           # durable group behavior
-├── task-service.ts            # task lifecycle
+├── task-service.ts            # task lifecycle / DAG
 ├── channel-service.ts         # group communication
 ├── runtime/                   # DSH / Codex / Claude runtime abstractions
-├── native-client/             # DSH-native Agent Groups workspace
+├── create-flow/               # production graph, state, tools, media runtime
+├── native-client/             # DSH-native Agent Groups + Create Flow workspace
 ├── web/                       # API + SSE
 ├── persistence.ts             # persistence setup
 └── store.ts                   # durable storage layer
@@ -218,21 +263,21 @@ src/
 
 ## 项目状态
 
-目前重点不是继续增加更多 provider，而是加固长期运行能力：
+这个分支目前重点是把已有长期 Agent Runtime 与视频生产能力组合成更动态的 Flow Agent：
 
-- queued turn 在 host restart 后的完整恢复；
-- active / queued task 状态保持无歧义；
-- transient turn-start failure 后的确定性 retry；
-- runtime / task 生命周期之间更严格的完成判定；
-- 长周期团队执行下更可靠的恢复与审计。
+- 用 Production DAG 表达真实生产依赖，而不是把 stage order 当成 scheduler；
+- 让多个 ready stage 同时暴露给 Leader，支持 Research / Materials 等工作并行展开；
+- 让大的生产阶段继续拆成动态 Task Graph，并复用或按需扩展长期 Specialist；
+- 把 Agent 结果稳定投影到 artifacts / scenes / media jobs；
+- 继续丰富 Scene Timeline 与确定性本地媒体执行。
 
 版本演进与实现历史以 Git history、pull request、issue 和 release 为准，不在 README 中维护不断膨胀的 V0.x changelog。
 
 ## Contributing
 
-欢迎提交 Bug、runtime compatibility 结果、回归测试以及范围明确的 pull request。
+欢迎提交 Bug、runtime compatibility 结果、Create Flow production capability、回归测试以及范围明确的 pull request。
 
-涉及 runtime/session 语义的修改，请先阅读 [AGENTS.md](AGENTS.md)、[CONTRIBUTING.md](CONTRIBUTING.md) 与 [Architecture](docs/architecture.md)。这些生命周期不变量属于产品行为的一部分，应由测试保护。
+涉及 runtime/session 语义或 Create Flow production boundary 的修改，请先阅读 [AGENTS.md](AGENTS.md)、[CONTRIBUTING.md](CONTRIBUTING.md)、[Create Flow Agent](docs/create-flow-agent.md) 与 [Architecture](docs/architecture.md)。
 
 ## 致谢
 
