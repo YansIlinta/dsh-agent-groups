@@ -138,14 +138,17 @@ export function templateTeamConfig(templateId: string | undefined): TeamConfig {
         leaderRole: {
           ...LEADER_ROLE,
           name: 'Create Flow Lead',
-          description: 'Owns topic selection, research/material collection, script approval, local media generation and final render verification.',
+          description: 'Owns production reasoning and dynamically materializes specialist roles as the video workfront expands.',
         },
+        // Create Flow deliberately has no eager defaultInstances. The role set
+        // describes available specialist capabilities; the Leader materializes
+        // only the instances needed for the current ready workfront.
         memberRoles: [
-          { ...byId('topic-strategist'), defaultInstances: 1 },
-          { ...byId('researcher'), defaultInstances: 1, maxInstances: 3, description: 'Searches sources and builds an evidence-backed research pack for the approved topic.' },
-          { ...byId('material-producer'), defaultInstances: 1 },
-          { ...byId('scriptwriter'), defaultInstances: 1 },
-          { ...byId('video-producer'), defaultInstances: 1 },
+          { ...byId('topic-strategist') },
+          { ...byId('researcher'), maxInstances: 3, description: 'Searches sources and builds evidence-backed research packs; independent questions can fan out across multiple instances.' },
+          { ...byId('material-producer') },
+          { ...byId('scriptwriter') },
+          { ...byId('video-producer') },
         ],
       }
     case 'general-team':
