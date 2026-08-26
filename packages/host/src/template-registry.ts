@@ -8,16 +8,7 @@
 import type { TeamTemplate } from './core-types.js'
 import { GroupError } from './group-service.js'
 
-/**
- * Built-in templates may declare a role roster without eagerly materializing
- * every role as a running Member. This stays local to the built-in registry so
- * the durable TeamTemplate transport shape remains backwards compatible.
- */
-interface BuiltinTeamTemplate extends TeamTemplate {
-  readonly eagerMembers?: boolean
-}
-
-export const TEAM_TEMPLATES: readonly BuiltinTeamTemplate[] = [
+export const TEAM_TEMPLATES: readonly TeamTemplate[] = [
   {
     id: 'software-team',
     name: 'Software Team',
@@ -47,19 +38,15 @@ export const TEAM_TEMPLATES: readonly BuiltinTeamTemplate[] = [
   {
     id: 'content-team',
     name: 'Create Flow',
-    description: 'Agent-native video production: persistent roles are spawned on demand while research/material work can fan out in parallel.',
+    description: 'Agent-native video production with a lazy Topic/Research/Materials/Script/Video specialist role pool and dynamic parallel task allocation.',
     leaderProfile: 'product-planner',
     icon: '🎬',
-    // The roster remains visible as template capability metadata, but Create
-    // Flow uses the V0.4 role-based path to materialize specialists lazily.
-    eagerMembers: false,
-    members: [
-      { role: 'Topic Strategist', profile: 'implementation-engineer', count: 1 },
-      { role: 'Researcher', profile: 'implementation-engineer', count: 1 },
-      { role: 'Material Producer', profile: 'implementation-engineer', count: 1 },
-      { role: 'Scriptwriter', profile: 'reviewer', count: 1 },
-      { role: 'Video Producer', profile: 'implementation-engineer', count: 1 },
-    ],
+    // V0.2 template members are eager materialization slots. Create Flow uses
+    // the V0.4 TeamConfig role pool instead, so it deliberately starts empty
+    // and materializes persistent specialists only when the workfront needs
+    // them. This also prevents the native Create Group dialog from expanding
+    // five legacy profile-based members into its POST payload.
+    members: [],
   },
   {
     id: 'general-team',
@@ -71,13 +58,8 @@ export const TEAM_TEMPLATES: readonly BuiltinTeamTemplate[] = [
   },
 ]
 
-/**
- * Flatten member slots that should be materialized eagerly at group creation.
- * A lazy template still declares its role roster in `members`; its running
- * instances are created later through the role-based spawn path.
- */
+/** Flatten a template's eager member slots (leader excluded). */
 export function templateMemberSlots(template: TeamTemplate): ReadonlyArray<{ role: string; profile: string }> {
-  if ((template as BuiltinTeamTemplate).eagerMembers === false) return []
   const slots: Array<{ role: string; profile: string }> = []
   for (const member of template.members) {
     const count = member.count ?? 1
