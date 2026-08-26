@@ -326,7 +326,7 @@ function evaluateScenes(state: CreateFlowState): StageEvaluation {
       blockers: ['No timeline scenes have been assembled.'],
       evidence: evidence(),
       recommendedActions: [{
-        action: 'assemble_senes' as CreateFlowRecommendedActionKind,
+        action: 'assemble_scenes',
         tool: 'leader_create_flow_upsert_scene',
         reason: 'Translate the accepted script/materials into an ordered scene timeline.',
       }],
