@@ -12,6 +12,7 @@ export type CreateFlowRecommendedActionKind =
   | 'delegate_task'
   | 'continue_task'
   | 'verify_task'
+  | 'reopen_task'
   | 'assemble_scenes'
   | 'generate_voice'
   | 'render_timeline'
@@ -43,6 +44,7 @@ export interface CreateFlowRecommendedAction {
 }
 
 export interface CreateFlowStageEvidence {
+  /** Current retry-chain leaves for task-backed stages; historical ancestors are omitted. */
   readonly taskIds: readonly string[]
   readonly artifactIds: readonly string[]
   readonly sceneIds: readonly string[]
@@ -181,24 +183,27 @@ function evaluateTaskStage(
         const member = host.groups.getMembership(groupId, task.ownerId)
         return member?.roleId === definition.roleId || member?.displayRole === definition.displayRole
       })
-  const verified = matching.filter((task) => task.verification?.passed === true)
-  const taskIds = matching.map((task) => task.taskId)
+  const current = currentWorkfrontTasks(matching)
+  const verified = current.filter(taskVerified)
+  const currentTaskIds = current.map((task) => task.taskId)
   const artifactIds = state.artifacts
-    .filter((artifact) => typeof artifact.metadata?.taskId === 'string' && taskIds.includes(artifact.metadata.taskId))
+    .filter((artifact) => typeof artifact.metadata?.taskId === 'string' && currentTaskIds.includes(artifact.metadata.taskId))
     .map((artifact) => artifact.artifactId)
 
-  if (verified.length > 0) {
+  // A fan-out stage converges only when every CURRENT retry-chain leaf has
+  // passed acceptance. One successful branch must never close sibling work.
+  if (current.length > 0 && verified.length === current.length) {
     return {
       complete: true,
       blockers: [],
-      evidence: evidence({ taskIds: verified.map((task) => task.taskId), artifactIds }),
+      evidence: evidence({ taskIds: currentTaskIds, artifactIds }),
       recommendedActions: [],
     }
   }
 
   const role = definition.displayRole ?? definition.roleId ?? definition.label
   const allocation = roleAllocation(host, groupId, definition)
-  if (matching.length === 0) {
+  if (current.length === 0) {
     const capacityHint = allocation?.spawnSuggested
       ? ` No ${role} instance is materialized yet; spawn the role when creating the first task.`
       : allocation !== undefined && allocation.instanceCount > 0
@@ -209,7 +214,7 @@ function evaluateTaskStage(
       : ''
     return {
       complete: false,
-      blockers: [`No verified ${role} task is available.`],
+      blockers: [`No current ${role} task is available.`],
       evidence: evidence(),
       recommendedActions: [{
         action: 'delegate_task',
@@ -220,28 +225,70 @@ function evaluateTaskStage(
     }
   }
 
-  const reviewable = matching.filter((task) => task.status === 'review' || task.status === 'completed')
+  const unresolved = current.filter((task) => !taskVerified(task))
+  const reviewable = unresolved.filter((task) => task.status === 'review' || task.status === 'completed')
+  const failed = unresolved.filter((task) => task.status === 'failed')
+  const inFlight = unresolved.filter((task) => task.status !== 'review' && task.status !== 'completed' && task.status !== 'failed')
+  const actions: CreateFlowRecommendedAction[] = []
+
+  if (reviewable.length > 0) {
+    actions.push({
+      action: 'verify_task',
+      roleId: definition.roleId,
+      taskIds: reviewable.map((task) => task.taskId),
+      tool: 'leader_verify_task',
+      ...(allocation !== undefined ? { allocation } : {}),
+      reason: `Verify the ${reviewable.length} reviewable ${definition.label} task${reviewable.length === 1 ? '' : 's'}; sibling branches remain open until the whole workfront converges.`,
+    })
+  }
+  if (failed.length > 0) {
+    actions.push({
+      action: 'reopen_task',
+      roleId: definition.roleId,
+      taskIds: failed.map((task) => task.taskId),
+      tool: 'leader_reopen_task',
+      ...(allocation !== undefined ? { allocation } : {}),
+      reason: `Recover the ${failed.length} failed ${definition.label} task${failed.length === 1 ? '' : 's'} by reopening the same node or creating a retry after replanning. Failed historical ancestors stop blocking once a newer retry leaf exists.`,
+    })
+  }
+  if (inFlight.length > 0) {
+    actions.push({
+      action: 'continue_task',
+      roleId: definition.roleId,
+      taskIds: inFlight.map((task) => task.taskId),
+      ...(allocation !== undefined ? { allocation } : {}),
+      reason: `Continue the ${inFlight.length} open ${definition.label} task${inFlight.length === 1 ? '' : 's'}; independent ready stages may proceed concurrently.`,
+    })
+  }
+
   return {
     complete: false,
-    blockers: [`${role} task work exists but has not passed Leader/Verifier acceptance.`],
-    evidence: evidence({ taskIds }),
-    recommendedActions: reviewable.length > 0
-      ? [{
-          action: 'verify_task',
-          roleId: definition.roleId,
-          taskIds: reviewable.map((task) => task.taskId),
-          tool: 'leader_verify_task',
-          ...(allocation !== undefined ? { allocation } : {}),
-          reason: `Inspect the ${definition.label} result and verify it before dependent production work advances.`,
-        }]
-      : [{
-          action: 'continue_task',
-          roleId: definition.roleId,
-          taskIds,
-          ...(allocation !== undefined ? { allocation } : {}),
-          reason: `Continue the in-flight ${definition.label} work; independent ready stages may proceed concurrently.`,
-        }],
+    blockers: [
+      `${definition.label} workfront has converged ${verified.length}/${current.length} current task${current.length === 1 ? '' : 's'}; ${unresolved.length} remain open.`,
+      ...failed.map((task) => `Task ${task.taskId} failed and needs reopen/retry or explicit replanning.`),
+    ],
+    evidence: evidence({ taskIds: currentTaskIds, artifactIds }),
+    recommendedActions: actions,
   }
+}
+
+/**
+ * Collapse retry history to the current workfront leaves. If A failed and B is
+ * a retry of A, A remains auditable in Agent Groups but B alone represents the
+ * live production obligation. Longer retry chains collapse the same way.
+ */
+function currentWorkfrontTasks(tasks: readonly GroupTask[]): GroupTask[] {
+  if (tasks.length <= 1) return [...tasks]
+  const ids = new Set(tasks.map((task) => task.taskId))
+  const superseded = new Set<string>()
+  for (const task of tasks) {
+    if (task.retryOf !== undefined && ids.has(task.retryOf)) superseded.add(task.retryOf)
+  }
+  return tasks.filter((task) => !superseded.has(task.taskId))
+}
+
+function taskVerified(task: GroupTask): boolean {
+  return task.verification?.passed === true
 }
 
 function roleAllocation(
@@ -279,7 +326,7 @@ function evaluateScenes(state: CreateFlowState): StageEvaluation {
       blockers: ['No timeline scenes have been assembled.'],
       evidence: evidence(),
       recommendedActions: [{
-        action: 'assemble_scenes',
+        action: 'assemble_senes' as CreateFlowRecommendedActionKind,
         tool: 'leader_create_flow_upsert_scene',
         reason: 'Translate the accepted script/materials into an ordered scene timeline.',
       }],
