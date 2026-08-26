@@ -4,17 +4,11 @@ import { templateTeamConfig } from '../src/runtime/team-config.js'
 import { makeHost } from './helpers.js'
 
 describe('Create Flow workspace', () => {
-  it('declares the production specialist roster without eagerly materializing it', () => {
+  it('keeps the legacy eager roster empty', () => {
     const template = requireTemplate('content-team')
 
     expect(template.name).toBe('Create Flow')
-    expect(template.members.map((slot) => slot.role)).toEqual([
-      'Topic Strategist',
-      'Researcher',
-      'Material Producer',
-      'Scriptwriter',
-      'Video Producer',
-    ])
+    expect(template.members).toEqual([])
     expect(templateMemberSlots(template)).toEqual([])
   })
 
@@ -52,6 +46,12 @@ describe('Create Flow workspace', () => {
 
     const members = host.groups.listMembers(group.groupId, () => undefined)
     expect(members.filter((member) => member.role === 'member')).toHaveLength(0)
-    expect(host.teamConfig(group).memberRoles.map((role) => role.id)).toContain('researcher')
+    expect(host.teamConfig(group).memberRoles.map((role) => role.id)).toEqual([
+      'topic-strategist',
+      'researcher',
+      'material-producer',
+      'scriptwriter',
+      'video-producer',
+    ])
   })
 })
