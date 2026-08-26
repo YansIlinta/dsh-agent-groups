@@ -38,16 +38,15 @@ export const TEAM_TEMPLATES: readonly TeamTemplate[] = [
   {
     id: 'content-team',
     name: 'Create Flow',
-    description: 'End-to-end video production workspace: topic → research → materials → script → local voice/captions → render.',
+    description: 'Agent-native video production with a lazy Topic/Research/Materials/Script/Video specialist role pool and dynamic parallel task allocation.',
     leaderProfile: 'product-planner',
     icon: '🎬',
-    members: [
-      { role: 'Topic Strategist', profile: 'implementation-engineer', count: 1 },
-      { role: 'Researcher', profile: 'implementation-engineer', count: 1 },
-      { role: 'Material Producer', profile: 'implementation-engineer', count: 1 },
-      { role: 'Scriptwriter', profile: 'reviewer', count: 1 },
-      { role: 'Video Producer', profile: 'implementation-engineer', count: 1 },
-    ],
+    // V0.2 template members are eager materialization slots. Create Flow uses
+    // the V0.4 TeamConfig role pool instead, so it deliberately starts empty
+    // and materializes persistent specialists only when the workfront needs
+    // them. This also prevents the native Create Group dialog from expanding
+    // five legacy profile-based members into its POST payload.
+    members: [],
   },
   {
     id: 'general-team',
@@ -59,7 +58,7 @@ export const TEAM_TEMPLATES: readonly TeamTemplate[] = [
   },
 ]
 
-/** Flatten a template into ordered member slots (leader excluded). */
+/** Flatten a template's eager member slots (leader excluded). */
 export function templateMemberSlots(template: TeamTemplate): ReadonlyArray<{ role: string; profile: string }> {
   const slots: Array<{ role: string; profile: string }> = []
   for (const member of template.members) {

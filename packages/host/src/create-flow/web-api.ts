@@ -3,6 +3,8 @@ import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
 import type { GroupHost } from '../group-host.js'
 import { GroupError } from '../group-service.js'
 import type { CreateFlowArtifactKind, CreateFlowService, CreateFlowStage } from './service.js'
+import { CREATE_FLOW_ARTIFACT_KINDS, CREATE_FLOW_STAGES } from './registry.js'
+import { readCreateFlowWorkbenchStatus } from './workflow.js'
 
 /**
  * Create Flow workspace API. Registered before the broad /groups/api route so
@@ -39,8 +41,19 @@ export async function handleCreateFlowApi(
   if (rest.length === 0 && method === 'GET') {
     sendJson(res, 200, {
       name: 'create-flow',
-      paths: [':groupId', ':groupId/artifacts', ':groupId/tts', ':groupId/asr', ':groupId/render'],
+      paths: [
+        ':groupId',
+        ':groupId/artifacts',
+        ':groupId/scenes',
+        ':groupId/scenes/:sceneId',
+        ':groupId/tts',
+        ':groupId/asr',
+        ':groupId/render',
+        ':groupId/timeline/render',
+      ],
       capabilities: createFlow.capabilities(),
+      stages: CREATE_FLOW_STAGES,
+      artifactKinds: CREATE_FLOW_ARTIFACT_KINDS,
     })
     return
   }
@@ -53,21 +66,41 @@ export async function handleCreateFlowApi(
   host.groups.requireGroup(groupId)
 
   if (rest.length === 1 && method === 'GET') {
-    sendJson(res, 200, await createFlow.status(groupId))
+    sendJson(res, 200, await readCreateFlowWorkbenchStatus(host, createFlow, groupId))
     return
   }
 
   if (rest.length === 2 && rest[1] === 'artifacts' && method === 'POST') {
     const body = (await readJsonBody(req)) ?? {}
     sendJson(res, 200, await createFlow.addArtifact(groupId, 'User', {
-      kind: enumString(body.kind, 'kind', ARTIFACT_KINDS),
-      stage: enumString(body.stage, 'stage', STAGES),
+      kind: enumString(body.kind, 'kind', CREATE_FLOW_ARTIFACT_KINDS),
+      stage: enumString(body.stage, 'stage', CREATE_FLOW_STAGES),
       title: stringOf(body.title, 'title'),
       path: optionalString(body.path),
       sourceUrl: optionalString(body.sourceUrl),
       mimeType: optionalString(body.mimeType),
       metadata: recordOf(body.metadata),
     }))
+    return
+  }
+
+  if (rest.length === 2 && rest[1] === 'scenes' && method === 'POST') {
+    const body = (await readJsonBody(req)) ?? {}
+    sendJson(res, 200, await createFlow.upsertScene(groupId, 'User', {
+      sceneId: optionalString(body.sceneId),
+      order: optionalNumber(body.order),
+      title: optionalString(body.title),
+      visualPath: optionalString(body.visualPath),
+      audioPath: optionalString(body.audioPath),
+      subtitlePath: optionalString(body.subtitlePath),
+      narration: optionalRawString(body.narration),
+      durationSec: optionalNumber(body.durationSec),
+    }))
+    return
+  }
+
+  if (rest.length === 3 && rest[1] === 'scenes' && method === 'DELETE') {
+    sendJson(res, 200, await createFlow.removeScene(groupId, 'User', stringOf(rest[2], 'sceneId')))
     return
   }
 
@@ -107,11 +140,21 @@ export async function handleCreateFlowApi(
     return
   }
 
+  if (rest.length === 3 && rest[1] === 'timeline' && rest[2] === 'render' && method === 'POST') {
+    const body = (await readJsonBody(req)) ?? {}
+    sendJson(res, 200, await createFlow.renderTimeline(groupId, 'User', {
+      outputPath: optionalString(body.outputPath),
+      fps: optionalNumber(body.fps),
+      width: optionalNumber(body.width),
+      height: optionalNumber(body.height),
+      title: optionalString(body.title),
+    }))
+    return
+  }
+
   sendJson(res, 404, { error: 'not found', path: rest.join('/') })
 }
 
-const STAGES = ['topic', 'research', 'materials', 'script', 'voice', 'captions', 'render'] as const satisfies readonly CreateFlowStage[]
-const ARTIFACT_KINDS = ['topic', 'source', 'material', 'script', 'audio', 'captions', 'video', 'other'] as const satisfies readonly CreateFlowArtifactKind[]
 const MAX_BODY = 1024 * 1024
 
 async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown> | undefined> {
@@ -141,6 +184,11 @@ function stringOf(value: unknown, name: string): string {
 
 function optionalString(value: unknown): string | undefined {
   if (value === undefined || value === null || value === '') return undefined
+  return String(value).trim() || undefined
+}
+
+function optionalRawString(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined
   return String(value)
 }
 

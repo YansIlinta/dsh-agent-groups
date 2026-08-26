@@ -8,7 +8,7 @@ import { LocalMediaRuntime, MediaRuntimeError, type MediaCommandResult, type Med
 
 export type CreateFlowStage = 'topic' | 'research' | 'materials' | 'script' | 'voice' | 'captions' | 'render'
 export type CreateFlowArtifactKind = 'topic' | 'source' | 'material' | 'script' | 'audio' | 'captions' | 'video' | 'other'
-export type CreateFlowJobKind = 'tts' | 'asr' | 'render'
+export type CreateFlowJobKind = 'tts' | 'asr' | 'render' | 'timeline_render'
 export type CreateFlowJobStatus = 'running' | 'completed' | 'failed'
 
 export interface CreateFlowArtifact {
@@ -22,6 +22,20 @@ export interface CreateFlowArtifact {
   readonly createdBy: string
   readonly createdAt: number
   readonly metadata?: Readonly<Record<string, unknown>>
+}
+
+export interface CreateFlowScene {
+  readonly sceneId: string
+  readonly order: number
+  readonly title: string
+  readonly visualPath: string
+  readonly audioPath?: string
+  readonly subtitlePath?: string
+  readonly narration?: string
+  readonly durationSec?: number
+  readonly createdBy: string
+  readonly createdAt: number
+  readonly updatedAt: number
 }
 
 export interface CreateFlowJob {
@@ -43,6 +57,7 @@ export interface CreateFlowState {
   readonly version: 1
   readonly groupId: string
   readonly artifacts: readonly CreateFlowArtifact[]
+  readonly scenes: readonly CreateFlowScene[]
   readonly jobs: readonly CreateFlowJob[]
   readonly updatedAt: number
 }
@@ -111,6 +126,83 @@ export class CreateFlowService {
     await this.mutateState(groupId, (state) => ({ ...state, artifacts: [...state.artifacts, artifact] }))
     await this.record(groupId, actor, 'artifact_added', { artifactId: artifact.artifactId, kind: artifact.kind, stage: artifact.stage, path: artifact.path ?? null })
     return artifact
+  }
+
+  async upsertScene(groupId: string, actor: string, input: {
+    sceneId?: string
+    order?: number
+    title?: string
+    visualPath?: string
+    audioPath?: string
+    subtitlePath?: string
+    narration?: string
+    durationSec?: number
+  }): Promise<CreateFlowScene> {
+    const group = this.groups.requireGroup(groupId)
+    this.groups.assertMutable(group)
+    const now = Date.now()
+    const sceneId = input.sceneId?.trim() || randomUUID()
+    let nextScene: CreateFlowScene | undefined
+
+    await this.mutateState(groupId, (state) => {
+      const existing = state.scenes.find((scene) => scene.sceneId === sceneId)
+      const order = normalizeOrder(input.order ?? existing?.order ?? nextSceneOrder(state.scenes))
+      const visualPath = input.visualPath !== undefined
+        ? this.relativeWorkspacePath(groupId, input.visualPath)
+        : existing?.visualPath
+      if (!visualPath) throw new Error('scene visualPath is required')
+
+      const audioPath = input.audioPath !== undefined
+        ? this.relativeWorkspacePath(groupId, input.audioPath)
+        : existing?.audioPath
+      const subtitlePath = input.subtitlePath !== undefined
+        ? this.relativeWorkspacePath(groupId, input.subtitlePath)
+        : existing?.subtitlePath
+      const durationSec = input.durationSec !== undefined
+        ? normalizeDuration(input.durationSec)
+        : existing?.durationSec
+
+      nextScene = {
+        sceneId,
+        order,
+        title: input.title?.trim() || existing?.title || `Scene ${order + 1}`,
+        visualPath,
+        ...(audioPath ? { audioPath } : {}),
+        ...(subtitlePath ? { subtitlePath } : {}),
+        ...(input.narration !== undefined ? { narration: input.narration } : existing?.narration !== undefined ? { narration: existing.narration } : {}),
+        ...(durationSec !== undefined ? { durationSec } : {}),
+        createdBy: existing?.createdBy ?? actor,
+        createdAt: existing?.createdAt ?? now,
+        updatedAt: now,
+      }
+      const scenes = existing
+        ? state.scenes.map((scene) => scene.sceneId === sceneId ? nextScene! : scene)
+        : [...state.scenes, nextScene]
+      return { ...state, scenes: sortScenes(scenes) }
+    })
+
+    if (!nextScene) throw new Error(`failed to upsert scene ${sceneId}`)
+    await this.record(groupId, actor, 'scene_upserted', {
+      sceneId: nextScene.sceneId,
+      order: nextScene.order,
+      visualPath: nextScene.visualPath,
+      audioPath: nextScene.audioPath ?? null,
+      durationSec: nextScene.durationSec ?? null,
+    })
+    return nextScene
+  }
+
+  async removeScene(groupId: string, actor: string, sceneId: string): Promise<{ removed: boolean; sceneId: string }> {
+    const group = this.groups.requireGroup(groupId)
+    this.groups.assertMutable(group)
+    let removed = false
+    await this.mutateState(groupId, (state) => {
+      const scenes = state.scenes.filter((scene) => scene.sceneId !== sceneId)
+      removed = scenes.length !== state.scenes.length
+      return removed ? { ...state, scenes } : state
+    })
+    if (removed) await this.record(groupId, actor, 'scene_removed', { sceneId })
+    return { removed, sceneId }
   }
 
   async runTts(groupId: string, actor: string, input: {
@@ -232,6 +324,74 @@ export class CreateFlowService {
     }
   }
 
+  async renderTimeline(groupId: string, actor: string, input: {
+    outputPath?: string
+    fps?: number
+    width?: number
+    height?: number
+    title?: string
+  } = {}): Promise<{ job: CreateFlowJob; artifact: CreateFlowArtifact; command: MediaCommandResult }> {
+    const group = this.requireDispatchable(groupId)
+    const state = await this.readState(groupId)
+    const scenes = sortScenes(state.scenes)
+    if (scenes.length === 0) throw new Error('Create Flow timeline has no scenes')
+
+    const jobId = randomUUID()
+    const root = this.workspaceRoot(group.groupId)
+    const outputPath = this.resolveWorkspacePath(group.groupId, input.outputPath ?? `.create-flow/outputs/timeline-${jobId}.mp4`)
+    const renderScenes = scenes.map((scene) => ({
+      sceneId: scene.sceneId,
+      visualPath: this.resolveWorkspacePath(groupId, scene.visualPath),
+      ...(scene.audioPath ? { audioPath: this.resolveWorkspacePath(groupId, scene.audioPath) } : {}),
+      ...(scene.subtitlePath ? { subtitlePath: this.resolveWorkspacePath(groupId, scene.subtitlePath) } : {}),
+      ...(scene.durationSec !== undefined ? { durationSec: scene.durationSec } : {}),
+    }))
+
+    await this.startJob(groupId, actor, {
+      jobId,
+      kind: 'timeline_render',
+      input: {
+        sceneCount: scenes.length,
+        sceneIds: scenes.map((scene) => scene.sceneId),
+        fps: input.fps ?? 30,
+        width: input.width ?? 1280,
+        height: input.height ?? 720,
+      },
+      outputPath: this.relativeWorkspacePath(groupId, outputPath),
+    })
+
+    try {
+      const command = await this.media.renderTimeline({
+        cwd: root,
+        scenes: renderScenes,
+        outputPath,
+        fps: input.fps,
+        width: input.width,
+        height: input.height,
+      })
+      const job = await this.finishJob(groupId, actor, jobId, command)
+      const artifact = await this.addArtifact(groupId, actor, {
+        kind: 'video',
+        stage: 'render',
+        title: input.title ?? 'Rendered timeline',
+        path: outputPath,
+        mimeType: 'video/mp4',
+        metadata: {
+          jobId,
+          sceneCount: scenes.length,
+          sceneIds: scenes.map((scene) => scene.sceneId),
+          fps: input.fps ?? 30,
+          width: input.width ?? 1280,
+          height: input.height ?? 720,
+        },
+      })
+      return { job, artifact, command }
+    } catch (error) {
+      await this.failJob(groupId, actor, jobId, error)
+      throw error
+    }
+  }
+
   private requireDispatchable(groupId: string) {
     const group = this.groups.requireGroup(groupId)
     this.groups.assertMutable(group)
@@ -270,12 +430,13 @@ export class CreateFlowService {
         version: 1,
         groupId,
         artifacts: Array.isArray(raw.artifacts) ? raw.artifacts as CreateFlowArtifact[] : [],
+        scenes: Array.isArray(raw.scenes) ? sortScenes(raw.scenes as CreateFlowScene[]) : [],
         jobs: Array.isArray(raw.jobs) ? raw.jobs as CreateFlowJob[] : [],
         updatedAt: typeof raw.updatedAt === 'number' ? raw.updatedAt : Date.now(),
       }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
-      return { version: 1, groupId, artifacts: [], jobs: [], updatedAt: Date.now() }
+      return { version: 1, groupId, artifacts: [], scenes: [], jobs: [], updatedAt: Date.now() }
     }
   }
 
@@ -283,7 +444,8 @@ export class CreateFlowService {
     const previous = this.stateLocks.get(groupId) ?? Promise.resolve()
     let release!: () => void
     const gate = new Promise<void>((resolveGate) => { release = resolveGate })
-    this.stateLocks.set(groupId, previous.then(() => gate))
+    const tail = previous.then(() => gate)
+    this.stateLocks.set(groupId, tail)
     await previous
     try {
       const current = await this.readState(groupId)
@@ -297,7 +459,7 @@ export class CreateFlowService {
       return next
     } finally {
       release()
-      if (this.stateLocks.get(groupId) === gate) this.stateLocks.delete(groupId)
+      if (this.stateLocks.get(groupId) === tail) this.stateLocks.delete(groupId)
     }
   }
 
@@ -384,4 +546,22 @@ function audioMime(path: string): string {
   if (lower.endsWith('.ogg')) return 'audio/ogg'
   if (lower.endsWith('.flac')) return 'audio/flac'
   return 'audio/wav'
+}
+
+function normalizeOrder(value: number): number {
+  if (!Number.isFinite(value)) throw new Error('scene order must be numeric')
+  return Math.max(0, Math.floor(value))
+}
+
+function normalizeDuration(value: number): number {
+  if (!Number.isFinite(value) || value <= 0) throw new Error('scene durationSec must be a positive number')
+  return Math.min(24 * 60 * 60, value)
+}
+
+function nextSceneOrder(scenes: readonly CreateFlowScene[]): number {
+  return scenes.length === 0 ? 0 : Math.max(...scenes.map((scene) => scene.order)) + 1
+}
+
+function sortScenes(scenes: readonly CreateFlowScene[]): CreateFlowScene[] {
+  return [...scenes].sort((a, b) => a.order - b.order || a.createdAt - b.createdAt || a.sceneId.localeCompare(b.sceneId))
 }
