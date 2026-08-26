@@ -76,7 +76,16 @@ describe('Create Flow registry and readiness', () => {
     expect(status.workflow.stages.find((stage) => stage.id === 'research')).toMatchObject({ status: 'blocked' })
     expect(status.workflow.stages.find((stage) => stage.id === 'materials')).toMatchObject({ status: 'blocked' })
     expect(status.workflow.blockers[0]).toContain('No verified Topic Strategist task')
-    expect(status.workflow.recommendedActions[0]).toMatchObject({ action: 'delegate_task', roleId: 'topic-strategist' })
+    expect(status.workflow.recommendedActions[0]).toMatchObject({
+      action: 'delegate_task',
+      roleId: 'topic-strategist',
+      allocation: {
+        instanceCount: 1,
+        maxInstances: 2,
+        canSpawnMore: true,
+        spawnSuggested: false,
+      },
+    })
     expect(await flow.status(group.groupId)).not.toHaveProperty('workflow')
 
     const task = await host.tasks.createTask(group.groupId, {
@@ -104,8 +113,26 @@ describe('Create Flow registry and readiness', () => {
     expect(status.workflow.stages.find((stage) => stage.id === 'materials')).toMatchObject({ status: 'ready' })
     expect(status.workflow.stages.find((stage) => stage.id === 'script')).toMatchObject({ status: 'blocked' })
     expect(status.workflow.recommendedActions).toEqual(expect.arrayContaining([
-      expect.objectContaining({ action: 'delegate_task', roleId: 'researcher' }),
-      expect.objectContaining({ action: 'delegate_task', roleId: 'material-producer' }),
+      expect.objectContaining({
+        action: 'delegate_task',
+        roleId: 'researcher',
+        allocation: expect.objectContaining({
+          instanceCount: 0,
+          maxInstances: 3,
+          canSpawnMore: true,
+          spawnSuggested: true,
+        }),
+      }),
+      expect.objectContaining({
+        action: 'delegate_task',
+        roleId: 'material-producer',
+        allocation: expect.objectContaining({
+          instanceCount: 0,
+          maxInstances: 2,
+          canSpawnMore: true,
+          spawnSuggested: true,
+        }),
+      }),
     ]))
   })
 })
