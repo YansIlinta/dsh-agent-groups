@@ -17,12 +17,29 @@ export type CreateFlowRecommendedActionKind =
   | 'render_timeline'
   | 'verify_output'
 
+/**
+ * Allocation facts for one production role. This is a projection, not a spawn
+ * command: the Leader still decides whether continuity or additional parallel
+ * capacity is the better choice for the concrete task graph.
+ */
+export interface CreateFlowRoleAllocation {
+  readonly roleId: string
+  readonly memberIds: readonly string[]
+  readonly instanceCount: number
+  readonly maxInstances?: number
+  readonly canSpawnMore: boolean
+  /** True when this workfront has no materialized instance yet. */
+  readonly spawnSuggested: boolean
+}
+
 export interface CreateFlowRecommendedAction {
   readonly action: CreateFlowRecommendedActionKind
   readonly reason: string
   readonly roleId?: string
   readonly tool?: string
   readonly taskIds?: readonly string[]
+  /** Current persistent-member capacity for role-backed task work. */
+  readonly allocation?: CreateFlowRoleAllocation
 }
 
 export interface CreateFlowStageEvidence {
@@ -180,7 +197,16 @@ function evaluateTaskStage(
   }
 
   const role = definition.displayRole ?? definition.roleId ?? definition.label
+  const allocation = roleAllocation(host, groupId, definition)
   if (matching.length === 0) {
+    const capacityHint = allocation?.spawnSuggested
+      ? ` No ${role} instance is materialized yet; spawn the role when creating the first task.`
+      : allocation !== undefined && allocation.instanceCount > 0
+        ? ` Reuse one of the ${allocation.instanceCount} persistent ${role} instance${allocation.instanceCount === 1 ? '' : 's'} when continuity helps.`
+        : ''
+    const fanoutHint = allocation?.canSpawnMore
+      ? ' Additional instances remain available for genuinely independent parallel subproblems.'
+      : ''
     return {
       complete: false,
       blockers: [`No verified ${role} task is available.`],
@@ -188,7 +214,8 @@ function evaluateTaskStage(
       recommendedActions: [{
         action: 'delegate_task',
         roleId: definition.roleId,
-        reason: `Create and assign the ${definition.label} work to the ${role} role. Split independent subproblems into parallel Agent Groups tasks when useful.`,
+        ...(allocation !== undefined ? { allocation } : {}),
+        reason: `Create and assign the ${definition.label} work to the ${role} role. Split independent subproblems into parallel Agent Groups tasks when useful.${capacityHint}${fanoutHint}`,
       }],
     }
   }
@@ -204,14 +231,43 @@ function evaluateTaskStage(
           roleId: definition.roleId,
           taskIds: reviewable.map((task) => task.taskId),
           tool: 'leader_verify_task',
+          ...(allocation !== undefined ? { allocation } : {}),
           reason: `Inspect the ${definition.label} result and verify it before dependent production work advances.`,
         }]
       : [{
           action: 'continue_task',
           roleId: definition.roleId,
           taskIds,
+          ...(allocation !== undefined ? { allocation } : {}),
           reason: `Continue the in-flight ${definition.label} work; independent ready stages may proceed concurrently.`,
         }],
+  }
+}
+
+function roleAllocation(
+  host: GroupHost,
+  groupId: string,
+  definition: CreateFlowWorkflowStageDefinition,
+): CreateFlowRoleAllocation | undefined {
+  if (definition.roleId === undefined) return undefined
+  const members = host.groups
+    .listMembers(groupId, () => undefined)
+    .filter((member) =>
+      member.role === 'member'
+        && member.status !== 'left'
+        && (member.roleId === definition.roleId || member.displayRole === definition.displayRole),
+    )
+  const group = host.groups.requireGroup(groupId)
+  const role = host.teamConfig(group).memberRoles.find((candidate) => candidate.id === definition.roleId)
+  const maxInstances = role?.maxInstances
+  const canSpawnMore = maxInstances === undefined || members.length < maxInstances
+  return {
+    roleId: definition.roleId,
+    memberIds: members.map((member) => member.sessionId),
+    instanceCount: members.length,
+    ...(maxInstances !== undefined ? { maxInstances } : {}),
+    canSpawnMore,
+    spawnSuggested: members.length === 0 && canSpawnMore,
   }
 }
 
